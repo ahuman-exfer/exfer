@@ -1,0 +1,78 @@
+[package]
+name = "exfer"
+version = "0.1.0"
+edition = "2021"
+description = "Exfer: A Peer-to-Peer Settlement Protocol for Autonomous Machines"
+license = "MIT"
+repository = "https://github.com/ahuman-exfer/exfer"
+
+[dependencies]
+# Cryptography
+sha2 = "0.10"
+hmac = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+curve25519-dalek = "4"
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Storage
+redb = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+rpassword = "5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hex encoding for display
+hex = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = []
+testnet = []
+allow-testnet-release = ["testnet"]  # Override compile_error for testnet in release profile. Use with extreme caution.
+testing = []  # Exposes test-only helpers (e.g. dispute_script_unchecked). Never enable in production builds.
+channels = []  # Payment channel covenant templates. Off by default.
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+exfer = { path = ".", features = ["testing", "channels"] }
+
+[lib]
+name = "exfer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exfer"
+path = "src/main.rs"
+
+[[bin]]
+name = "mine_genesis"
+path = "src/bin/mine_genesis.rs"
+
+[[bin]]
+name = "htlc_test"
+path = "src/bin/htlc_test.rs"
+
+[[bin]]
+name = "covenant_test"
+path = "src/bin/covenant_test.rs"
+
+[[bin]]
+name = "covenant_test2"
+path = "src/bin/covenant_test2.rs"
+
+[[bin]]
+name = "stress_test"
+path = "src/bin/stress_test.rs"

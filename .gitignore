@@ -1,0 +1,16 @@
+/target
+.DS_Store
+.claude/
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+*.key
+node_modules/
+*.pyc
+__pycache__/
+AUDIT-REPORT.txt
+fuzz/artifacts/
+fuzz/corpus/
+fuzz-*.log

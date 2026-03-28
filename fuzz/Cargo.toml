@@ -1,0 +1,58 @@
+[package]
+name = "exfer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+hex = "0.4"
+
+[dependencies.exfer]
+path = ".."
+
+[[bin]]
+name = "fuzz_tx_deser"
+path = "fuzz_targets/fuzz_tx_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_block_deser"
+path = "fuzz_targets/fuzz_block_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_script_deser"
+path = "fuzz_targets/fuzz_script_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_script_eval"
+path = "fuzz_targets/fuzz_script_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_net_msg"
+path = "fuzz_targets/fuzz_net_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rpc_parse"
+path = "fuzz_targets/fuzz_rpc_parse.rs"
+test = false
+doc = false
+bench = false
