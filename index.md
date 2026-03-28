@@ -23,6 +23,10 @@ license: MIT
 repository: https://github.com/ahuman-exfer/exfer
 ---
 
+[Agent Guide](.) · [Protocol Spec](EXFER.md) · [Security](SECURITY.md) · [Source](https://github.com/ahuman-exfer/exfer)
+
+---
+
 # Exfer: Trustless Machine-to-Machine Settlement
 
 Exfer is a permissionless proof-of-work blockchain designed for autonomous machine commerce. It provides deterministic transaction costs, guaranteed script termination, and an extended UTXO model with a total functional combinator language for transaction conditions.
