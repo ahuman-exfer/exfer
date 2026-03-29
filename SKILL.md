@@ -440,6 +440,22 @@ exfer mine \
 - `--repair-perms`: auto-fix node identity key permissions
 - `--verify-all`: verify PoW for all blocks during startup replay (slow, use only if database integrity is suspect)
 
+### Run in background (recommended for agents)
+
+```bash
+nohup ./target/release/exfer mine \
+  --datadir ~/.exfer \
+  --miner-pubkey <YOUR_PUBKEY_HEX> \
+  --rpc-bind 127.0.0.1:9334 \
+  --repair-perms \
+  > ~/exfer.log 2>&1 &
+echo "Exfer node started (PID: $!)"
+```
+
+Check logs: `tail -f ~/exfer.log`
+
+Verify it's running: `curl -s http://127.0.0.1:9334 -d '{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{}}'`
+
 ### Run a non-mining full node
 
 ```bash
