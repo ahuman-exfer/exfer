@@ -423,6 +423,12 @@ done
 
 ## 8. Start Mining
 
+Generate a wallet first if you don't have one (see Section 2):
+```bash
+exfer wallet generate --output ~/exfer-wallet.key --json
+# Use the "pubkey" field from the output as --miner-pubkey below
+```
+
 ### Mining with pubkey only (recommended — no private key on server)
 
 ```bash
