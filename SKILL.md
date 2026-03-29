@@ -454,12 +454,27 @@ nohup ./target/release/exfer mine \
 
 **macOS:**
 ```bash
-launchctl submit -l org.exfer.miner -- \
-  /path/to/exfer mine \
-  --datadir ~/.exfer \
-  --miner-pubkey <YOUR_PUBKEY_HEX> \
-  --rpc-bind 127.0.0.1:9334 \
-  --repair-perms
+cat > ~/Library/LaunchAgents/org.exfer.miner.plist << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.exfer.miner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(which exfer || echo ./target/release/exfer)</string>
+    <string>mine</string>
+    <string>--datadir</string><string>$HOME/.exfer</string>
+    <string>--miner-pubkey</string><string>YOUR_PUBKEY_HEX</string>
+    <string>--repair-perms</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/exfer.log</string>
+  <key>StandardErrorPath</key><string>/tmp/exfer.log</string>
+</dict>
+</plist>
+EOF
+launchctl load ~/Library/LaunchAgents/org.exfer.miner.plist
 ```
 
 Check status: `curl -s http://127.0.0.1:9334 -d '{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{}}'`
