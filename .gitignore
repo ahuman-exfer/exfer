@@ -14,3 +14,5 @@ AUDIT-REPORT.txt
 fuzz/artifacts/
 fuzz/corpus/
 fuzz-*.log
+task_server.py
+tasks.db
