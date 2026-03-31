@@ -2088,7 +2088,6 @@ async fn run_node(
         outbound_bootstraps: std::sync::Mutex::new(initial_bootstraps),
         next_session_id: std::sync::atomic::AtomicU64::new(1),
         active_ibd_peer: std::sync::Mutex::new(None),
-        pending_ibd_blocks: std::sync::Mutex::new(std::collections::HashSet::new()),
         global_block_limiter: std::sync::Mutex::new((std::time::Instant::now(), 0)),
         global_tx_limiter: std::sync::Mutex::new((std::time::Instant::now(), 0)),
         ip_abuse: std::sync::Mutex::new(restored_ip_abuse),

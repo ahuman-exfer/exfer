@@ -206,7 +206,6 @@ mod deferred_storage_tests {
             outbound_bootstraps: std::sync::Mutex::new(HashMap::new()),
             next_session_id: std::sync::atomic::AtomicU64::new(1),
             active_ibd_peer: std::sync::Mutex::new(None),
-            pending_ibd_blocks: std::sync::Mutex::new(HashSet::new()),
             global_block_limiter: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             global_tx_limiter: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             ip_abuse: std::sync::Mutex::new(HashMap::new()),

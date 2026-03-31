@@ -571,10 +571,6 @@ pub struct Node {
     pub next_session_id: std::sync::atomic::AtomicU64,
     /// Identity + session_id of the peer currently serving IBD.
     pub active_ibd_peer: std::sync::Mutex<Option<(PeerId, u64)>>,
-    /// Block hashes requested via GetBlocks during IBD.
-    /// The reader_task checks incoming BlockResponses from the IBD peer
-    /// against this set — unexpected responses are rejected and struck.
-    pub pending_ibd_blocks: std::sync::Mutex<HashSet<Hash256>>,
     /// Global (cross-peer) block rate limiter: (window_start, count).
     /// Caps aggregate PoW verifications to MAX_GLOBAL_BLOCKS_PER_MIN regardless
     /// of how many peers send NewBlock messages concurrently.
@@ -3340,23 +3336,6 @@ impl Node {
                         if block_count > MAX_BLOCKS_PER_MIN {
                             return Err(PeerError::RateLimitExceeded);
                         }
-                    } else {
-                        // IBD peer: verify this block was actually requested
-                        let block_id = block.header.block_id();
-                        let was_requested = {
-                            let mut pending = self.pending_ibd_blocks.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.remove(&block_id)
-                        };
-                        if !was_requested {
-                            unsolicited_count += 1;
-                            if unsolicited_count > 10 {
-                                warn!("IBD peer {} sent >10 unrequested BlockResponses, disconnecting", meta.addr);
-                                if self.record_ip_strike(meta.addr.ip(), Some(meta.identity)) {
-                                    return Err(PeerError::RateLimitExceeded);
-                                }
-                            }
-                            continue;
-                        }
                     }
                     if self.is_ip_banned(meta.addr.ip()) {
                         continue;
@@ -4155,13 +4134,6 @@ async fn run_ibd(
         let block_ids: Vec<Hash256> = headers.iter().map(|h| h.block_id()).collect();
 
         for chunk in block_ids.chunks(MAX_GETBLOCKS_RESPONSE) {
-            // Record which blocks we requested so the reader can reject unexpected ones
-            {
-                let mut pending = node.pending_ibd_blocks.lock().unwrap_or_else(|e| e.into_inner());
-                for id in chunk {
-                    pending.insert(*id);
-                }
-            }
             let msg = Message::GetBlocks(chunk.to_vec());
             if !node.send_to_session(peer_identity, session_id, msg).await {
                 return Err("failed to send GetBlocks".into());
@@ -4772,9 +4744,8 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     }
                 }
             }
-            // Clear IBD protection and pending block tracking
+            // Clear IBD protection
             *node.active_ibd_peer.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            node.pending_ibd_blocks.lock().unwrap_or_else(|e| e.into_inner()).clear();
             continue;
         }
 
