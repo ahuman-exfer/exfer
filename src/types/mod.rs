@@ -80,8 +80,8 @@ pub const MAX_SPENT_UTXOS_SIZE: usize = 16_777_216; // 16 MiB cap on serialized 
 
 pub const MAX_MESSAGE_SIZE: usize = 8_388_608; // 8 MiB
 pub const MAX_OUTBOUND_PEERS: usize = 8;
-pub const MAX_INBOUND_PEERS: usize = 64;
-pub const MAX_INBOUND_PER_IP: usize = 4;
+pub const MAX_INBOUND_PEERS: usize = 256;
+pub const MAX_INBOUND_PER_IP: usize = 1;
 pub const PING_INTERVAL_SECS: u64 = 60;
 pub const PONG_DEADLINE_SECS: u64 = 15;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
