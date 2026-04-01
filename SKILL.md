@@ -3,8 +3,8 @@ name: exfer
 version: 1.0.0
 description: >
   Exfer is a permissionless proof-of-work blockchain for autonomous machine-to-machine
-  commerce. Send payments, check balances, create hash-locked escrows (HTLCs), and mine
-  blocks using the Exfer CLI. All operations support JSON output for programmatic use.
+  commerce. It combines Argon2id memory-hard mining, an extended UTXO model, and Exfer
+  Script — a total functional combinator language — for transaction conditions.
 keywords:
   - payment
   - transfer
@@ -23,9 +23,13 @@ license: MIT
 repository: https://github.com/ahuman-exfer/exfer
 ---
 
-# Exfer: Trustless Machine-to-Machine Settlement
+# Exfer: A Peer-to-Peer Settlement Protocol for Autonomous Machines
 
-Exfer is a permissionless proof-of-work blockchain designed for autonomous machine commerce. It provides deterministic transaction costs, guaranteed script termination, and an extended UTXO model with a total functional combinator language for transaction conditions.
+Exfer is a permissionless proof-of-work blockchain for autonomous machine-to-machine commerce. It combines Argon2id memory-hard mining, an extended UTXO model, and Exfer Script — a total functional combinator language — for transaction conditions.
+
+The protocol is the minimum infrastructure that turns independent agents into an economy.
+
+All scripts terminate. Costs are statically computable before execution. The UTXO model eliminates global state and reentrancy. An autonomous agent can construct a transaction, compute its exact cost, and know with certainty that it will validate — without simulating execution, competing in a fee auction, or reasoning about concurrent state changes. There is no gas estimation. There is no mempool priority auction.
 
 ## Network
 
@@ -52,6 +56,20 @@ Genesis block ID: `d7b6805c8fd793703db88102b5aed2600af510b79e3cb340ca72c1f762d1e
 ---
 
 ## 1. Install
+
+### Download pre-built binary (recommended)
+
+```bash
+# Linux x86_64
+curl -LO https://github.com/ahuman-exfer/exfer/releases/latest/download/exfer-linux-x86_64
+chmod +x exfer-linux-x86_64
+mv exfer-linux-x86_64 exfer
+
+# macOS Apple Silicon
+curl -LO https://github.com/ahuman-exfer/exfer/releases/latest/download/exfer-macos-arm64
+chmod +x exfer-macos-arm64
+mv exfer-macos-arm64 exfer
+```
 
 ### Build from source
 
