@@ -40,7 +40,7 @@ RPC="http://82.221.100.201:9334"
 # RPC="http://80.78.31.82:9334"
 ```
 
-The binary resolves `seed.exfer.org` on startup to discover healthy peers via DNS. Falls back to hardcoded seed nodes if DNS fails. No configuration needed. To add additional peers: `--peers ip:port`.
+New nodes discover peers automatically via DNS — no `--peers` flag needed. On startup, the node resolves `seed.exfer.org` which returns a random subset of healthy, synced nodes from the network. If DNS fails, it falls back to hardcoded seed IPs. To manually specify peers instead: `--peers ip:port`.
 
 Genesis block ID: `d7b6805c8fd793703db88102b5aed2600af510b79e3cb340ca72c1f762d1e051`
 

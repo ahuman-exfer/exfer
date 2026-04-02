@@ -1034,6 +1034,12 @@ Global transaction rate limit slots are refunded when a transaction fails pre-ch
 
 After receiving a TipResponse, the node verifies the claimed tip by requesting the header at the claimed height. The header must match the claimed block_id and height, pass PoW verification, and have a difficulty target consistent with the local chain. Only after verification is the peer's tip marked as confirmed. Unconfirmed peers cannot trigger IBD.
 
+### Peer Discovery
+
+On startup, the node resolves `seed.exfer.org` via DNS to discover healthy peers. The DNS seed returns A records pointing to nodes that are reachable and synced (tip within 100 blocks of the network's best height). A seed crawler probes all known nodes every 10 minutes and updates the DNS record with the current healthy set.
+
+If DNS resolution fails (no internet, DNS blocked, seed.exfer.org not configured), the node falls back to three hardcoded seed IPs. The `--peers` flag overrides both DNS and hardcoded seeds.
+
 ### Peer Limits
 
 - Maximum outbound peers: 8
