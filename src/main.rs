@@ -342,16 +342,40 @@ enum ScriptCommands {
     },
 }
 
+/// Hardcoded fallback seed peers.
+const FALLBACK_SEEDS: &[&str] = &[
+    "89.127.232.155:9333",
+    "82.221.100.201:9333",
+    "80.78.31.82:9333",
+];
+
 /// Default mainnet seed peers. Used when --peers is not specified.
+/// Resolves seed.exfer.org first, falls back to hardcoded IPs if DNS fails.
 fn default_peers_if_empty(peers: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
     if !peers.is_empty() {
         return peers;
     }
-    vec![
-        "89.127.232.155:9333".parse().unwrap(),
-        "82.221.100.201:9333".parse().unwrap(),
-        "80.78.31.82:9333".parse().unwrap(),
-    ]
+
+    // Try DNS seed first
+    match std::net::ToSocketAddrs::to_socket_addrs(&("seed.exfer.org", 9333)) {
+        Ok(addrs) => {
+            let resolved: Vec<std::net::SocketAddr> = addrs.collect();
+            if !resolved.is_empty() {
+                tracing::info!("Resolved {} seed peers from seed.exfer.org", resolved.len());
+                return resolved;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("DNS seed resolution failed (seed.exfer.org): {}", e);
+        }
+    }
+
+    // Fall back to hardcoded seeds
+    tracing::info!("Using hardcoded seed peers");
+    FALLBACK_SEEDS
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect()
 }
 
 #[tokio::main]

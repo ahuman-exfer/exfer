@@ -40,7 +40,7 @@ RPC="http://82.221.100.201:9334"
 # RPC="http://80.78.31.82:9334"
 ```
 
-The binary includes default seed nodes. No configuration needed. To add additional peers: `--peers ip:port`.
+The binary resolves `seed.exfer.org` on startup to discover healthy peers via DNS. Falls back to hardcoded seed nodes if DNS fails. No configuration needed. To add additional peers: `--peers ip:port`.
 
 Genesis block ID: `d7b6805c8fd793703db88102b5aed2600af510b79e3cb340ca72c1f762d1e051`
 
