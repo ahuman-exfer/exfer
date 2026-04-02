@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub type PeerId = [u8; 32];
 
@@ -640,6 +640,13 @@ pub struct Node {
     /// The mining tip-watcher checks this to cancel in-flight mining
     /// immediately instead of waiting for a tip change.
     pub mining_cancel: AtomicBool,
+    /// When true, assume-valid optimization is enabled.
+    /// Disabled by --no-assume-valid or --verify-all.
+    pub assume_valid: bool,
+    /// True once the checkpoint block (ASSUME_VALID_HEIGHT) has been verified
+    /// to match ASSUME_VALID_HASH. Set on startup if storage already has the
+    /// checkpoint, or during IBD when block 130,000 arrives and matches.
+    pub assume_valid_verified: AtomicBool,
 }
 
 impl Node {
@@ -1854,8 +1861,8 @@ impl Node {
         };
 
         // When skip_pow is true, caller already verified difficulty + PoW
-        // (NewBlock/BlockResponse pre-checks). Use the skip variant to avoid
-        // redundant Argon2id computation.
+        // (NewBlock/BlockResponse pre-checks or IBD assume-valid). Use the
+        // skip variant to avoid redundant Argon2id computation.
         let header_result = if skip_pow {
             validate_block_header_skip_pow(
                 &block,
@@ -1880,6 +1887,22 @@ impl Node {
                 return Ok(ProcessBlockOutcome::BufferedFuture);
             }
             return Err(format!("block header validation failed: {:?}", e).into());
+        }
+
+        // Assume-valid checkpoint: when block at checkpoint height arrives,
+        // verify hash matches. On match, mark checkpoint as proven. On
+        // mismatch, reject — caller (IBD) must wipe unproven blocks.
+        if self.assume_valid && block.header.height == ASSUME_VALID_HEIGHT {
+            let expected = Hash256(ASSUME_VALID_HASH);
+            if block_id == expected {
+                self.assume_valid_verified.store(true, Ordering::SeqCst);
+                info!("Assume-valid checkpoint verified at height {}", ASSUME_VALID_HEIGHT);
+            } else {
+                return Err(ProcessBlockError::Recoverable(format!(
+                    "assume-valid checkpoint FAILED at height {}: expected {}, got {}",
+                    ASSUME_VALID_HEIGHT, expected, block_id
+                )));
+            }
         }
 
         // 2. Compute cumulative work in memory for fork-choice (defer storage).
@@ -4182,7 +4205,18 @@ async fn run_ibd(
                     None
                 };
 
-                match node.process_block(block.clone(), ibd_wall_clock).await {
+                // Assume-valid: skip Argon2id only after the checkpoint has been
+                // proven (block 130,000 received and hash matched). First IBD
+                // verifies full PoW; subsequent syncs skip below the checkpoint.
+                let ibd_skip_pow = node.assume_valid
+                    && node.assume_valid_verified.load(Ordering::SeqCst)
+                    && block.header.height <= ASSUME_VALID_HEIGHT;
+                let result = if ibd_skip_pow {
+                    node.process_block_pre_validated(block.clone(), ibd_wall_clock).await
+                } else {
+                    node.process_block(block.clone(), ibd_wall_clock).await
+                };
+                match result {
                     Ok(_) => {}
                     Err(ProcessBlockError::MissingReorgAncestor(missing_id)) => {
                         const MAX_ANCESTOR_RECOVERY_DEPTH: usize = 4320;
@@ -4230,7 +4264,15 @@ async fn run_ibd(
 
                         fetched_ancestors.reverse();
                         for anc in fetched_ancestors {
-                            match node.process_block(anc, ibd_wall_clock).await {
+                            let anc_skip = node.assume_valid
+                                && node.assume_valid_verified.load(Ordering::SeqCst)
+                                && anc.header.height <= ASSUME_VALID_HEIGHT;
+                            let anc_result = if anc_skip {
+                                node.process_block_pre_validated(anc, ibd_wall_clock).await
+                            } else {
+                                node.process_block(anc, ibd_wall_clock).await
+                            };
+                            match anc_result {
                                 Ok(_) => {}
                                 Err(e) if e.is_fatal() => {
                                     node.shutdown.store(true, Ordering::SeqCst);
@@ -4242,7 +4284,15 @@ async fn run_ibd(
                             }
                         }
 
-                        match node.process_block(block, ibd_wall_clock).await {
+                        let retry_skip = node.assume_valid
+                            && node.assume_valid_verified.load(Ordering::SeqCst)
+                            && block.header.height <= ASSUME_VALID_HEIGHT;
+                        let retry_result = if retry_skip {
+                            node.process_block_pre_validated(block, ibd_wall_clock).await
+                        } else {
+                            node.process_block(block, ibd_wall_clock).await
+                        };
+                        match retry_result {
                             Ok(_) => {}
                             Err(e) => return Err(format!("block retry failed: {}", e)),
                         }
@@ -4737,6 +4787,16 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 }
                 Err(e) => {
                     warn!("Sync manager: IBD failed: {}", e);
+                    if e.contains("checkpoint FAILED") {
+                        // Checkpoint hash mismatch — peer served a fake chain.
+                        // Shut down; user must delete datadir and re-sync.
+                        error!(
+                            "Assume-valid checkpoint verification failed — \
+                             the peer served a fake chain. Delete the data \
+                             directory and restart to re-sync from scratch."
+                        );
+                        node.shutdown.store(true, Ordering::SeqCst);
+                    }
                     let mut peers = node.peers.lock().await;
                     if let Some(lp) = peers.get_mut_by_identity(&peer_identity) {
                         lp.ibd_cooldown_until =

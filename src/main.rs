@@ -131,6 +131,10 @@ enum Commands {
         /// Use if database integrity is suspect (corruption, tampering).
         #[arg(long)]
         verify_all: bool,
+        /// Disable assume-valid: verify Argon2id PoW for all blocks during IBD,
+        /// even below the hardcoded checkpoint height.
+        #[arg(long)]
+        no_assume_valid: bool,
     },
     /// Run the miner
     Mine {
@@ -166,6 +170,10 @@ enum Commands {
         /// Use if database integrity is suspect (corruption, tampering).
         #[arg(long)]
         verify_all: bool,
+        /// Disable assume-valid: verify Argon2id PoW for all blocks during IBD,
+        /// even below the hardcoded checkpoint height.
+        #[arg(long)]
+        no_assume_valid: bool,
     },
     /// Wallet operations
     Wallet {
@@ -365,9 +373,10 @@ async fn main() {
             repair_perms,
             rpc_bind,
             verify_all,
+            no_assume_valid,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -383,6 +392,7 @@ async fn main() {
             repair_perms,
             rpc_bind,
             verify_all,
+            no_assume_valid,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -405,7 +415,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -1255,6 +1265,16 @@ fn rebuild_utxo_set_inner(datadir: &Path) -> Result<(UtxoSet, u64), String> {
         .ok_or_else(|| format!("tip header {} not found", tip_id))?;
     let tip_height = tip_header.height;
 
+    // Assume-valid for wallet replay: same policy as startup replay.
+    // Skip PoW only if checkpoint block exists in storage and matches.
+    let wallet_assume_valid_proven = tip_height >= types::ASSUME_VALID_HEIGHT
+        && storage
+            .get_block_id_by_height(types::ASSUME_VALID_HEIGHT)
+            .ok()
+            .flatten()
+            .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
+            .unwrap_or(false);
+
     let mut prev_id = Hash256::ZERO; // genesis has prev = ZERO
 
     for height in 0..=tip_height {
@@ -1321,12 +1341,10 @@ fn rebuild_utxo_set_inner(datadir: &Path) -> Result<(UtxoSet, u64), String> {
             )
             .map_err(|e| format!("difficulty computation failed at height {}: {}", height, e))?;
 
-            // Replay trusts local storage integrity. PoW is verified only for
-            // the most recent RETARGET_WINDOW blocks (4,320) to catch recent
-            // Wallet replay trusts local storage integrity. PoW verified
-            // only for recent blocks.
-            let pow_cutoff = tip_height.saturating_sub(types::RETARGET_WINDOW);
-            if height > pow_cutoff {
+            // Wallet replay uses same assume-valid policy as startup replay:
+            // skip PoW only if checkpoint is proven in storage.
+            let skip_pow = wallet_assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
+            if !skip_pow {
                 validate_block_header(
                     &block,
                     Some(&parent_header),
@@ -1461,7 +1479,7 @@ fn replay_chain(
     storage: &Arc<ChainStorage>,
     utxo_set: &mut UtxoSet,
     expected_genesis_id: &Hash256,
-    verify_all: bool,
+    assume_valid: bool,
 ) -> Result<ChainTip, String> {
     let tip_id = match storage
         .get_tip()
@@ -1518,6 +1536,28 @@ fn replay_chain(
         .map_err(|e| format!("db error reading tip header: {}", e))?
         .ok_or_else(|| format!("tip block header {} not found", tip_id))?;
     let tip_height = tip_header.height;
+
+    // Check if assume-valid checkpoint is proven: chain must be at or past
+    // checkpoint height AND the block at that height must match the hash.
+    let assume_valid_proven = assume_valid && tip_height >= types::ASSUME_VALID_HEIGHT && {
+        match storage
+            .get_block_id_by_height(types::ASSUME_VALID_HEIGHT)
+            .map_err(|e| format!("db error checking checkpoint: {}", e))?
+        {
+            Some(id) => id == Hash256(types::ASSUME_VALID_HASH),
+            None => false,
+        }
+    };
+    if assume_valid {
+        if assume_valid_proven {
+            info!(
+                "Assume-valid checkpoint verified in storage at height {}",
+                types::ASSUME_VALID_HEIGHT
+            );
+        } else {
+            info!("Assume-valid checkpoint not yet proven — full PoW verification during replay");
+        }
+    }
 
     let mut cumulative_work = [0u8; 32];
     let mut block_count = 0u64;
@@ -1588,10 +1628,11 @@ fn replay_chain(
                         format!("difficulty computation failed at height {}: {}", height, e)
                     })?;
 
-            // Replay trusts local storage integrity. Use --verify-all to
-            // re-validate all blocks if the database is suspect.
-            let pow_cutoff = tip_height.saturating_sub(types::RETARGET_WINDOW);
-            if verify_all || height > pow_cutoff {
+            // Assume-valid: skip PoW for blocks at/below checkpoint, but ONLY
+            // if the checkpoint block is already in storage and matches.
+            // If chain is shorter than checkpoint, verify full PoW.
+            let skip_pow = assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
+            if !skip_pow {
                 validate_block_header(
                     &block,
                     Some(&parent_header),
@@ -1614,6 +1655,20 @@ fn replay_chain(
                     block.header.height, e
                 )
             })?;
+
+            // Assume-valid checkpoint during replay (redundant if already proven,
+            // but verifies integrity on every replay)
+            if assume_valid_proven && height == types::ASSUME_VALID_HEIGHT {
+                use crate::types::hash::Hash256;
+                let expected = Hash256(types::ASSUME_VALID_HASH);
+                let actual = block.header.block_id();
+                if actual != expected {
+                    return Err(format!(
+                        "assume-valid checkpoint failed during replay at height {}: expected {}, got {}",
+                        types::ASSUME_VALID_HEIGHT, expected, actual
+                    ));
+                }
+            }
         }
 
         // Full transaction validation with automatic rollback on failure
@@ -1717,7 +1772,9 @@ async fn run_node(
     repair_perms: bool,
     rpc_bind: Option<SocketAddr>,
     verify_all: bool,
+    no_assume_valid: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let assume_valid = !no_assume_valid && !verify_all;
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("failed to create data directory {}: {e}", datadir.display()))?;
 
@@ -1922,7 +1979,7 @@ async fn run_node(
     }
 
     // P1-5: Reconstruct state by replaying chain from genesis to tip
-    let tip = replay_chain(&storage, &mut utxo_set, &expected_genesis_id, verify_all).map_err(|e| {
+    let tip = replay_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid).map_err(|e| {
         format!(
             "Chain replay failed: {e}. Database may be corrupt. Delete data directory and re-sync."
         )
@@ -2076,6 +2133,16 @@ async fn run_node(
         );
     }
 
+    // Check if assume-valid checkpoint is already proven in storage
+    let checkpoint_proven = assume_valid
+        && tip.height >= types::ASSUME_VALID_HEIGHT
+        && storage
+            .get_block_id_by_height(types::ASSUME_VALID_HEIGHT)
+            .ok()
+            .flatten()
+            .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
+            .unwrap_or(false);
+
     let node = Arc::new(Node {
         storage,
         utxo_set: Arc::new(RwLock::new(utxo_set)),
@@ -2106,6 +2173,8 @@ async fn run_node(
         sync_state: std::sync::atomic::AtomicU8::new(SyncState::CatchingUp as u8),
         best_peer_work: std::sync::Mutex::new([0u8; 32]),
         mining_cancel: std::sync::atomic::AtomicBool::new(true),
+        assume_valid,
+        assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
     });
 
     let listen_node = node.clone();

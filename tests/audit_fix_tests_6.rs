@@ -15,8 +15,8 @@ mod outbound_cap_tests {
     }
 
     #[test]
-    fn inbound_cap_constant_is_64() {
-        assert_eq!(MAX_INBOUND_PEERS, 64);
+    fn inbound_cap_constant_is_256() {
+        assert_eq!(MAX_INBOUND_PEERS, 256);
     }
 
     #[test]

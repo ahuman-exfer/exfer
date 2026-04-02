@@ -462,7 +462,8 @@ exfer mine \
 - Default seed nodes are built in — no `--peers` needed.
 - `--rpc-bind`: optional JSON-RPC endpoint (use `127.0.0.1` for local-only access). **RPC has no authentication** — do not bind to `0.0.0.0` on untrusted networks without a reverse proxy.
 - `--repair-perms`: auto-fix node identity key permissions
-- `--verify-all`: verify PoW for all blocks during startup replay (slow, use only if database integrity is suspect)
+- `--verify-all`: verify PoW for all blocks during startup replay (slow, use only if database integrity is suspect). Also disables assume-valid.
+- `--no-assume-valid`: disable assume-valid optimization — verify Argon2id PoW for all blocks during IBD, even below the hardcoded checkpoint height (130,000). By default, blocks at or below this checkpoint skip PoW verification during initial sync to speed up IBD. All other validation (transactions, signatures, UTXO accounting, state roots) is always performed.
 
 ### Run in background
 

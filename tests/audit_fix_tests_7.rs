@@ -224,6 +224,8 @@ mod deferred_storage_tests {
             sync_state: std::sync::atomic::AtomicU8::new(0),
             best_peer_work: std::sync::Mutex::new([0u8; 32]),
             mining_cancel: std::sync::atomic::AtomicBool::new(false),
+            assume_valid: false,
+            assume_valid_verified: std::sync::atomic::AtomicBool::new(false),
         };
 
         let pubkey = [42u8; 32];

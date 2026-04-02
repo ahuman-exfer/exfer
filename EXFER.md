@@ -1028,6 +1028,8 @@ During Initial Block Download (CatchingUp state), the per-peer and global respon
 
 During IBD, only the active IBD peer is exempt from per-peer block rate limits. All other peers are rate-limited normally even during CatchingUp state. This prevents sybil peers from flooding unsolicited blocks.
 
+**Assume-valid optimization.** Blocks at or below the hardcoded checkpoint height (130,000) skip Argon2id PoW verification during IBD and replay. All other validation is performed: block linkage, transaction validation, Ed25519 signature verification, UTXO accounting, state root verification, fee calculation, coinbase rules, and timestamp checks. The trust assumption is the binary author, not the peer — the checkpoint hash guarantees the block at that height matches the canonical chain. If the block hash at the checkpoint height does not match, the chain is rejected. Use `--no-assume-valid` to disable this optimization and verify full PoW for every block. `--verify-all` also disables assume-valid.
+
 Global transaction rate limit slots are refunded when a transaction fails pre-check validation, full validation, mempool insertion, or is discarded due to a tip change during validation. Only transactions that successfully enter the mempool consume the slot permanently.
 
 After receiving a TipResponse, the node verifies the claimed tip by requesting the header at the claimed height. The header must match the claimed block_id and height, pass PoW verification, and have a difficulty target consistent with the local chain. Only after verification is the peer's tip marked as confirmed. Unconfirmed peers cannot trigger IBD.
@@ -1035,8 +1037,8 @@ After receiving a TipResponse, the node verifies the claimed tip by requesting t
 ### Peer Limits
 
 - Maximum outbound peers: 8
-- Maximum inbound peers: 64
-- Maximum inbound per IP: 4
+- Maximum inbound peers: 256
+- Maximum inbound per IP: 1
 - Ping interval: 60 seconds
 - Pong deadline: 15 seconds
 

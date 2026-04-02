@@ -29,6 +29,19 @@ pub const MAX_TIMESTAMP_GAP: u64 = 604_800; // consensus (~7 days)
 #[allow(dead_code)]
 pub const BLOCK_HEADER_SIZE: usize = 156;
 
+// ── Assume-valid checkpoint ──
+
+/// Height at which the assume-valid checkpoint is verified.
+/// Blocks at or below this height skip Argon2id PoW during IBD/replay.
+pub const ASSUME_VALID_HEIGHT: u64 = 130_000;
+/// Block hash at ASSUME_VALID_HEIGHT. Verified exactly once during sync.
+pub const ASSUME_VALID_HASH: [u8; 32] = [
+    0xe8, 0xb1, 0x06, 0xba, 0xaf, 0xf1, 0x42, 0x9b,
+    0x0d, 0x4b, 0x47, 0xfe, 0xcc, 0x6a, 0x1e, 0x2b,
+    0x1f, 0x7e, 0x4b, 0xee, 0x8d, 0x6e, 0xe2, 0x18,
+    0x64, 0x5c, 0x45, 0x03, 0xe5, 0x45, 0xa1, 0x7f,
+];
+
 // ── Emission constants ──
 
 pub const BASE_REWARD: u64 = 100_000_000; // 1.0 EXFER
