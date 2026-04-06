@@ -194,10 +194,10 @@ enum Commands {
         #[arg(long)]
         mine: bool,
         /// Read wallet passphrase from this environment variable (non-interactive)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_passphrase")]
         passphrase_env: Option<String>,
         /// Create unencrypted wallet (not recommended)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "passphrase_env")]
         no_passphrase: bool,
         /// Machine-readable JSON output
         #[arg(long)]
@@ -1273,20 +1273,80 @@ fn run_init(
         PathBuf::from(&datadir_str)
     };
 
-    // Step 1: Check for existing init
-    let wallet_path = datadir.join("wallet.key");
-    if wallet_path.exists() {
-        eprintln!(
-            "Error: already initialized at {}. Use --datadir to specify a different path.",
-            datadir.display()
-        );
-        std::process::exit(1);
-    }
-
-    // Step 2: Create datadir
+    // Step 1: Create datadir
     if let Err(e) = std::fs::create_dir_all(&datadir) {
         eprintln!("ERROR: failed to create {}: {}", datadir.display(), e);
         std::process::exit(1);
+    }
+
+    // Step 2: Atomically check for existing init via exclusive file create.
+    // O_CREAT|O_EXCL fails if the file already exists — no TOCTOU race.
+    let wallet_path = datadir.join("wallet.key");
+    let lock_path = datadir.join(".init.lock");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(_) => {} // We hold the lock
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lock file exists — either another init is running or a previous
+            // init completed. Check for wallet.key to distinguish.
+            if wallet_path.exists() {
+                eprintln!(
+                    "Error: already initialized at {}. Use --datadir to specify a different path.",
+                    datadir.display()
+                );
+            } else {
+                eprintln!(
+                    "Error: another exfer init may be running for {}. Remove {}.init.lock if stale.",
+                    datadir.display(),
+                    datadir.display()
+                );
+            }
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("ERROR: failed to create lock file: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Run the rest inside a closure so we can clean up the lock on all paths.
+    // std::process::exit() skips Drop, so we use a closure + manual cleanup.
+    let result = run_init_inner(
+        &datadir,
+        &wallet_path,
+        mine,
+        passphrase_env,
+        no_passphrase,
+        json_output,
+        rpc_port,
+    );
+
+    // Always clean up the lock file
+    let _ = std::fs::remove_file(&lock_path);
+
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_init_inner(
+    datadir: &Path,
+    wallet_path: &Path,
+    mine: bool,
+    passphrase_env: Option<String>,
+    no_passphrase: bool,
+    json_output: bool,
+    rpc_port: u16,
+) -> Result<(), String> {
+    if wallet_path.exists() {
+        return Err(format!(
+            "Error: already initialized at {}. Use --datadir to specify a different path.",
+            datadir.display()
+        ));
     }
 
     // Step 3: Generate wallet
@@ -1295,39 +1355,24 @@ fn run_init(
         if !json_output {
             eprintln!("WARNING: Creating unencrypted wallet. Not recommended for production.");
         }
-        if let Err(e) = w.save_unencrypted(&wallet_path) {
-            eprintln!("ERROR: failed to save wallet: {}", e);
-            std::process::exit(1);
-        }
+        w.save_unencrypted(wallet_path)
+            .map_err(|e| format!("ERROR: failed to save wallet: {}", e))?;
     } else if let Some(env_var) = &passphrase_env {
-        let passphrase = match std::env::var(env_var) {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ERROR: Environment variable ${} not set", env_var);
-                std::process::exit(1);
-            }
-        };
+        let passphrase = std::env::var(env_var)
+            .map_err(|_| format!("ERROR: Environment variable ${} not set", env_var))?;
         if passphrase.is_empty() {
-            eprintln!("ERROR: Environment variable ${} is empty", env_var);
-            std::process::exit(1);
+            return Err(format!("ERROR: Environment variable ${} is empty", env_var));
         }
-        if let Err(e) = w.save_encrypted(&wallet_path, passphrase.as_bytes()) {
-            eprintln!("ERROR: failed to save wallet: {}", e);
-            std::process::exit(1);
-        }
+        w.save_encrypted(wallet_path, passphrase.as_bytes())
+            .map_err(|e| format!("ERROR: failed to save wallet: {}", e))?;
+        // Clear the passphrase env var so child processes don't inherit it
+        std::env::remove_var(env_var);
     } else {
         // Interactive mode
-        let passphrase = match prompt_passphrase_confirm() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("ERROR: failed to read passphrase: {}", e);
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = w.save_encrypted(&wallet_path, &passphrase) {
-            eprintln!("ERROR: failed to save wallet: {}", e);
-            std::process::exit(1);
-        }
+        let passphrase = prompt_passphrase_confirm()
+            .map_err(|e| format!("ERROR: failed to read passphrase: {}", e))?;
+        w.save_encrypted(wallet_path, &passphrase)
+            .map_err(|e| format!("ERROR: failed to save wallet: {}", e))?;
     }
 
     let pubkey_hex = hex::encode(w.pubkey());
@@ -1349,10 +1394,8 @@ fn run_init(
 
     // Step 5: Start node
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("exfer"));
-    let log_file = std::fs::File::create(&log_path).unwrap_or_else(|e| {
-        eprintln!("WARNING: failed to create log file: {}", e);
-        std::process::exit(1);
-    });
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("ERROR: failed to create log file: {}", e))?;
     let log_err = log_file.try_clone().unwrap();
 
     let mut cmd = std::process::Command::new(&exe);
@@ -1381,10 +1424,38 @@ fn run_init(
         .spawn();
 
     let node_started = match child {
-        Ok(child) => {
-            // Write PID file
-            let _ = std::fs::write(&pid_path, child.id().to_string());
-            true
+        Ok(mut child) => {
+            let pid = child.id();
+            if let Err(e) = std::fs::write(&pid_path, pid.to_string()) {
+                if !json_output {
+                    eprintln!("WARNING: failed to write PID file: {}", e);
+                }
+            }
+            // Wait briefly to verify the child didn't die immediately
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Child already exited — startup failed
+                    let _ = std::fs::remove_file(&pid_path);
+                    if !json_output {
+                        eprintln!(
+                            "WARNING: node exited immediately (status: {}). Check {}",
+                            status, log_path.display()
+                        );
+                    }
+                    false
+                }
+                Ok(None) => {
+                    // Still running — success. Detach so init can exit.
+                    std::mem::forget(child);
+                    true
+                }
+                Err(_) => {
+                    // Can't check — assume running
+                    std::mem::forget(child);
+                    true
+                }
+            }
         }
         Err(e) => {
             if !json_output {
@@ -1473,6 +1544,8 @@ fn run_init(
             );
         }
     }
+
+    Ok(())
 }
 
 /// Rebuild the UTXO set by replaying the chain from storage.
