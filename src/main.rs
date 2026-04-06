@@ -185,6 +185,27 @@ enum Commands {
         #[command(subcommand)]
         action: ScriptCommands,
     },
+    /// Initialize a new Exfer node: create wallet, start syncing
+    Init {
+        /// Data directory
+        #[arg(long, default_value = "~/.exfer")]
+        datadir: String,
+        /// Enable mining after init
+        #[arg(long)]
+        mine: bool,
+        /// Read wallet passphrase from this environment variable (non-interactive)
+        #[arg(long)]
+        passphrase_env: Option<String>,
+        /// Create unencrypted wallet (not recommended)
+        #[arg(long)]
+        no_passphrase: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// RPC port
+        #[arg(long, default_value = "9334")]
+        rpc_port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1216,6 +1237,241 @@ async fn main() {
                 }
             }
         },
+        Commands::Init {
+            datadir,
+            mine,
+            passphrase_env,
+            no_passphrase,
+            json,
+            rpc_port,
+        } => {
+            run_init(datadir, mine, passphrase_env, no_passphrase, json, rpc_port);
+        }
+    }
+}
+
+fn run_init(
+    datadir_str: String,
+    mine: bool,
+    passphrase_env: Option<String>,
+    no_passphrase: bool,
+    json_output: bool,
+    rpc_port: u16,
+) {
+    // JSON mode requires non-interactive passphrase
+    if json_output && passphrase_env.is_none() && !no_passphrase {
+        eprintln!("ERROR: Use --passphrase-env with --json for non-interactive mode");
+        std::process::exit(1);
+    }
+
+    // Expand ~ in datadir
+    let datadir = if datadir_str.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(&datadir_str[2..])
+    } else {
+        PathBuf::from(&datadir_str)
+    };
+
+    // Step 1: Check for existing init
+    let wallet_path = datadir.join("wallet.key");
+    if wallet_path.exists() {
+        eprintln!(
+            "Error: already initialized at {}. Use --datadir to specify a different path.",
+            datadir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Step 2: Create datadir
+    if let Err(e) = std::fs::create_dir_all(&datadir) {
+        eprintln!("ERROR: failed to create {}: {}", datadir.display(), e);
+        std::process::exit(1);
+    }
+
+    // Step 3: Generate wallet
+    let w = Wallet::generate();
+    if no_passphrase {
+        if !json_output {
+            eprintln!("WARNING: Creating unencrypted wallet. Not recommended for production.");
+        }
+        if let Err(e) = w.save_unencrypted(&wallet_path) {
+            eprintln!("ERROR: failed to save wallet: {}", e);
+            std::process::exit(1);
+        }
+    } else if let Some(env_var) = &passphrase_env {
+        let passphrase = match std::env::var(env_var) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("ERROR: Environment variable ${} not set", env_var);
+                std::process::exit(1);
+            }
+        };
+        if passphrase.is_empty() {
+            eprintln!("ERROR: Environment variable ${} is empty", env_var);
+            std::process::exit(1);
+        }
+        if let Err(e) = w.save_encrypted(&wallet_path, passphrase.as_bytes()) {
+            eprintln!("ERROR: failed to save wallet: {}", e);
+            std::process::exit(1);
+        }
+    } else {
+        // Interactive mode
+        let passphrase = match prompt_passphrase_confirm() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ERROR: failed to read passphrase: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = w.save_encrypted(&wallet_path, &passphrase) {
+            eprintln!("ERROR: failed to save wallet: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    let pubkey_hex = hex::encode(w.pubkey());
+    let address = w.address().to_string();
+    let rpc_url = format!("http://127.0.0.1:{}", rpc_port);
+    let log_path = datadir.join("node.log");
+    let pid_path = datadir.join("node.pid");
+
+    // Step 4: Write config
+    let config_path = datadir.join("config.toml");
+    let config_content = format!(
+        "rpc_port = {}\np2p_port = 9333\ndatadir = \"{}\"\ndns_seeds = [\"seed.exfer.org\"]\n",
+        rpc_port,
+        datadir.display()
+    );
+    if let Err(e) = std::fs::write(&config_path, &config_content) {
+        eprintln!("WARNING: failed to write config: {}", e);
+    }
+
+    // Step 5: Start node
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("exfer"));
+    let log_file = std::fs::File::create(&log_path).unwrap_or_else(|e| {
+        eprintln!("WARNING: failed to create log file: {}", e);
+        std::process::exit(1);
+    });
+    let log_err = log_file.try_clone().unwrap();
+
+    let mut cmd = std::process::Command::new(&exe);
+    if mine {
+        cmd.arg("mine")
+            .arg("--datadir")
+            .arg(&datadir)
+            .arg("--miner-pubkey")
+            .arg(&pubkey_hex)
+            .arg("--rpc-bind")
+            .arg(format!("127.0.0.1:{}", rpc_port))
+            .arg("--repair-perms");
+    } else {
+        cmd.arg("node")
+            .arg("--datadir")
+            .arg(&datadir)
+            .arg("--rpc-bind")
+            .arg(format!("127.0.0.1:{}", rpc_port))
+            .arg("--repair-perms");
+    }
+
+    let child = cmd
+        .stdout(log_file)
+        .stderr(log_err)
+        .stdin(std::process::Stdio::null())
+        .spawn();
+
+    let node_started = match child {
+        Ok(child) => {
+            // Write PID file
+            let _ = std::fs::write(&pid_path, child.id().to_string());
+            true
+        }
+        Err(e) => {
+            if !json_output {
+                eprintln!("WARNING: failed to start node: {}", e);
+                eprintln!("Check {}", log_path.display());
+            }
+            false
+        }
+    };
+
+    // Step 6: Wait for RPC (best effort, up to 10s)
+    let mut sync_height: Option<u64> = None;
+    if node_started {
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if let Ok(output) = std::process::Command::new("curl")
+                .args(["-s", &rpc_url, "-d",
+                    r#"{"jsonrpc":"2.0","id":1,"method":"get_block_height"}"#])
+                .output()
+            {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(h) = v["result"]["height"].as_u64() {
+                            sync_height = Some(h);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 7: Print summary
+    let task_server = "http://82.221.100.201:8080/api/v1/tasks";
+
+    if json_output {
+        let j = serde_json::json!({
+            "address": address,
+            "pubkey": pubkey_hex,
+            "rpc": rpc_url,
+            "datadir": datadir.display().to_string(),
+            "wallet": wallet_path.display().to_string(),
+            "log": log_path.display().to_string(),
+            "node_started": node_started,
+            "mining": mine,
+            "sync": {
+                "current_height": sync_height,
+                "status": if sync_height.is_some() { "syncing" } else { "starting" },
+            },
+            "task_server": task_server,
+        });
+        println!("{}", serde_json::to_string_pretty(&j).unwrap());
+    } else {
+        println!();
+        println!("Exfer initialized.");
+        println!();
+        println!("Address : {}", address);
+        println!("Pubkey  : {}", pubkey_hex);
+        println!("RPC     : {}", rpc_url);
+        println!("Log     : {}", log_path.display());
+        println!();
+        if let Some(h) = sync_height {
+            println!("Node is syncing. Current height: {}", h);
+        } else if node_started {
+            println!("Node started. Waiting for sync to begin...");
+        } else {
+            println!("Node failed to start. Check {}", log_path.display());
+        }
+        if mine {
+            println!("Mining enabled. Rewards go to {}", address);
+        }
+        println!();
+        println!("Earn EXFER by completing tasks: {}", task_server);
+        println!();
+        println!(
+            "To check balance:  exfer wallet balance --wallet {} --rpc {}",
+            wallet_path.display(),
+            rpc_url
+        );
+        if !mine {
+            println!(
+                "To enable mining:  exfer mine --datadir {} --miner-pubkey {} --rpc-bind 127.0.0.1:{}",
+                datadir.display(),
+                pubkey_hex,
+                rpc_port
+            );
+        }
     }
 }
 

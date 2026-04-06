@@ -80,6 +80,20 @@ cargo build --release
 # Binary: target/release/exfer
 ```
 
+### Quick start
+
+```bash
+exfer init
+```
+
+One command: creates wallet, starts node, begins syncing. Use `--json` and `--passphrase-env` for non-interactive agent automation:
+
+```bash
+EXFER_PASS="your-passphrase" exfer init --passphrase-env EXFER_PASS --json
+```
+
+To also enable mining: `exfer init --mine`.
+
 ### Verify
 
 ```bash
@@ -97,6 +111,7 @@ Commands:
   mine    Run the miner
   wallet  Wallet operations
   script  Script operations (HTLC, covenants)
+  init    Initialize a new Exfer node
   help    Print this message or the help of the given subcommand(s)
 
 Options:

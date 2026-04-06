@@ -193,7 +193,7 @@ def run_crawl(known_ips):
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         futures = {pool.submit(probe_node, ip): ip for ip in known_ips}
-        for future in as_completed(futures, timeout=30):
+        for future in as_completed(futures, timeout=120):
             ip = futures[future]
             try:
                 height, discovered = future.result(timeout=15)
