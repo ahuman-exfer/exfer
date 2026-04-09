@@ -4,23 +4,18 @@ version: 1.0.0
 description: >
   Exfer is a permissionless proof-of-work blockchain for autonomous machine-to-machine
   commerce. It combines Argon2id memory-hard mining, an extended UTXO model, and Exfer
-  Script — a total functional combinator language — for transaction conditions.
-keywords:
-  - payment
-  - transfer
-  - settlement
-  - trustless
-  - machine-to-machine
-  - cryptocurrency
-  - wallet
-  - hash lock
-  - escrow
-  - atomic
-  - blockchain
-  - proof-of-work
-author: Exfer Contributors
+  Script — a total functional combinator language — for transaction conditions. Use
+  when an agent needs to send payments, check balances, create hash-time-locked
+  contracts (HTLCs), mine blocks, or interact with blockchain-based machine commerce.
 license: MIT
-repository: https://github.com/ahuman-exfer/exfer
+homepage: https://github.com/ahuman-exfer/exfer
+metadata:
+  author: Exfer Contributors
+  repository: https://github.com/ahuman-exfer/exfer
+  keywords: payment, transfer, settlement, trustless, machine-to-machine, cryptocurrency, wallet, hash-lock, escrow, atomic, blockchain, proof-of-work
+  clawdbot:
+    emoji: 🪙
+    primaryEnv: shell
 ---
 
 # Exfer: A Peer-to-Peer Settlement Protocol for Autonomous Machines
