@@ -1264,11 +1264,17 @@ fn run_init(
         std::process::exit(1);
     }
 
-    // Expand ~ in datadir
-    let datadir = if datadir_str.starts_with("~/") {
+    // Expand ~ in datadir (cross-platform)
+    let datadir = if datadir_str.starts_with("~/") || datadir_str.starts_with("~\\") {
         let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(&datadir_str[2..])
+    } else if datadir_str == "~" {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
     } else {
         PathBuf::from(&datadir_str)
     };
@@ -1446,13 +1452,14 @@ fn run_init_inner(
                     false
                 }
                 Ok(None) => {
-                    // Still running — success. Detach so init can exit.
-                    std::mem::forget(child);
+                    // Still running — success. Dropping Child closes handles
+                    // but does NOT kill the process on any platform.
+                    drop(child);
                     true
                 }
                 Err(_) => {
                     // Can't check — assume running
-                    std::mem::forget(child);
+                    drop(child);
                     true
                 }
             }

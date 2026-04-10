@@ -25,6 +25,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: exfer-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: exfer-windows-x86_64.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -48,7 +51,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/exfer ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/exfer${{ contains(matrix.target, 'windows') && '.exe' || '' }} ${{ matrix.artifact }}
+        shell: bash
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -73,3 +77,4 @@ jobs:
             artifacts/exfer-linux-arm64/exfer-linux-arm64
             artifacts/exfer-macos-x86_64/exfer-macos-x86_64
             artifacts/exfer-macos-arm64/exfer-macos-arm64
+            artifacts/exfer-windows-x86_64.exe/exfer-windows-x86_64.exe
