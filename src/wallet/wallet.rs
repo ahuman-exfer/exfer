@@ -381,8 +381,12 @@ fn atomic_write(path: &Path, data: &[u8], _mode: u32) -> Result<(), WalletError>
         fs::rename(&tmp_path, path).map_err(|e| WalletError::Io(e.to_string()))?;
 
         // Fsync the parent directory so the new directory entry is durable.
-        let dir = fs::File::open(parent).map_err(|e| WalletError::Io(e.to_string()))?;
-        dir.sync_all().map_err(|e| WalletError::Io(e.to_string()))?;
+        // Windows does not support opening a directory as a file for fsync.
+        #[cfg(unix)]
+        {
+            let dir = fs::File::open(parent).map_err(|e| WalletError::Io(e.to_string()))?;
+            dir.sync_all().map_err(|e| WalletError::Io(e.to_string()))?;
+        }
 
         Ok(())
     })();

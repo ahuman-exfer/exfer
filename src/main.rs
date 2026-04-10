@@ -2233,10 +2233,14 @@ async fn run_node(
                 drop(file);
                 std::fs::rename(&tmp_path, &key_path)
                     .map_err(|e| format!("failed to rename identity file: {e}"))?;
-                let dir = std::fs::File::open(parent)
-                    .map_err(|e| format!("failed to open parent dir for fsync: {e}"))?;
-                dir.sync_all()
-                    .map_err(|e| format!("failed to fsync parent dir: {e}"))?;
+                // Windows does not support opening a directory as a file for fsync.
+                #[cfg(unix)]
+                {
+                    let dir = std::fs::File::open(parent)
+                        .map_err(|e| format!("failed to open parent dir for fsync: {e}"))?;
+                    dir.sync_all()
+                        .map_err(|e| format!("failed to fsync parent dir: {e}"))?;
+                }
                 Ok(())
             })();
             if write_result.is_err() {
