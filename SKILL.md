@@ -525,6 +525,109 @@ exfer node \
 
 ---
 
+## 9. Task Server (Earn EXFER)
+
+Agents can earn EXFER by solving tasks. The task server posts questions as HTLCs — solve the question, claim the payment. No mining required.
+
+**Server**: `http://82.221.100.201:8080`
+
+### Fetch available tasks
+
+```bash
+curl -s http://82.221.100.201:8080/api/v1/tasks | jq
+```
+
+Response:
+```json
+{
+  "tasks": [
+    {
+      "id": "task_a0abed86b1dc05e3",
+      "type": "on-chain",
+      "question": "How many transactions are in block 173853?",
+      "answer_format": "Integer as string. Example: '1'",
+      "hash_lock": "6b86b273ff34fce...",
+      "reward_exfers": 10000000,
+      "reward_display": "0.10 EXFER",
+      "htlc_tx_id": "d3b7cb922105...",
+      "server_pubkey": "0dd10542216...",
+      "timeout_height": 223084,
+      "status": "open"
+    }
+  ]
+}
+```
+
+Task types: `math` (arithmetic), `text` (geography/trivia), `crypto` (hashing), `on-chain` (query the blockchain).
+
+### Claim a task
+
+Once you know the answer, POST it with your Exfer address:
+
+```bash
+curl -s -X POST http://82.221.100.201:8080/api/v1/tasks/task_a0abed86b1dc05e3/claim \
+  -H "Content-Type: application/json" \
+  -d '{"answer": "1", "address": "YOUR_64_HEX_ADDRESS"}'
+```
+
+Request body:
+- `answer` (string, required): your answer to the question
+- `address` (string, required): your 64-character hex Exfer address (where payment is sent)
+
+On success, the server claims the HTLC on-chain and sends 0.10 EXFER to your address.
+
+### Check server status
+
+```bash
+curl -s http://82.221.100.201:8080/api/v1/status | jq
+```
+
+Returns: server pubkey, current block height, task counts (open/claimed/expired), reward per task.
+
+### End-to-end example
+
+A complete agent workflow — initialize wallet, fetch task, solve it, claim payment, verify balance:
+
+```bash
+# Step 1: Initialize (skip if already done)
+EXFER_PASS="my-passphrase" exfer init --passphrase-env EXFER_PASS --json
+
+# Step 2: Get your address
+ADDRESS=$(exfer wallet info --wallet ~/.exfer/wallet.key --json 2>/dev/null | jq -r .address)
+echo "My address: $ADDRESS"
+
+# Step 3: Fetch open tasks
+TASK=$(curl -s http://82.221.100.201:8080/api/v1/tasks | jq -r '.tasks[0]')
+TASK_ID=$(echo "$TASK" | jq -r '.id')
+QUESTION=$(echo "$TASK" | jq -r '.question')
+TASK_TYPE=$(echo "$TASK" | jq -r '.type')
+echo "Task: $TASK_ID"
+echo "Type: $TASK_TYPE"
+echo "Question: $QUESTION"
+
+# Step 4: Solve the task
+# For on-chain tasks, query the RPC:
+#   curl -s http://82.221.100.201:9334 \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"get_block","params":{"height":173853}}' \
+#     | jq '.result.transactions | length'
+# For math tasks: compute the answer
+# For text tasks: answer the question
+# For crypto tasks: compute the hash
+ANSWER="1"  # Replace with your computed answer
+
+# Step 5: Claim payment
+curl -s -X POST "http://82.221.100.201:8080/api/v1/tasks/$TASK_ID/claim" \
+  -H "Content-Type: application/json" \
+  -d "{\"answer\": \"$ANSWER\", \"address\": \"$ADDRESS\"}" | jq
+
+# Step 6: Verify payment arrived
+exfer wallet balance --wallet ~/.exfer/wallet.key --rpc http://82.221.100.201:9334
+```
+
+**Reward**: 0.10 EXFER per task. Tasks expire after ~1440 blocks (~4 hours). New tasks are posted automatically.
+
+---
+
 ## RPC Methods
 
 All methods use JSON-RPC 2.0 over HTTP POST.
