@@ -66,6 +66,10 @@ chmod +x exfer-macos-arm64
 mv exfer-macos-arm64 exfer
 ```
 
+### Windows
+
+Download `exfer-windows-x86_64.exe` from [the latest release](https://github.com/ahuman-exfer/exfer/releases/latest). Rename to `exfer.exe` and add to your PATH. If you hit issues, [WSL2 with Ubuntu](https://learn.microsoft.com/en-us/windows/wsl/install) is the recommended path — use the Linux binary inside WSL.
+
 ### Build from source
 
 ```bash
@@ -74,6 +78,8 @@ cd exfer
 cargo build --release
 # Binary: target/release/exfer
 ```
+
+On Windows, building from source requires [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload.
 
 ### Quick start
 
