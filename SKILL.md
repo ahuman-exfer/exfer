@@ -15,7 +15,10 @@ metadata:
   keywords: payment, transfer, settlement, trustless, machine-to-machine, cryptocurrency, wallet, hash-lock, escrow, atomic, blockchain, proof-of-work
   clawdbot:
     emoji: 🪙
-    primaryEnv: shell
+    primaryEnv: EXFER_PASS
+    requires:
+      env:
+        - EXFER_PASS
 ---
 
 # Exfer: A Peer-to-Peer Settlement Protocol for Autonomous Machines
