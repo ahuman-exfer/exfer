@@ -2,12 +2,26 @@
 
 Peer-to-peer settlement for autonomous machines.
 
-## Build
+## For Agents
+
+Install and initialize in one command:
+
+```bash
+exfer init --passphrase-env EXFER_PASS --mine --json
+```
+
+Full agent interface: [SKILL.md](SKILL.md)
+
+## For Developers
+
+Build from source:
+
 ```bash
 cargo build --release
 ```
 
-## Run
+Run:
+
 ```bash
 # Generate a wallet
 ./target/release/exfer wallet generate --output wallet.key --json
