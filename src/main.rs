@@ -361,6 +361,353 @@ enum ScriptCommands {
         #[arg(long)]
         json: bool,
     },
+
+    // ── Multisig ──────────────────────────────────────────────────────
+
+    /// Lock funds in a 2-of-2 multisig
+    Multisig2of2Lock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        /// Second pubkey (hex)
+        #[arg(long)]
+        pubkey_b: String,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spend from a 2-of-2 multisig (both wallets required)
+    Multisig2of2Spend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        /// Second wallet key file
+        #[arg(long)]
+        wallet2: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Destination address (hex, 64 chars)
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Lock funds in a 1-of-2 multisig
+    Multisig1of2Lock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        pubkey_b: String,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spend from a 1-of-2 multisig (either key)
+    Multisig1of2Spend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Other pubkey (hex) — needed to reconstruct script
+        #[arg(long)]
+        other_pubkey: String,
+        /// Which key is signing: "a" (first/left) or "b" (second/right)
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Lock funds in a 2-of-3 multisig
+    Multisig2of3Lock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        pubkey_b: String,
+        #[arg(long)]
+        pubkey_c: String,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spend from a 2-of-3 multisig (two wallets required)
+    Multisig2of3Spend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        wallet2: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Destination address (hex, 64 chars)
+        #[arg(long)]
+        to: String,
+        /// All three pubkeys for script reconstruction
+        #[arg(long)]
+        pubkey_a: String,
+        #[arg(long)]
+        pubkey_b: String,
+        #[arg(long)]
+        pubkey_c: String,
+        /// Which pair is signing: "ab", "ac", or "bc"
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    // ── Vault ─────────────────────────────────────────────────────────
+
+    /// Lock funds in a vault (timelock + recovery key)
+    VaultLock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        /// Recovery pubkey (hex)
+        #[arg(long)]
+        recovery_pubkey: String,
+        /// Block height after which primary key can spend
+        #[arg(long)]
+        locktime: u64,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spend from vault (primary key, after locktime)
+    VaultSpend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Recovery pubkey (hex) — for script reconstruction
+        #[arg(long)]
+        recovery_pubkey: String,
+        #[arg(long)]
+        locktime: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Emergency recovery from vault (recovery key, anytime)
+    VaultRecover {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Primary pubkey (hex) — for script reconstruction
+        #[arg(long)]
+        primary_pubkey: String,
+        #[arg(long)]
+        locktime: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    // ── Escrow ────────────────────────────────────────────────────────
+
+    /// Lock funds in escrow (mutual + arbiter + timeout)
+    EscrowLock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        /// Party B pubkey (hex)
+        #[arg(long)]
+        party_b: String,
+        /// Arbiter pubkey (hex)
+        #[arg(long)]
+        arbiter: String,
+        /// Timeout block height (party A reclaims after this)
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release escrow by mutual agreement (both parties sign)
+    EscrowRelease {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        wallet2: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Destination address (hex, 64 chars)
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        party_a: String,
+        #[arg(long)]
+        party_b: String,
+        #[arg(long)]
+        arbiter: String,
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Arbiter decides escrow outcome
+    EscrowArbitrate {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Destination address (hex, 64 chars)
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        party_a: String,
+        #[arg(long)]
+        party_b: String,
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim escrow after timeout (party A)
+    EscrowReclaim {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        #[arg(long)]
+        party_b: String,
+        #[arg(long)]
+        arbiter: String,
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    // ── Delegation ────────────────────────────────────────────────────
+
+    /// Lock funds with delegation (owner + time-limited delegate)
+    DelegationLock {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        /// Delegate pubkey (hex)
+        #[arg(long)]
+        delegate: String,
+        /// Delegation expiry block height
+        #[arg(long)]
+        expiry: u64,
+        #[arg(long, value_parser = parse_amount)]
+        amount: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Owner spends delegated funds (anytime)
+    DelegationOwnerSpend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Delegate pubkey (hex) — for script reconstruction
+        #[arg(long)]
+        delegate: String,
+        #[arg(long)]
+        expiry: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delegate spends (before expiry only)
+    DelegationDelegateSpend {
+        #[arg(long, default_value = "wallet.key")]
+        wallet: PathBuf,
+        #[arg(long)]
+        tx_id: String,
+        #[arg(long, default_value = "0")]
+        output_index: u32,
+        /// Owner pubkey (hex) — for script reconstruction
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        expiry: u64,
+        #[arg(long, default_value = "100000", value_parser = parse_amount)]
+        fee: u64,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Hardcoded fallback seed peers.
@@ -1236,6 +1583,398 @@ async fn main() {
                     }
                 }
             }
+
+            // ── Multisig 2-of-2 ──────────────────────────────────────────
+
+            ScriptCommands::Multisig2of2Lock {
+                wallet: path, pubkey_b, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let pk_a = w.pubkey();
+                let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
+                require_distinct_keys(&[(&pk_a, "pubkey_a"), (&pk_b, "pubkey_b")]);
+                let program = covenants::multisig::multisig_2of2(&pk_a, &pk_b);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-2of2", "output_index": 0, "amount": amount,
+                    "pubkey_a": hex::encode(pk_a), "pubkey_b": pubkey_b,
+                }));
+            }
+            ScriptCommands::Multisig2of2Spend {
+                wallet: path, wallet2: path2, tx_id: tx_id_hex, output_index, to, fee, rpc, json,
+            } => {
+                let w_a = load_wallet_interactive(&path);
+                let w_b = load_wallet_interactive(&path2);
+                let pk_a = w_a.pubkey();
+                let pk_b = w_b.pubkey();
+                let dest = parse_pubkey_hex(&to, "to");
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
+                let sig_a = sign_tx_with_wallet(&tx, &w_a);
+                let sig_b = sign_tx_with_wallet(&tx, &w_b);
+                use script::value::Value;
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&Value::Bytes(sig_a.to_bytes().to_vec()).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig_b.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::multisig::multisig_2of2(&pk_a, &pk_b));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-2of2-spend", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
+                }));
+            }
+
+            // ── Multisig 1-of-2 ──────────────────────────────────────────
+
+            ScriptCommands::Multisig1of2Lock {
+                wallet: path, pubkey_b, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let pk_a = w.pubkey();
+                let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
+                require_distinct_keys(&[(&pk_a, "pubkey_a"), (&pk_b, "pubkey_b")]);
+                let program = covenants::multisig::multisig_1of2(&pk_a, &pk_b);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-1of2", "output_index": 0, "amount": amount,
+                    "pubkey_a": hex::encode(pk_a), "pubkey_b": pubkey_b,
+                }));
+            }
+            ScriptCommands::Multisig1of2Spend {
+                wallet: path, tx_id: tx_id_hex, output_index, other_pubkey, path: key_path, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let my_pk = w.pubkey();
+                let other_pk = parse_pubkey_hex(&other_pubkey, "other_pubkey");
+                let (pk_a, pk_b) = match key_path.as_str() {
+                    "a" => (my_pk, other_pk),
+                    "b" => (other_pk, my_pk),
+                    _ => { eprintln!("ERROR: --path must be 'a' or 'b'"); std::process::exit(1); }
+                };
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let selector = match key_path.as_str() {
+                    "a" => Value::Left(Box::new(Value::Unit)),
+                    _ => Value::Right(Box::new(Value::Unit)),
+                };
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&selector.serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::multisig::multisig_1of2(&pk_a, &pk_b));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-1of2-spend", "spent_from": tx_id_hex,
+                    "path": key_path, "amount": value.saturating_sub(fee),
+                }));
+            }
+
+            // ── Multisig 2-of-3 ──────────────────────────────────────────
+
+            ScriptCommands::Multisig2of3Lock {
+                wallet: path, pubkey_b, pubkey_c, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let pk_a = w.pubkey();
+                let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
+                let pk_c = parse_pubkey_hex(&pubkey_c, "pubkey_c");
+                require_distinct_keys(&[(&pk_a, "pubkey_a"), (&pk_b, "pubkey_b"), (&pk_c, "pubkey_c")]);
+                let program = covenants::multisig::multisig_2of3(&pk_a, &pk_b, &pk_c);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-2of3", "output_index": 0, "amount": amount,
+                    "pubkey_a": hex::encode(pk_a), "pubkey_b": pubkey_b, "pubkey_c": pubkey_c,
+                }));
+            }
+            ScriptCommands::Multisig2of3Spend {
+                wallet: path, wallet2: path2, tx_id: tx_id_hex, output_index, to,
+                pubkey_a, pubkey_b, pubkey_c, path: pair_path, fee, rpc, json,
+            } => {
+                let w1 = load_wallet_interactive(&path);
+                let w2 = load_wallet_interactive(&path2);
+                let dest = parse_pubkey_hex(&to, "to");
+                let pk_a = parse_pubkey_hex(&pubkey_a, "pubkey_a");
+                let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
+                let pk_c = parse_pubkey_hex(&pubkey_c, "pubkey_c");
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
+                let sig1 = sign_tx_with_wallet(&tx, &w1);
+                let sig2 = sign_tx_with_wallet(&tx, &w2);
+                use script::value::Value;
+                let selector = match pair_path.as_str() {
+                    "ab" => Value::Left(Box::new(Value::Left(Box::new(Value::Unit)))),
+                    "ac" => Value::Left(Box::new(Value::Right(Box::new(Value::Unit)))),
+                    "bc" => Value::Right(Box::new(Value::Unit)),
+                    _ => { eprintln!("ERROR: --path must be 'ab', 'ac', or 'bc'"); std::process::exit(1); }
+                };
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&selector.serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig1.to_bytes().to_vec()).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig2.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::multisig::multisig_2of3(&pk_a, &pk_b, &pk_c));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "multisig-2of3-spend", "spent_from": tx_id_hex,
+                    "path": pair_path, "amount": value.saturating_sub(fee),
+                }));
+            }
+
+            // ── Vault ─────────────────────────────────────────────────────
+
+            ScriptCommands::VaultLock {
+                wallet: path, recovery_pubkey, locktime, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let primary_pk = w.pubkey();
+                let recovery_pk = parse_pubkey_hex(&recovery_pubkey, "recovery_pubkey");
+                require_distinct_keys(&[(&primary_pk, "primary_pubkey"), (&recovery_pk, "recovery_pubkey")]);
+                let program = covenants::vault::vault(&primary_pk, &recovery_pk, locktime);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "vault", "output_index": 0, "amount": amount,
+                    "primary_pubkey": hex::encode(primary_pk), "recovery_pubkey": recovery_pubkey,
+                    "locktime": locktime,
+                }));
+            }
+            ScriptCommands::VaultSpend {
+                wallet: path, tx_id: tx_id_hex, output_index, recovery_pubkey, locktime, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let primary_pk = w.pubkey();
+                let recovery_pk = parse_pubkey_hex(&recovery_pubkey, "recovery_pubkey");
+                let current_height = rpc::rpc_call(&rpc, "get_block_height", serde_json::json!({}))
+                    .unwrap_or_else(|e| { eprintln!("ERROR: {}", e); std::process::exit(1); })["height"]
+                    .as_u64().unwrap_or(0);
+                if current_height <= locktime {
+                    eprintln!("ERROR: locktime not reached (current {} <= locktime {})", current_height, locktime);
+                    std::process::exit(1);
+                }
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&Value::Left(Box::new(Value::Unit)).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "vault-spend", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
+                }));
+            }
+            ScriptCommands::VaultRecover {
+                wallet: path, tx_id: tx_id_hex, output_index, primary_pubkey, locktime, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let primary_pk = parse_pubkey_hex(&primary_pubkey, "primary_pubkey");
+                let recovery_pk = w.pubkey();
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&Value::Right(Box::new(Value::Unit)).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "vault-recover", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
+                }));
+            }
+
+            // ── Escrow ────────────────────────────────────────────────────
+
+            ScriptCommands::EscrowLock {
+                wallet: path, party_b, arbiter, timeout, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let pk_a = w.pubkey();
+                let pk_b = parse_pubkey_hex(&party_b, "party_b");
+                let pk_arb = parse_pubkey_hex(&arbiter, "arbiter");
+                require_distinct_keys(&[(&pk_a, "party_a"), (&pk_b, "party_b"), (&pk_arb, "arbiter")]);
+                let program = covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "escrow", "output_index": 0, "amount": amount,
+                    "party_a": hex::encode(pk_a), "party_b": party_b,
+                    "arbiter": arbiter, "timeout": timeout,
+                }));
+            }
+            ScriptCommands::EscrowRelease {
+                wallet: path, wallet2: path2, tx_id: tx_id_hex, output_index, to,
+                party_a, party_b, arbiter, timeout, fee, rpc, json,
+            } => {
+                let w_a = load_wallet_interactive(&path);
+                let w_b = load_wallet_interactive(&path2);
+                let dest = parse_pubkey_hex(&to, "to");
+                let pk_a = parse_pubkey_hex(&party_a, "party_a");
+                let pk_b = parse_pubkey_hex(&party_b, "party_b");
+                let pk_arb = parse_pubkey_hex(&arbiter, "arbiter");
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
+                let sig_a = sign_tx_with_wallet(&tx, &w_a);
+                let sig_b = sign_tx_with_wallet(&tx, &w_b);
+                use script::value::Value;
+                let selector = Value::Left(Box::new(Value::Left(Box::new(Value::Unit))));
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&selector.serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig_a.to_bytes().to_vec()).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig_b.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "escrow-release", "spent_from": tx_id_hex,
+                    "path": "mutual", "amount": value.saturating_sub(fee),
+                }));
+            }
+            ScriptCommands::EscrowArbitrate {
+                wallet: path, tx_id: tx_id_hex, output_index, to,
+                party_a, party_b, timeout, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let dest = parse_pubkey_hex(&to, "to");
+                let pk_a = parse_pubkey_hex(&party_a, "party_a");
+                let pk_b = parse_pubkey_hex(&party_b, "party_b");
+                let pk_arb = w.pubkey();
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let selector = Value::Left(Box::new(Value::Right(Box::new(Value::Unit))));
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&selector.serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "escrow-arbitrate", "spent_from": tx_id_hex,
+                    "path": "arbiter", "amount": value.saturating_sub(fee),
+                }));
+            }
+            ScriptCommands::EscrowReclaim {
+                wallet: path, tx_id: tx_id_hex, output_index,
+                party_b, arbiter, timeout, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let pk_a = w.pubkey();
+                let pk_b = parse_pubkey_hex(&party_b, "party_b");
+                let pk_arb = parse_pubkey_hex(&arbiter, "arbiter");
+                let current_height = rpc::rpc_call(&rpc, "get_block_height", serde_json::json!({}))
+                    .unwrap_or_else(|e| { eprintln!("ERROR: {}", e); std::process::exit(1); })["height"]
+                    .as_u64().unwrap_or(0);
+                if current_height <= timeout {
+                    eprintln!("ERROR: timeout not reached (current {} <= timeout {})", current_height, timeout);
+                    std::process::exit(1);
+                }
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let selector = Value::Right(Box::new(Value::Unit));
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&selector.serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "escrow-reclaim", "spent_from": tx_id_hex,
+                    "path": "timeout", "amount": value.saturating_sub(fee),
+                }));
+            }
+
+            // ── Delegation ────────────────────────────────────────────────
+
+            ScriptCommands::DelegationLock {
+                wallet: path, delegate, expiry, amount, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let owner_pk = w.pubkey();
+                let delegate_pk = parse_pubkey_hex(&delegate, "delegate");
+                require_distinct_keys(&[(&owner_pk, "owner"), (&delegate_pk, "delegate")]);
+                let program = covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry);
+                let script_bytes = script::serialize_program(&program);
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(&selected, sel_total, amount, fee, script_bytes, w.address().as_bytes().to_vec());
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee = sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "delegation", "output_index": 0, "amount": amount,
+                    "owner": hex::encode(owner_pk), "delegate": delegate, "expiry": expiry,
+                }));
+            }
+            ScriptCommands::DelegationOwnerSpend {
+                wallet: path, tx_id: tx_id_hex, output_index, delegate, expiry, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let owner_pk = w.pubkey();
+                let delegate_pk = parse_pubkey_hex(&delegate, "delegate");
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&Value::Left(Box::new(Value::Unit)).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "delegation-owner-spend", "spent_from": tx_id_hex,
+                    "amount": value.saturating_sub(fee),
+                }));
+            }
+            ScriptCommands::DelegationDelegateSpend {
+                wallet: path, tx_id: tx_id_hex, output_index, owner, expiry, fee, rpc, json,
+            } => {
+                let w = load_wallet_interactive(&path);
+                let owner_pk = parse_pubkey_hex(&owner, "owner");
+                let delegate_pk = w.pubkey();
+                let current_height = rpc::rpc_call(&rpc, "get_block_height", serde_json::json!({}))
+                    .unwrap_or_else(|e| { eprintln!("ERROR: {}", e); std::process::exit(1); })["height"]
+                    .as_u64().unwrap_or(0);
+                if current_height >= expiry {
+                    eprintln!("ERROR: delegation expired (current {} >= expiry {})", current_height, expiry);
+                    std::process::exit(1);
+                }
+                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
+                let sig = sign_tx_with_wallet(&tx, &w);
+                use script::value::Value;
+                let mut witness_data = Vec::new();
+                witness_data.extend_from_slice(&Value::Right(Box::new(Value::Unit)).serialize());
+                witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
+                tx.witnesses[0].witness = witness_data;
+                verify_locked_script(&locked_script, &covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
+                submit_tx(&rpc, &tx, json, serde_json::json!({
+                    "type": "delegation-delegate-spend", "spent_from": tx_id_hex,
+                    "amount": value.saturating_sub(fee),
+                }));
+            }
         },
         Commands::Init {
             datadir,
@@ -1828,6 +2567,307 @@ fn load_wallet_interactive(path: &Path) -> Wallet {
             }
         }
     }
+}
+
+// ── Covenant CLI helpers ──────────────────────────────────────────────────
+
+fn verify_locked_script(locked_script: &[u8], expected_program: &crate::script::ast::Program) {
+    let expected = script::serialize_program(expected_program);
+    if locked_script != expected {
+        eprintln!("ERROR: lock output script does not match reconstructed covenant script");
+        eprintln!("  Check that pubkeys, timeouts, and other parameters match the original lock");
+        std::process::exit(1);
+    }
+}
+
+fn require_distinct_keys(keys: &[(&[u8; 32], &str)]) {
+    for i in 0..keys.len() {
+        for j in (i + 1)..keys.len() {
+            if keys[i].0 == keys[j].0 {
+                eprintln!(
+                    "ERROR: {} and {} must be distinct pubkeys (got identical keys)",
+                    keys[i].1, keys[j].1
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn parse_pubkey_hex(hex_str: &str, name: &str) -> [u8; 32] {
+    let bytes = hex::decode(hex_str).unwrap_or_else(|e| {
+        eprintln!("ERROR: invalid {} hex: {}", name, e);
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("ERROR: {} must be 32 bytes (64 hex chars)", name);
+        std::process::exit(1);
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    arr
+}
+
+fn fetch_lock_tx_output(
+    rpc: &str,
+    tx_id_hex: &str,
+    output_index: u32,
+) -> (Hash256, u64, Vec<u8>) {
+    let tx_id_bytes = hex::decode(tx_id_hex).unwrap_or_else(|e| {
+        eprintln!("ERROR: invalid tx_id hex: {}", e);
+        std::process::exit(1);
+    });
+    if tx_id_bytes.len() != 32 {
+        eprintln!("ERROR: tx_id must be 32 bytes");
+        std::process::exit(1);
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&tx_id_bytes);
+    let tx_id = Hash256(arr);
+
+    let tx_result = rpc::rpc_call(rpc, "get_transaction", serde_json::json!({"hash": tx_id_hex}))
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        });
+    let tx_hex_str = tx_result["tx_hex"].as_str().unwrap_or_else(|| {
+        eprintln!("ERROR: transaction not found");
+        std::process::exit(1);
+    });
+    let raw = hex::decode(tx_hex_str).unwrap();
+    let (tx, _) = types::transaction::Transaction::deserialize(&raw).unwrap_or_else(|e| {
+        eprintln!("ERROR: failed to deserialize lock tx: {:?}", e);
+        std::process::exit(1);
+    });
+    let output = tx
+        .outputs
+        .get(output_index as usize)
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: output index {} not found in lock tx", output_index);
+            std::process::exit(1);
+        });
+    (tx_id, output.value, output.script.clone())
+}
+
+fn fetch_utxos_select(
+    rpc: &str,
+    w: &Wallet,
+    amount: u64,
+    fee: u64,
+) -> (Vec<(types::transaction::OutPoint, u64)>, u64) {
+    let address_hex = w.address().to_string();
+    let utxos_result =
+        rpc::rpc_call(rpc, "get_address_utxos", serde_json::json!({"address": address_hex}))
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: {}", e);
+                std::process::exit(1);
+            });
+    let tip_h = utxos_result["tip_height"].as_u64().unwrap_or(0);
+    let utxo_entries = utxos_result["utxos"].as_array().cloned().unwrap_or_default();
+    let mut utxo_set = chain::state::UtxoSet::new();
+    for entry in &utxo_entries {
+        let tx_id_hex = entry["tx_id"].as_str().unwrap_or("");
+        let output_index = entry["output_index"].as_u64().unwrap_or(0) as u32;
+        let value = entry["value"].as_u64().unwrap_or(0);
+        let height = entry["height"].as_u64().unwrap_or(0);
+        let is_coinbase = entry["is_coinbase"].as_bool().unwrap_or(false);
+        let tx_id_bytes = match hex::decode(tx_id_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            }
+            _ => continue,
+        };
+        let outpoint = types::transaction::OutPoint {
+            tx_id: Hash256(tx_id_bytes),
+            output_index,
+        };
+        let utxo_entry = chain::state::UtxoEntry {
+            output: types::transaction::TxOutput {
+                value,
+                script: w.address().as_bytes().to_vec(),
+                datum: None,
+                datum_hash: None,
+            },
+            height,
+            is_coinbase,
+        };
+        let _ = utxo_set.insert(outpoint, utxo_entry);
+    }
+    let my_utxos = w.list_utxos(&utxo_set, tip_h + 1);
+    let needed = amount.checked_add(fee).unwrap_or_else(|| {
+        eprintln!("ERROR: amount + fee overflow");
+        std::process::exit(1);
+    });
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for (outpoint, val) in &my_utxos {
+        selected.push((*outpoint, *val));
+        total = total.saturating_add(*val);
+        if total >= needed {
+            break;
+        }
+    }
+    if total < needed {
+        eprintln!("ERROR: insufficient funds ({} available, {} needed)", total, needed);
+        std::process::exit(1);
+    }
+    (selected, total)
+}
+
+fn build_lock_tx(
+    selected: &[(types::transaction::OutPoint, u64)],
+    total_selected: u64,
+    amount: u64,
+    fee: u64,
+    script_bytes: Vec<u8>,
+    change_script: Vec<u8>,
+) -> types::transaction::Transaction {
+    if amount < types::DUST_THRESHOLD {
+        eprintln!("ERROR: lock amount {} below dust threshold {}", amount, types::DUST_THRESHOLD);
+        std::process::exit(1);
+    }
+    let change = total_selected - amount - fee;
+    let mut outputs = vec![types::transaction::TxOutput {
+        value: amount,
+        script: script_bytes,
+        datum: None,
+        datum_hash: None,
+    }];
+    if change >= types::DUST_THRESHOLD {
+        outputs.push(types::transaction::TxOutput {
+            value: change,
+            script: change_script,
+            datum: None,
+            datum_hash: None,
+        });
+    }
+    let inputs: Vec<types::transaction::TxInput> = selected
+        .iter()
+        .map(|(op, _)| types::transaction::TxInput {
+            prev_tx_id: op.tx_id,
+            output_index: op.output_index,
+        })
+        .collect();
+    let witnesses: Vec<types::transaction::TxWitness> = inputs
+        .iter()
+        .map(|_| types::transaction::TxWitness {
+            witness: vec![],
+            redeemer: None,
+        })
+        .collect();
+    types::transaction::Transaction {
+        inputs,
+        outputs,
+        witnesses,
+    }
+}
+
+fn sign_p2pkh(tx: &mut types::transaction::Transaction, w: &Wallet) {
+    use ed25519_dalek::Signer;
+    let sig_msg = tx.sig_message().unwrap();
+    let signing_key = w.signing_key_for_cli();
+    let sig = signing_key.sign(&sig_msg);
+    let witness_bytes = [w.pubkey().as_slice(), sig.to_bytes().as_slice()].concat();
+    for witness in &mut tx.witnesses {
+        witness.witness = witness_bytes.clone();
+    }
+}
+
+fn build_spend_tx(
+    lock_tx_id: Hash256,
+    output_index: u32,
+    value: u64,
+    fee: u64,
+    dest_script: Vec<u8>,
+) -> types::transaction::Transaction {
+    let output_value = value.saturating_sub(fee);
+    if output_value < types::DUST_THRESHOLD {
+        eprintln!("ERROR: output value {} below dust threshold {}", output_value, types::DUST_THRESHOLD);
+        std::process::exit(1);
+    }
+    types::transaction::Transaction {
+        inputs: vec![types::transaction::TxInput {
+            prev_tx_id: lock_tx_id,
+            output_index,
+        }],
+        outputs: vec![types::transaction::TxOutput {
+            value: output_value,
+            script: dest_script,
+            datum: None,
+            datum_hash: None,
+        }],
+        witnesses: vec![types::transaction::TxWitness {
+            witness: vec![],
+            redeemer: None,
+        }],
+    }
+}
+
+fn preflight_fee_check(tx: &types::transaction::Transaction, effective_fee: u64) {
+    if let Some(required_min) = consensus::cost::min_fee(tx) {
+        if effective_fee < required_min {
+            eprintln!(
+                "ERROR: fee {} below consensus minimum {} — increase --fee",
+                effective_fee, required_min
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn submit_tx(
+    rpc: &str,
+    tx: &types::transaction::Transaction,
+    json: bool,
+    extra: serde_json::Value,
+) {
+    let tx_id = tx.tx_id().unwrap();
+    let serialized = tx.serialize().unwrap();
+    if serialized.len() > types::MAX_TX_SIZE {
+        eprintln!("ERROR: transaction size {} exceeds maximum {}", serialized.len(), types::MAX_TX_SIZE);
+        std::process::exit(1);
+    }
+    let tx_hex = hex::encode(serialized);
+    match rpc::rpc_call(rpc, "send_raw_transaction", serde_json::json!({"tx_hex": tx_hex})) {
+        Ok(_) => {
+            if json {
+                let mut obj = extra.as_object().cloned().unwrap_or_default();
+                obj.insert("tx_id".to_string(), serde_json::json!(tx_id.to_string()));
+                obj.insert("submitted".to_string(), serde_json::json!(true));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap()
+                );
+            } else {
+                println!("TxId:         {}", tx_id);
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        let vs = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        println!("{:<14}{}", format!("{}:", k), vs);
+                    }
+                }
+                println!("Submitted:    {}", rpc);
+            }
+        }
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn sign_tx_with_wallet(
+    tx: &types::transaction::Transaction,
+    w: &Wallet,
+) -> ed25519_dalek::Signature {
+    use ed25519_dalek::Signer;
+    let sig_msg = tx.sig_message().unwrap();
+    w.signing_key_for_cli().sign(&sig_msg)
 }
 
 /// Replay the canonical chain from genesis to tip, rebuilding the UTXO set

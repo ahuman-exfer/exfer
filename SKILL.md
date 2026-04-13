@@ -458,6 +458,252 @@ done
 
 ---
 
+## 7a. Multisig
+
+### Multisig 2-of-2
+
+Both parties must sign to spend. Use for joint custody, payment channels, or atomic two-party agreements.
+
+#### multisig2of2-lock
+
+```bash
+exfer script multisig2of2-lock \
+  --wallet ~/my-wallet.key \
+  --pubkey-b <OTHER_PUBKEY_HEX> \
+  --amount "10 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### multisig2of2-spend
+
+```bash
+exfer script multisig2of2-spend \
+  --wallet ~/wallet-a.key \
+  --wallet2 ~/wallet-b.key \
+  --tx-id <LOCK_TX_ID> \
+  --to <DESTINATION_ADDRESS_HEX> \
+  --rpc $RPC \
+  --json
+```
+
+### Multisig 1-of-2
+
+Either party can spend independently. Use for shared accounts or backup access.
+
+#### multisig1of2-lock
+
+```bash
+exfer script multisig1of2-lock \
+  --wallet ~/my-wallet.key \
+  --pubkey-b <OTHER_PUBKEY_HEX> \
+  --amount "10 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### multisig1of2-spend
+
+```bash
+exfer script multisig1of2-spend \
+  --wallet ~/my-wallet.key \
+  --tx-id <LOCK_TX_ID> \
+  --other-pubkey <OTHER_PUBKEY_HEX> \
+  --path a \
+  --rpc $RPC \
+  --json
+```
+
+`--path`: `a` if your key was first (pubkey_a at lock time), `b` if second.
+
+### Multisig 2-of-3
+
+Any two of three parties can spend. Use for committee governance or 2FA with recovery.
+
+#### multisig2of3-lock
+
+```bash
+exfer script multisig2of3-lock \
+  --wallet ~/my-wallet.key \
+  --pubkey-b <PUBKEY_B_HEX> \
+  --pubkey-c <PUBKEY_C_HEX> \
+  --amount "10 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### multisig2of3-spend
+
+```bash
+exfer script multisig2of3-spend \
+  --wallet ~/signer1.key \
+  --wallet2 ~/signer2.key \
+  --tx-id <LOCK_TX_ID> \
+  --to <DESTINATION_ADDRESS_HEX> \
+  --pubkey-a <PUBKEY_A_HEX> \
+  --pubkey-b <PUBKEY_B_HEX> \
+  --pubkey-c <PUBKEY_C_HEX> \
+  --path ab \
+  --rpc $RPC \
+  --json
+```
+
+`--path`: `ab`, `ac`, or `bc` — which pair of keys the two wallets hold.
+
+---
+
+## 7b. Vault
+
+Timelock + emergency recovery key. Primary key can spend after locktime. Recovery key can spend anytime (emergency override).
+
+#### vault-lock
+
+```bash
+exfer script vault-lock \
+  --wallet ~/primary-wallet.key \
+  --recovery-pubkey <RECOVERY_PUBKEY_HEX> \
+  --locktime <BLOCK_HEIGHT> \
+  --amount "100 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### vault-spend (primary key, after locktime)
+
+```bash
+exfer script vault-spend \
+  --wallet ~/primary-wallet.key \
+  --tx-id <LOCK_TX_ID> \
+  --recovery-pubkey <RECOVERY_PUBKEY_HEX> \
+  --locktime <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+Fails if current block height <= locktime.
+
+#### vault-recover (recovery key, anytime)
+
+```bash
+exfer script vault-recover \
+  --wallet ~/recovery-wallet.key \
+  --tx-id <LOCK_TX_ID> \
+  --primary-pubkey <PRIMARY_PUBKEY_HEX> \
+  --locktime <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+---
+
+## 7c. Escrow
+
+Three-path spending: mutual release, arbiter decision, or timeout refund.
+
+#### escrow-lock
+
+```bash
+exfer script escrow-lock \
+  --wallet ~/party-a.key \
+  --party-b <PARTY_B_PUBKEY_HEX> \
+  --arbiter <ARBITER_PUBKEY_HEX> \
+  --timeout <BLOCK_HEIGHT> \
+  --amount "50 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### escrow-release (mutual — both parties sign)
+
+```bash
+exfer script escrow-release \
+  --wallet ~/party-a.key \
+  --wallet2 ~/party-b.key \
+  --tx-id <LOCK_TX_ID> \
+  --to <DESTINATION_ADDRESS_HEX> \
+  --party-a <PARTY_A_PUBKEY_HEX> \
+  --party-b <PARTY_B_PUBKEY_HEX> \
+  --arbiter <ARBITER_PUBKEY_HEX> \
+  --timeout <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+#### escrow-arbitrate (arbiter decides)
+
+```bash
+exfer script escrow-arbitrate \
+  --wallet ~/arbiter.key \
+  --tx-id <LOCK_TX_ID> \
+  --to <DESTINATION_ADDRESS_HEX> \
+  --party-a <PARTY_A_PUBKEY_HEX> \
+  --party-b <PARTY_B_PUBKEY_HEX> \
+  --timeout <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+#### escrow-reclaim (party A, after timeout)
+
+```bash
+exfer script escrow-reclaim \
+  --wallet ~/party-a.key \
+  --tx-id <LOCK_TX_ID> \
+  --party-b <PARTY_B_PUBKEY_HEX> \
+  --arbiter <ARBITER_PUBKEY_HEX> \
+  --timeout <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+Fails if current block height <= timeout.
+
+---
+
+## 7d. Delegation
+
+Owner + time-limited delegate. Owner can spend anytime. Delegate can only spend before the expiry height.
+
+#### delegation-lock
+
+```bash
+exfer script delegation-lock \
+  --wallet ~/owner.key \
+  --delegate <DELEGATE_PUBKEY_HEX> \
+  --expiry <BLOCK_HEIGHT> \
+  --amount "10 EXFER" \
+  --rpc $RPC \
+  --json
+```
+
+#### delegation-owner-spend (owner, anytime)
+
+```bash
+exfer script delegation-owner-spend \
+  --wallet ~/owner.key \
+  --tx-id <LOCK_TX_ID> \
+  --delegate <DELEGATE_PUBKEY_HEX> \
+  --expiry <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+#### delegation-delegate-spend (delegate, before expiry)
+
+```bash
+exfer script delegation-delegate-spend \
+  --wallet ~/delegate.key \
+  --tx-id <LOCK_TX_ID> \
+  --owner <OWNER_PUBKEY_HEX> \
+  --expiry <BLOCK_HEIGHT> \
+  --rpc $RPC \
+  --json
+```
+
+Fails if current block height >= expiry.
+
+---
+
 ## 8. Start Mining
 
 Generate a wallet first if you don't have one (see Section 2):
@@ -656,15 +902,15 @@ All methods use JSON-RPC 2.0 over HTTP POST.
 
 | Pattern | CLI | Description |
 |---------|-----|-------------|
-| HTLC | `exfer script htlc-lock`, `htlc-claim`, `htlc-reclaim` | Hash time-locked contract (atomic swaps) |
-| Multisig 2-of-2 | — | Both parties must sign |
-| Multisig 1-of-2 | — | Either party can sign |
-| Multisig 2-of-3 | — | Any 2 of 3 parties |
-| Vault | — | Timelock + recovery key |
-| Escrow | — | Mutual / arbiter / timeout (3-path) |
-| Delegation | — | Owner + time-limited delegate |
+| HTLC | `htlc-lock`, `htlc-claim`, `htlc-reclaim` | Hash time-locked contract (atomic swaps) |
+| Multisig 2-of-2 | `multisig2of2-lock`, `multisig2of2-spend` | Both parties must sign |
+| Multisig 1-of-2 | `multisig1of2-lock`, `multisig1of2-spend` | Either party can sign |
+| Multisig 2-of-3 | `multisig2of3-lock`, `multisig2of3-spend` | Any 2 of 3 parties |
+| Vault | `vault-lock`, `vault-spend`, `vault-recover` | Timelock + recovery key |
+| Escrow | `escrow-lock`, `escrow-release`, `escrow-arbitrate`, `escrow-reclaim` | Mutual / arbiter / timeout (3-path) |
+| Delegation | `delegation-lock`, `delegation-owner-spend`, `delegation-delegate-spend` | Owner + time-limited delegate |
 
-HTLC is available via CLI (`exfer script htlc-lock`, `htlc-claim`, `htlc-reclaim`). Other patterns are supported by the protocol. CLI commands for additional patterns are planned.
+All commands are under `exfer script <command>`. Use `--json` for machine-readable output.
 
 ---
 
