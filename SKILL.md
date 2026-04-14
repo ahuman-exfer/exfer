@@ -66,7 +66,16 @@ mv exfer-linux-x86_64 exfer
 # macOS Apple Silicon
 curl -LO https://github.com/ahuman-exfer/exfer/releases/latest/download/exfer-macos-arm64
 chmod +x exfer-macos-arm64
+# macOS: remove quarantine flag before running
+xattr -d com.apple.quarantine exfer-macos-arm64
 mv exfer-macos-arm64 exfer
+
+# macOS Intel
+curl -LO https://github.com/ahuman-exfer/exfer/releases/latest/download/exfer-macos-x86_64
+chmod +x exfer-macos-x86_64
+# macOS: remove quarantine flag before running
+xattr -d com.apple.quarantine exfer-macos-x86_64
+mv exfer-macos-x86_64 exfer
 ```
 
 ### Windows
