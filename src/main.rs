@@ -1130,108 +1130,20 @@ async fn main() {
                     covenants::htlc::htlc(&sender_pk, &receiver_pk, &hash_lock_val, timeout);
                 let script_bytes = script::serialize_program(&program);
 
-                // Fetch UTXOs
-                let address_hex = w.address().to_string();
-                let utxos_result = rpc::rpc_call(
-                    &rpc,
-                    "get_address_utxos",
-                    serde_json::json!({"address": address_hex}),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("ERROR: {}", e);
-                    std::process::exit(1);
-                });
-                let tip_h = utxos_result["tip_height"].as_u64().unwrap_or(0);
-
-                // Build local UtxoSet from RPC response
-                let utxo_entries = utxos_result["utxos"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let mut utxo_set = chain::state::UtxoSet::new();
-                for entry in &utxo_entries {
-                    let tx_id_hex = entry["tx_id"].as_str().unwrap_or("");
-                    let output_index = entry["output_index"].as_u64().unwrap_or(0) as u32;
-                    let value = entry["value"].as_u64().unwrap_or(0);
-                    let height = entry["height"].as_u64().unwrap_or(0);
-                    let is_coinbase = entry["is_coinbase"].as_bool().unwrap_or(false);
-                    let tx_id_bytes = match hex::decode(tx_id_hex) {
-                        Ok(b) if b.len() == 32 => {
-                            let mut a = [0u8; 32];
-                            a.copy_from_slice(&b);
-                            a
-                        }
-                        _ => continue,
-                    };
-                    let outpoint = types::transaction::OutPoint {
-                        tx_id: Hash256(tx_id_bytes),
-                        output_index,
-                    };
-                    let utxo_entry = chain::state::UtxoEntry {
-                        output: types::transaction::TxOutput {
-                            value,
-                            script: w.address().as_bytes().to_vec(),
-                            datum: None,
-                            datum_hash: None,
-                        },
-                        height,
-                        is_coinbase,
-                    };
-                    let _ = utxo_set.insert(outpoint, utxo_entry);
-                }
-
-                // Build locking tx using wallet's build logic for input selection
-                let htlc_output = types::transaction::TxOutput {
-                    value: amount,
-                    script: script_bytes,
-                    datum: None,
-                    datum_hash: None,
-                };
-                // Simple input selection: find a UTXO large enough
-                let my_utxos = w.list_utxos(&utxo_set, tip_h + 1);
-                let needed = amount + fee;
-                let mut selected = None;
-                for (outpoint, val) in &my_utxos {
-                    if *val >= needed {
-                        selected = Some((*outpoint, *val));
-                        break;
-                    }
-                }
-                let (sel_outpoint, sel_value) = selected.unwrap_or_else(|| {
-                    eprintln!("ERROR: no UTXO large enough for {} + {} fee", amount, fee);
-                    std::process::exit(1);
-                });
-
-                let change = sel_value - amount - fee;
-                let mut outputs = vec![htlc_output];
-                if change >= types::DUST_THRESHOLD {
-                    outputs.push(types::transaction::TxOutput {
-                        value: change,
-                        script: w.address().as_bytes().to_vec(),
-                        datum: None,
-                        datum_hash: None,
-                    });
-                }
-
-                let mut tx = types::transaction::Transaction {
-                    inputs: vec![types::transaction::TxInput {
-                        prev_tx_id: sel_outpoint.tx_id,
-                        output_index: sel_outpoint.output_index,
-                    }],
-                    outputs,
-                    witnesses: vec![types::transaction::TxWitness {
-                        witness: vec![],
-                        redeemer: None,
-                    }],
-                };
-
-                // Sign (P2PKH)
-                let sig_msg = tx.sig_message().unwrap();
-                use ed25519_dalek::Signer;
-                let signing_key = w.signing_key_for_cli();
-                let sig = signing_key.sign(&sig_msg);
-                tx.witnesses[0].witness =
-                    [sender_pk.as_slice(), sig.to_bytes().as_slice()].concat();
+                // Multi-UTXO coin selection (same helper the covenant lock commands use)
+                let (selected, sel_total) = fetch_utxos_select(&rpc, &w, amount, fee);
+                let mut tx = build_lock_tx(
+                    &selected,
+                    sel_total,
+                    amount,
+                    fee,
+                    script_bytes,
+                    w.address().as_bytes().to_vec(),
+                );
+                sign_p2pkh(&mut tx, &w);
+                let effective_fee =
+                    sel_total - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+                preflight_fee_check(&tx, effective_fee);
 
                 let tx_id = tx.tx_id().unwrap();
                 let tx_hex = hex::encode(tx.serialize().unwrap());
