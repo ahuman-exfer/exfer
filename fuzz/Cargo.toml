@@ -56,3 +56,10 @@ path = "fuzz_targets/fuzz_rpc_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_wallet_spend"
+path = "fuzz_targets/fuzz_wallet_spend.rs"
+test = false
+doc = false
+bench = false

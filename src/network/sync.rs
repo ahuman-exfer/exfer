@@ -647,6 +647,15 @@ pub struct Node {
     /// to match ASSUME_VALID_HASH. Set on startup if storage already has the
     /// checkpoint, or during IBD when block 130,000 arrives and matches.
     pub assume_valid_verified: AtomicBool,
+    /// v1.4.2 Fix 3: node-wide in-flight pre-verification frame-buffer budget.
+    /// Every peer's reader task takes an `Arc<PeerBudget>` derived from this
+    /// before allocating a payload buffer. Caps actual peak memory at
+    /// 128 MiB total and 16 MiB per peer under honest accounting (the
+    /// reader holds both a payload buffer and a full-frame reconstruction
+    /// buffer concurrently at HMAC verification time — see
+    /// `crate::network::peer::peak_prever_bytes`). This prevents a pool of
+    /// 256 peers × 4 MiB blocks from consuming ~1 GiB of unverified RAM.
+    pub frame_budget: Arc<crate::network::frame_budget::FrameBudget>,
 }
 
 impl Node {
@@ -3469,7 +3478,13 @@ impl Node {
 
         let (reader_state, writer_state, metadata) = peer.into_split();
         let meta = Arc::new(metadata);
-        let shared = Arc::new(PeerSharedState::new());
+        // v1.4.2 Fix 3: attach this peer to the node-wide frame-buffer
+        // budget. The PeerBudget is dropped when `shared` is dropped at
+        // task exit, which releases any outstanding in-flight bytes (the
+        // FrameReservation RAII guard held inside the reader loop releases
+        // synchronously).
+        let peer_budget = crate::network::frame_budget::PeerBudget::new(self.frame_budget.clone());
+        let shared = Arc::new(PeerSharedState::with_frame_budget(peer_budget));
 
         // Read the shutdown flag from LogicalPeer.session (set by attach_session)
         let external_shutdown = {

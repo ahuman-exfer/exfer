@@ -101,8 +101,14 @@ fn parse_amount(s: &str) -> Result<u64, String> {
     ))
 }
 
+/// Public release tag. Separate from `Cargo.toml`'s `version` field: the
+/// Cargo version is reserved for eventual crates.io publication and
+/// follows its own semver, while the release tag is what the network and
+/// binary releases track.
+pub const RELEASE_TAG: &str = "1.4.2";
+
 #[derive(Parser)]
-#[command(name = "exfer", about = "Exfer blockchain node")]
+#[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -947,7 +953,16 @@ async fn main() {
                 let recipient = Hash256(hash);
 
                 let (utxo_set, tip_height) = if let Some(ref url) = rpc_url {
-                    // Fetch UTXOs from remote node via RPC
+                    // v1.4.2 Fix 1: treat `get_address_utxos` as returning a
+                    // list of outpoints only. The JSON `value` and `script`
+                    // fields are deliberately NOT read in the spend path —
+                    // each outpoint is authenticated below by fetching the
+                    // funding transaction and verifying the output against
+                    // our locally-derived wallet script. This prevents a
+                    // malicious RPC from understating `value` (which would
+                    // otherwise become unintended miner fee) or forging a
+                    // phantom script. Residual trust (`height`, `is_coinbase`,
+                    // `tip_height`) is documented in CHANGELOG.
                     let address_hex = w.address().to_string();
                     let result = match rpc::rpc_call(
                         url,
@@ -971,7 +986,7 @@ async fn main() {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Build a local UtxoSet from the RPC response
+                    let wallet_script = w.address().as_bytes().to_vec();
                     let mut utxo_set = chain::state::UtxoSet::new();
                     for entry in &utxo_entries {
                         let tx_id_hex = entry.get("tx_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -979,7 +994,6 @@ async fn main() {
                             .get("output_index")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32;
-                        let value = entry.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
                         let height = entry.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
                         let is_coinbase = entry
                             .get("is_coinbase")
@@ -994,15 +1008,33 @@ async fn main() {
                             }
                             _ => continue,
                         };
-
+                        let tx_id = Hash256(tx_id_bytes);
                         let outpoint = types::transaction::OutPoint {
-                            tx_id: Hash256(tx_id_bytes),
+                            tx_id,
                             output_index,
                         };
+
+                        // Authenticate the outpoint: fetch funding tx, verify
+                        // strict-parse + txid match + script byte-equality
+                        // against our own wallet script.
+                        let (auth_value, auth_script) =
+                            match wallet::auth::authenticated_output_lookup(
+                                url,
+                                tx_id,
+                                output_index,
+                                Some(&wallet_script),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("ERROR: {}", e);
+                                    std::process::exit(1);
+                                }
+                            };
+
                         let utxo_entry = chain::state::UtxoEntry {
                             output: types::transaction::TxOutput {
-                                value,
-                                script: w.address().as_bytes().to_vec(),
+                                value: auth_value,
+                                script: auth_script,
                                 datum: None,
                                 datum_hash: None,
                             },
@@ -1189,13 +1221,13 @@ async fn main() {
                 output_index,
                 preimage: preimage_hex,
                 sender,
-                timeout: _timeout,
+                timeout,
                 fee,
                 rpc,
                 json,
             } => {
                 let w = load_wallet_interactive(&path);
-                let _receiver_pk = w.pubkey();
+                let receiver_pk = w.pubkey();
 
                 let sender_bytes = hex::decode(&sender).unwrap_or_else(|e| {
                     eprintln!("ERROR: invalid sender hex: {}", e);
@@ -1212,7 +1244,7 @@ async fn main() {
                     eprintln!("ERROR: invalid preimage hex: {}", e);
                     std::process::exit(1);
                 });
-                let _hash_lock = Hash256::sha256(&preimage_bytes);
+                let hash_lock_val = Hash256::sha256(&preimage_bytes);
 
                 let lock_tx_bytes = hex::decode(&lock_tx_id_hex).unwrap_or_else(|e| {
                     eprintln!("ERROR: invalid tx_id hex: {}", e);
@@ -1226,34 +1258,29 @@ async fn main() {
                 lock_arr.copy_from_slice(&lock_tx_bytes);
                 let lock_tx_id = Hash256(lock_arr);
 
-                // Fetch the locking tx to get the HTLC output value
-                let tx_result = rpc::rpc_call(
+                // v1.4.2 Fix 1: reconstruct the HTLC locked script locally from
+                // the CLI-provided sender, our own receiver pubkey, the hash
+                // derived from the preimage, and the CLI-provided timeout.
+                // Authenticate the on-chain output against this reconstruction
+                // so a malicious RPC cannot feed us a phantom output to claim.
+                let expected_script = script::serialize_program(&covenants::htlc::htlc(
+                    &sender_pk,
+                    &receiver_pk,
+                    &hash_lock_val,
+                    timeout,
+                ));
+                let (htlc_value, _script) = match wallet::auth::authenticated_output_lookup(
                     &rpc,
-                    "get_transaction",
-                    serde_json::json!({"hash": lock_tx_id_hex}),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("ERROR: {}", e);
-                    std::process::exit(1);
-                });
-                let tx_hex_str = tx_result["tx_hex"].as_str().unwrap_or_else(|| {
-                    eprintln!("ERROR: transaction not found");
-                    std::process::exit(1);
-                });
-                let lock_tx_raw = hex::decode(tx_hex_str).unwrap();
-                let (lock_tx, _) = types::transaction::Transaction::deserialize(&lock_tx_raw)
-                    .unwrap_or_else(|e| {
-                        eprintln!("ERROR: failed to deserialize lock tx: {:?}", e);
+                    lock_tx_id,
+                    output_index,
+                    Some(&expected_script),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("ERROR: {}", e);
                         std::process::exit(1);
-                    });
-                let htlc_value = lock_tx
-                    .outputs
-                    .get(output_index as usize)
-                    .map(|o| o.value)
-                    .unwrap_or_else(|| {
-                        eprintln!("ERROR: output index {} not found in lock tx", output_index);
-                        std::process::exit(1);
-                    });
+                    }
+                };
 
                 let claim_value = htlc_value.saturating_sub(fee);
 
@@ -1376,34 +1403,29 @@ async fn main() {
                 lock_arr.copy_from_slice(&lock_tx_bytes);
                 let lock_tx_id = Hash256(lock_arr);
 
-                // Fetch the locking tx to get the HTLC output value
-                let tx_result = rpc::rpc_call(
+                // v1.4.2 Fix 1: reconstruct the HTLC locked script locally
+                // from the CLI-provided receiver, our own sender pubkey, the
+                // supplied hash_lock, and the CLI-provided timeout. Authenticate
+                // the on-chain output against this reconstruction so a malicious
+                // RPC cannot feed us a phantom output to reclaim from.
+                let expected_script = script::serialize_program(&covenants::htlc::htlc(
+                    &sender_pk,
+                    &receiver_pk,
+                    &hash_lock_val,
+                    timeout,
+                ));
+                let (htlc_value, _script) = match wallet::auth::authenticated_output_lookup(
                     &rpc,
-                    "get_transaction",
-                    serde_json::json!({"hash": lock_tx_id_hex}),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("ERROR: {}", e);
-                    std::process::exit(1);
-                });
-                let tx_hex_str = tx_result["tx_hex"].as_str().unwrap_or_else(|| {
-                    eprintln!("ERROR: transaction not found");
-                    std::process::exit(1);
-                });
-                let lock_tx_raw = hex::decode(tx_hex_str).unwrap();
-                let (lock_tx, _) = types::transaction::Transaction::deserialize(&lock_tx_raw)
-                    .unwrap_or_else(|e| {
-                        eprintln!("ERROR: failed to deserialize lock tx: {:?}", e);
+                    lock_tx_id,
+                    output_index,
+                    Some(&expected_script),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("ERROR: {}", e);
                         std::process::exit(1);
-                    });
-                let htlc_value = lock_tx
-                    .outputs
-                    .get(output_index as usize)
-                    .map(|o| o.value)
-                    .unwrap_or_else(|| {
-                        eprintln!("ERROR: output index {} not found in lock tx", output_index);
-                        std::process::exit(1);
-                    });
+                    }
+                };
 
                 // Check current height vs timeout
                 let current_height = rpc::rpc_call(&rpc, "get_block_height", serde_json::json!({}))
@@ -1422,10 +1444,6 @@ async fn main() {
                 }
 
                 let reclaim_value = htlc_value.saturating_sub(fee);
-
-                // Reconstruct the HTLC script to validate spending
-                let _program =
-                    covenants::htlc::htlc(&sender_pk, &receiver_pk, &hash_lock_val, timeout);
 
                 // Build reclaim tx
                 let mut reclaim_tx = types::transaction::Transaction {
@@ -1525,7 +1543,8 @@ async fn main() {
                 let pk_a = w_a.pubkey();
                 let pk_b = w_b.pubkey();
                 let dest = parse_pubkey_hex(&to, "to");
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::multisig::multisig_2of2(&pk_a, &pk_b));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
                 let sig_a = sign_tx_with_wallet(&tx, &w_a);
                 let sig_b = sign_tx_with_wallet(&tx, &w_b);
@@ -1534,7 +1553,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Bytes(sig_a.to_bytes().to_vec()).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig_b.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::multisig::multisig_2of2(&pk_a, &pk_b));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "multisig-2of2-spend", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
                 }));
@@ -1572,7 +1590,8 @@ async fn main() {
                     "b" => (other_pk, my_pk),
                     _ => { eprintln!("ERROR: --path must be 'a' or 'b'"); std::process::exit(1); }
                 };
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::multisig::multisig_1of2(&pk_a, &pk_b));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1584,7 +1603,6 @@ async fn main() {
                 witness_data.extend_from_slice(&selector.serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::multisig::multisig_1of2(&pk_a, &pk_b));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "multisig-1of2-spend", "spent_from": tx_id_hex,
                     "path": key_path, "amount": value.saturating_sub(fee),
@@ -1623,7 +1641,8 @@ async fn main() {
                 let pk_a = parse_pubkey_hex(&pubkey_a, "pubkey_a");
                 let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
                 let pk_c = parse_pubkey_hex(&pubkey_c, "pubkey_c");
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::multisig::multisig_2of3(&pk_a, &pk_b, &pk_c));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
                 let sig1 = sign_tx_with_wallet(&tx, &w1);
                 let sig2 = sign_tx_with_wallet(&tx, &w2);
@@ -1639,7 +1658,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Bytes(sig1.to_bytes().to_vec()).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig2.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::multisig::multisig_2of3(&pk_a, &pk_b, &pk_c));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "multisig-2of3-spend", "spent_from": tx_id_hex,
                     "path": pair_path, "amount": value.saturating_sub(fee),
@@ -1681,7 +1699,8 @@ async fn main() {
                     eprintln!("ERROR: locktime not reached (current {} <= locktime {})", current_height, locktime);
                     std::process::exit(1);
                 }
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1689,7 +1708,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Left(Box::new(Value::Unit)).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "vault-spend", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
                 }));
@@ -1700,7 +1718,8 @@ async fn main() {
                 let w = load_wallet_interactive(&path);
                 let primary_pk = parse_pubkey_hex(&primary_pubkey, "primary_pubkey");
                 let recovery_pk = w.pubkey();
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1708,7 +1727,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Right(Box::new(Value::Unit)).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::vault::vault(&primary_pk, &recovery_pk, locktime));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "vault-recover", "spent_from": tx_id_hex, "amount": value.saturating_sub(fee),
                 }));
@@ -1747,7 +1765,8 @@ async fn main() {
                 let pk_a = parse_pubkey_hex(&party_a, "party_a");
                 let pk_b = parse_pubkey_hex(&party_b, "party_b");
                 let pk_arb = parse_pubkey_hex(&arbiter, "arbiter");
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
                 let sig_a = sign_tx_with_wallet(&tx, &w_a);
                 let sig_b = sign_tx_with_wallet(&tx, &w_b);
@@ -1758,7 +1777,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Bytes(sig_a.to_bytes().to_vec()).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig_b.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "escrow-release", "spent_from": tx_id_hex,
                     "path": "mutual", "amount": value.saturating_sub(fee),
@@ -1773,7 +1791,8 @@ async fn main() {
                 let pk_a = parse_pubkey_hex(&party_a, "party_a");
                 let pk_b = parse_pubkey_hex(&party_b, "party_b");
                 let pk_arb = w.pubkey();
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1782,7 +1801,6 @@ async fn main() {
                 witness_data.extend_from_slice(&selector.serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "escrow-arbitrate", "spent_from": tx_id_hex,
                     "path": "arbiter", "amount": value.saturating_sub(fee),
@@ -1803,7 +1821,8 @@ async fn main() {
                     eprintln!("ERROR: timeout not reached (current {} <= timeout {})", current_height, timeout);
                     std::process::exit(1);
                 }
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1812,7 +1831,6 @@ async fn main() {
                 witness_data.extend_from_slice(&selector.serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::escrow::escrow(&pk_a, &pk_b, &pk_arb, timeout));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "escrow-reclaim", "spent_from": tx_id_hex,
                     "path": "timeout", "amount": value.saturating_sub(fee),
@@ -1846,7 +1864,8 @@ async fn main() {
                 let w = load_wallet_interactive(&path);
                 let owner_pk = w.pubkey();
                 let delegate_pk = parse_pubkey_hex(&delegate, "delegate");
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1854,7 +1873,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Left(Box::new(Value::Unit)).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "delegation-owner-spend", "spent_from": tx_id_hex,
                     "amount": value.saturating_sub(fee),
@@ -1873,7 +1891,8 @@ async fn main() {
                     eprintln!("ERROR: delegation expired (current {} >= expiry {})", current_height, expiry);
                     std::process::exit(1);
                 }
-                let (lock_tx_id, value, locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index);
+                let expected_script = script::serialize_program(&covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
+                let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, w.address().as_bytes().to_vec());
                 let sig = sign_tx_with_wallet(&tx, &w);
                 use script::value::Value;
@@ -1881,7 +1900,6 @@ async fn main() {
                 witness_data.extend_from_slice(&Value::Right(Box::new(Value::Unit)).serialize());
                 witness_data.extend_from_slice(&Value::Bytes(sig.to_bytes().to_vec()).serialize());
                 tx.witnesses[0].witness = witness_data;
-                verify_locked_script(&locked_script, &covenants::delegation::delegation(&owner_pk, &delegate_pk, expiry));
                 submit_tx(&rpc, &tx, json, serde_json::json!({
                     "type": "delegation-delegate-spend", "spent_from": tx_id_hex,
                     "amount": value.saturating_sub(fee),
@@ -2483,15 +2501,6 @@ fn load_wallet_interactive(path: &Path) -> Wallet {
 
 // ── Covenant CLI helpers ──────────────────────────────────────────────────
 
-fn verify_locked_script(locked_script: &[u8], expected_program: &crate::script::ast::Program) {
-    let expected = script::serialize_program(expected_program);
-    if locked_script != expected {
-        eprintln!("ERROR: lock output script does not match reconstructed covenant script");
-        eprintln!("  Check that pubkeys, timeouts, and other parameters match the original lock");
-        std::process::exit(1);
-    }
-}
-
 fn require_distinct_keys(keys: &[(&[u8; 32], &str)]) {
     for i in 0..keys.len() {
         for j in (i + 1)..keys.len() {
@@ -2520,10 +2529,22 @@ fn parse_pubkey_hex(hex_str: &str, name: &str) -> [u8; 32] {
     arr
 }
 
+/// Fetch and authenticate a covenant lock-tx output via RPC.
+///
+/// Delegates to [`wallet::auth::authenticated_output_lookup`], which verifies:
+///   1. The returned tx deserializes under strict parse (no trailing bytes).
+///   2. Its recomputed tx_id matches the requested `tx_id_hex`.
+///   3. The output at `output_index` exists and its script byte-equals
+///      `expected_script`.
+///
+/// On any authentication failure, prints a clear error and exits with code 1.
+/// Callers that want to handle the error themselves should use
+/// `authenticated_output_lookup` directly.
 fn fetch_lock_tx_output(
     rpc: &str,
     tx_id_hex: &str,
     output_index: u32,
+    expected_script: &[u8],
 ) -> (Hash256, u64, Vec<u8>) {
     let tx_id_bytes = hex::decode(tx_id_hex).unwrap_or_else(|e| {
         eprintln!("ERROR: invalid tx_id hex: {}", e);
@@ -2537,28 +2558,18 @@ fn fetch_lock_tx_output(
     arr.copy_from_slice(&tx_id_bytes);
     let tx_id = Hash256(arr);
 
-    let tx_result = rpc::rpc_call(rpc, "get_transaction", serde_json::json!({"hash": tx_id_hex}))
-        .unwrap_or_else(|e| {
+    match wallet::auth::authenticated_output_lookup(
+        rpc,
+        tx_id,
+        output_index,
+        Some(expected_script),
+    ) {
+        Ok((value, script)) => (tx_id, value, script),
+        Err(e) => {
             eprintln!("ERROR: {}", e);
             std::process::exit(1);
-        });
-    let tx_hex_str = tx_result["tx_hex"].as_str().unwrap_or_else(|| {
-        eprintln!("ERROR: transaction not found");
-        std::process::exit(1);
-    });
-    let raw = hex::decode(tx_hex_str).unwrap();
-    let (tx, _) = types::transaction::Transaction::deserialize(&raw).unwrap_or_else(|e| {
-        eprintln!("ERROR: failed to deserialize lock tx: {:?}", e);
-        std::process::exit(1);
-    });
-    let output = tx
-        .outputs
-        .get(output_index as usize)
-        .unwrap_or_else(|| {
-            eprintln!("ERROR: output index {} not found in lock tx", output_index);
-            std::process::exit(1);
-        });
-    (tx_id, output.value, output.script.clone())
+        }
+    }
 }
 
 fn fetch_utxos_select(
@@ -2567,6 +2578,8 @@ fn fetch_utxos_select(
     amount: u64,
     fee: u64,
 ) -> (Vec<(types::transaction::OutPoint, u64)>, u64) {
+    // v1.4.2 Fix 1: outpoints only from `get_address_utxos`. `value` and
+    // `script` are NOT read here — each outpoint is authenticated below.
     let address_hex = w.address().to_string();
     let utxos_result =
         rpc::rpc_call(rpc, "get_address_utxos", serde_json::json!({"address": address_hex}))
@@ -2576,11 +2589,11 @@ fn fetch_utxos_select(
             });
     let tip_h = utxos_result["tip_height"].as_u64().unwrap_or(0);
     let utxo_entries = utxos_result["utxos"].as_array().cloned().unwrap_or_default();
+    let wallet_script = w.address().as_bytes().to_vec();
     let mut utxo_set = chain::state::UtxoSet::new();
     for entry in &utxo_entries {
         let tx_id_hex = entry["tx_id"].as_str().unwrap_or("");
         let output_index = entry["output_index"].as_u64().unwrap_or(0) as u32;
-        let value = entry["value"].as_u64().unwrap_or(0);
         let height = entry["height"].as_u64().unwrap_or(0);
         let is_coinbase = entry["is_coinbase"].as_bool().unwrap_or(false);
         let tx_id_bytes = match hex::decode(tx_id_hex) {
@@ -2591,14 +2604,29 @@ fn fetch_utxos_select(
             }
             _ => continue,
         };
+        let tx_id = Hash256(tx_id_bytes);
         let outpoint = types::transaction::OutPoint {
-            tx_id: Hash256(tx_id_bytes),
+            tx_id,
             output_index,
         };
+
+        let (auth_value, auth_script) = match wallet::auth::authenticated_output_lookup(
+            rpc,
+            tx_id,
+            output_index,
+            Some(&wallet_script),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ERROR: {}", e);
+                std::process::exit(1);
+            }
+        };
+
         let utxo_entry = chain::state::UtxoEntry {
             output: types::transaction::TxOutput {
-                value,
-                script: w.address().as_bytes().to_vec(),
+                value: auth_value,
+                script: auth_script,
                 datum: None,
                 datum_hash: None,
             },
@@ -3491,6 +3519,7 @@ async fn run_node(
         mining_cancel: std::sync::atomic::AtomicBool::new(true),
         assume_valid,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
+        frame_budget: network::frame_budget::FrameBudget::new(),
     });
 
     let listen_node = node.clone();

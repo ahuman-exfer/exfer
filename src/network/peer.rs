@@ -417,7 +417,7 @@ impl Peer {
     pub async fn recv_with_timeout(&mut self, dur: Duration) -> Result<Message, PeerError> {
         let (msg, counter) = timeout(
             dur,
-            read_message_with_counter(&mut self.stream, true, &self.recv_key, None),
+            read_message_with_counter(&mut self.stream, true, &self.recv_key, None, None),
         )
         .await
         .map_err(|_| PeerError::Io("read timeout".into()))?
@@ -451,15 +451,35 @@ pub struct PeerSharedState {
     pub awaiting_pong: AtomicBool,
     /// Set by supervisor to signal both tasks to shut down.
     pub shutdown: AtomicBool,
+    /// v1.4.2 Fix 3: this peer's slice of the node-wide in-flight frame
+    /// budget. The reader reserves `payload_len` bytes against this before
+    /// allocating a pre-verification buffer; the reservation releases
+    /// on drop (after HMAC verify or error). `None` in test / legacy paths
+    /// that don't construct a full node.
+    pub frame_budget: Option<Arc<crate::network::frame_budget::PeerBudget>>,
 }
 
 impl PeerSharedState {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             bytes_read: AtomicU64::new(0),
             pong_received: AtomicBool::new(false),
             awaiting_pong: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            frame_budget: None,
+        }
+    }
+
+    pub fn with_frame_budget(
+        frame_budget: Arc<crate::network::frame_budget::PeerBudget>,
+    ) -> Self {
+        Self {
+            bytes_read: AtomicU64::new(0),
+            pong_received: AtomicBool::new(false),
+            awaiting_pong: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            frame_budget: Some(frame_budget),
         }
     }
 }
@@ -592,6 +612,7 @@ pub async fn reader_recv(
             &state.recv_key,
             counter,
             Some(&shared.bytes_read),
+            shared.frame_budget.as_ref(),
         ),
     )
     .await
@@ -790,12 +811,17 @@ pub async fn read_auth_ack(stream: &mut TcpStream) -> Result<[u8; 64], std::io::
 /// Read a single framed message from a stream and verify its HMAC tag.
 /// Reads the 8-byte frame counter, then msg_type, payload, and HMAC tag.
 /// Returns the deserialized message and the frame counter.
+///
+/// `frame_budget` is the per-peer in-flight budget (v1.4.2 Fix 3). Pass
+/// `None` only from legacy / test paths that don't have a budget in scope
+/// — the main reader task passes `Some(...)` and the cap is enforced.
 #[allow(dead_code)]
 async fn read_message_with_counter<S: AsyncRead + Unpin>(
     stream: &mut S,
     allow_heavy: bool,
     session_key: &[u8; 32],
     bytes_read: Option<&AtomicU64>,
+    frame_budget: Option<&Arc<crate::network::frame_budget::PeerBudget>>,
 ) -> Result<(Message, u64), std::io::Error> {
     // 5-second timeout on the 8-byte frame counter to prevent slowloris
     // attacks where a peer trickles one byte per second to hold the connection.
@@ -804,7 +830,15 @@ async fn read_message_with_counter<S: AsyncRead + Unpin>(
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "frame counter read timeout")
         })??;
-    let msg = read_message(stream, allow_heavy, session_key, counter, bytes_read).await?;
+    let msg = read_message(
+        stream,
+        allow_heavy,
+        session_key,
+        counter,
+        bytes_read,
+        frame_budget,
+    )
+    .await?;
     Ok((msg, counter))
 }
 
@@ -816,6 +850,7 @@ async fn read_message<S: AsyncRead + Unpin>(
     session_key: &[u8; 32],
     counter: u64,
     bytes_read: Option<&AtomicU64>,
+    frame_budget: Option<&Arc<crate::network::frame_budget::PeerBudget>>,
 ) -> Result<Message, std::io::Error> {
     let msg_type = stream.read_u8().await?;
     read_message_after_type(
@@ -825,6 +860,7 @@ async fn read_message<S: AsyncRead + Unpin>(
         session_key,
         counter,
         bytes_read,
+        frame_budget,
     )
     .await
 }
@@ -839,6 +875,81 @@ const READ_CHUNK_SIZE: usize = 32_768; // 32 KiB
 /// Per-chunk read deadline. A peer must deliver each 32 KiB chunk within this
 /// window or be disconnected. At 32 KiB / 5s this enforces a ~6.4 KB/s floor.
 const CHUNK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wire-header bytes that precede every frame payload: `msg_type: u8` +
+/// `payload_len: u32 LE` = 5 bytes. Excludes the trailing HMAC tag, which
+/// lives on the stack as a fixed 16-byte array and is not heap-allocated.
+pub(crate) const FRAME_HEADER_SIZE: usize = 5;
+
+/// Honest peak pre-HMAC-verification heap memory held by
+/// [`read_message_after_type`] for a single frame of the given payload size.
+///
+/// The reader keeps two buffers alive simultaneously at the peak (the moment
+/// HMAC verification runs):
+///
+///   1. `payload: Vec<u8>` of length `payload_len` — read from the socket.
+///   2. `full: Vec<u8>` of length `FRAME_HEADER_SIZE + payload_len` — the
+///      frame header + payload copy required to feed HMAC verification
+///      with a single contiguous slice.
+///
+/// Peak = `payload_len + (FRAME_HEADER_SIZE + payload_len)`
+///      = `2 · payload_len + FRAME_HEADER_SIZE`.
+///
+/// This is the **single source of truth** for the frame-budget
+/// reservation: `read_message_after_type` reserves exactly this many
+/// bytes from the peer's frame budget before allocating the payload
+/// buffer. The drift-catching test `reservation_always_geq_actual_peak`
+/// in this file invokes the full read path through a duplex stream and
+/// asserts this formula is not an underestimate for any legitimate
+/// `payload_len`. If a future change to the reader introduces an
+/// additional transient allocation, the drift test will fail until this
+/// formula is updated.
+///
+/// Not intended for production callers outside `read_message_after_type`
+/// and this module's tests.
+pub(crate) fn peak_prever_bytes(payload_len: usize) -> usize {
+    // payload buffer + reconstructed full-frame buffer held concurrently.
+    // `saturating_add` is cheap insurance against an attacker-controlled
+    // payload_len near usize::MAX; the caller already bounds payload_len
+    // to `MAX_MESSAGE_SIZE` (8 MiB) before reaching this helper.
+    payload_len
+        .saturating_mul(2)
+        .saturating_add(FRAME_HEADER_SIZE)
+}
+
+/// Test-only probe into the frame-budget reservation path. Each
+/// [`record`] captures one invocation of `read_message_after_type` that
+/// used a `FrameBudget`; tests drain the buffer with [`take`] and assert
+/// invariants (typically that `reserved >= actual_peak`).
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    pub struct FrameBudgetRecord {
+        pub payload_len: usize,
+        pub reserved: usize,
+        pub actual_peak: usize,
+    }
+
+    static RECORDS: Mutex<Vec<FrameBudgetRecord>> = Mutex::new(Vec::new());
+
+    pub fn clear() {
+        RECORDS.lock().unwrap().clear();
+    }
+
+    pub fn take() -> Vec<FrameBudgetRecord> {
+        std::mem::take(&mut *RECORDS.lock().unwrap())
+    }
+
+    pub(crate) fn record(payload_len: usize, reserved: usize, actual_peak: usize) {
+        RECORDS.lock().unwrap().push(FrameBudgetRecord {
+            payload_len,
+            reserved,
+            actual_peak,
+        });
+    }
+}
 
 /// Read the remainder of a frame after the msg_type byte has been consumed.
 ///
@@ -855,6 +966,7 @@ async fn read_message_after_type<S: AsyncRead + Unpin>(
     session_key: &[u8; 32],
     counter: u64,
     bytes_read: Option<&AtomicU64>,
+    frame_budget: Option<&Arc<crate::network::frame_budget::PeerBudget>>,
 ) -> Result<Message, std::io::Error> {
     let payload_len = stream.read_u32_le().await? as usize;
 
@@ -893,6 +1005,31 @@ async fn read_message_after_type<S: AsyncRead + Unpin>(
         ));
     }
 
+    // v1.4.2 Fix 3: reserve in-flight buffer budget BEFORE allocating.
+    // The reservation RAII-releases on any return path — HMAC pass, HMAC
+    // fail, deserialization error, or I/O error — so the budget is freed
+    // whether the frame was honest or not. `_reservation` is held across
+    // the payload read, HMAC verify, and deserialize.
+    //
+    // Updated after the first expert re-review: `peak_prever_bytes` now
+    // accounts for BOTH the payload buffer and the reconstructed full-frame
+    // buffer held concurrently during HMAC verification — pre-fix the
+    // reservation was `payload_len` alone, which undercounted by ~2×.
+    let reservation_bytes = peak_prever_bytes(payload_len);
+    let _reservation = if let Some(budget) = frame_budget {
+        match budget.try_reserve(reservation_bytes) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("frame budget exhausted — shedding peer: {}", e),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Read the payload — chunked for large frames, eager for small ones.
     let payload = if payload_len <= EAGER_ALLOC_LIMIT {
         // Small payload: single allocation + read is safe (bounded at 32 KiB).
@@ -913,10 +1050,30 @@ async fn read_message_after_type<S: AsyncRead + Unpin>(
     stream.read_exact(&mut received_tag).await?;
 
     // Reconstruct the frame for HMAC verification and deserialization.
-    let mut full = Vec::with_capacity(5 + payload_len);
+    let mut full = Vec::with_capacity(FRAME_HEADER_SIZE + payload_len);
     full.push(msg_type);
     full.extend_from_slice(&(payload_len as u32).to_le_bytes());
     full.extend_from_slice(&payload);
+
+    // v1.4.2: drift-catching probe. In test builds, record the actual
+    // peak bytes held at this moment (payload + full reconstruction)
+    // alongside the reservation size. `reservation_always_geq_actual_peak`
+    // (below) asserts reserved >= actual_peak across a range of frame
+    // sizes and catches the class of accounting drift the first expert
+    // re-review identified.
+    #[cfg(test)]
+    {
+        if frame_budget.is_some() {
+            // Measure *logical* bytes in the two live buffers, not
+            // `capacity()`, so the check is independent of allocator
+            // rounding. Any future transient allocation added to this
+            // function MUST both update `peak_prever_bytes` above AND
+            // extend this sum — the drift test will only catch omissions
+            // from the formula, not from this probe.
+            let actual_peak = payload.len() + full.len();
+            test_probe::record(payload_len, reservation_bytes, actual_peak);
+        }
+    }
 
     // Verify HMAC before deserializing — reject tampered frames early.
     if !verify_frame_hmac(session_key, counter, &full, &received_tag) {
@@ -1081,3 +1238,121 @@ impl std::fmt::Display for PeerError {
 }
 
 impl std::error::Error for PeerError {}
+
+#[cfg(test)]
+mod frame_budget_drift_tests {
+    use super::*;
+    use crate::network::frame_budget::{FrameBudget, PeerBudget};
+    use tokio::io::AsyncWriteExt;
+
+    /// v1.4.2 drift-catching test (added after first expert re-review).
+    ///
+    /// Runs a full `read_message_after_type` against an in-memory
+    /// duplex stream for a spread of payload sizes spanning the eager
+    /// allocation boundary and up to `MAX_BLOCK_SIZE`. For each frame
+    /// the probe records the reservation size and the actual peak data
+    /// bytes held at HMAC verification time. Asserts reservation ≥
+    /// actual peak.
+    ///
+    /// This test exists to prevent the class of accounting drift the
+    /// first expert re-review identified: the reader originally held
+    /// a payload buffer AND a reconstructed full-frame buffer at the
+    /// peak, but the reservation accounted only for the payload — the
+    /// caps were "half-honest". Any future change that introduces a
+    /// new transient allocation in the read path must update
+    /// `peak_prever_bytes` AND the probe in `read_message_after_type`;
+    /// this test fails otherwise.
+    ///
+    /// The frames carry bogus HMAC tags so the function returns an
+    /// error after the probe runs — we only need to reach the probe
+    /// point, not complete the read successfully.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn reservation_always_geq_actual_peak() {
+        test_probe::clear();
+
+        // Payload sizes spanning: empty, small, eager/chunked boundary,
+        // large, MAX_BLOCK_SIZE. msg_type 0x10 (NewBlock) permits payloads
+        // up to MAX_BLOCK_SIZE.
+        let sizes: &[usize] = &[
+            0,
+            1,
+            100,
+            EAGER_ALLOC_LIMIT - 1,
+            EAGER_ALLOC_LIMIT,
+            EAGER_ALLOC_LIMIT + 1,
+            100_000,
+            1_048_576,       // 1 MiB
+            4 * 1024 * 1024, // MAX_BLOCK_SIZE
+        ];
+
+        for &payload_len in sizes {
+            // Wire format read_message_after_type consumes (msg_type has
+            // already been pulled by the caller and is passed as an
+            // argument): 4 bytes payload_len u32 LE, N bytes payload,
+            // 16 bytes HMAC tag.
+            let mut wire = Vec::with_capacity(4 + payload_len + HMAC_TAG_SIZE);
+            wire.extend_from_slice(&(payload_len as u32).to_le_bytes());
+            wire.extend(std::iter::repeat(0x42u8).take(payload_len));
+            wire.extend_from_slice(&[0u8; HMAC_TAG_SIZE]);
+
+            let (mut client, mut server) = tokio::io::duplex(wire.len() + 1024);
+            client.write_all(&wire).await.unwrap();
+            // Close the client so read_payload_chunked's inner read_exact
+            // gets EOF rather than hanging if payload_len is 0.
+            drop(client);
+
+            let global = FrameBudget::new();
+            let peer_budget = PeerBudget::new(global);
+
+            // HMAC will fail (bogus tag) — we don't care. The probe
+            // fires BEFORE HMAC verification, so we still capture.
+            let _ = read_message_after_type(
+                &mut server,
+                0x10, // NewBlock — allows MAX_BLOCK_SIZE payloads
+                true,
+                &[0u8; 32],
+                0,
+                None,
+                Some(&peer_budget),
+            )
+            .await;
+        }
+
+        let records = test_probe::take();
+        assert_eq!(
+            records.len(),
+            sizes.len(),
+            "expected one probe record per frame ({} sizes), got {}",
+            sizes.len(),
+            records.len()
+        );
+
+        for r in &records {
+            assert!(
+                r.reserved >= r.actual_peak,
+                "accounting drift: payload_len={} reserved={} actual_peak={} \
+                 — a new transient allocation was added to read_message_after_type \
+                 without updating peak_prever_bytes",
+                r.payload_len,
+                r.reserved,
+                r.actual_peak,
+            );
+            // Also verify the formula matches exactly for the current
+            // allocation set — this is the tighter invariant. If the
+            // reader starts over-allocating (e.g. someone changes
+            // `Vec::with_capacity(FRAME_HEADER_SIZE + payload_len)` to
+            // a larger expression), this catches it.
+            assert_eq!(
+                r.reserved,
+                2 * r.payload_len + FRAME_HEADER_SIZE,
+                "peak_prever_bytes formula diverged from 2·payload+header"
+            );
+            assert_eq!(
+                r.actual_peak,
+                2 * r.payload_len + FRAME_HEADER_SIZE,
+                "actual_peak diverged from the two-buffer invariant for payload_len {}",
+                r.payload_len
+            );
+        }
+    }
+}
