@@ -3520,6 +3520,8 @@ async fn run_node(
         assume_valid,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
         frame_budget: network::frame_budget::FrameBudget::new(),
+        tip_validation_coord: Arc::new(network::tip_validation::TipValidationCoordinator::new()),
+        assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
     });
 
     let listen_node = node.clone();

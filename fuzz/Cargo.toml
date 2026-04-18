@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 hex = "0.4"
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dependencies.exfer]
 path = ".."
@@ -60,6 +61,20 @@ bench = false
 [[bin]]
 name = "fuzz_wallet_spend"
 path = "fuzz_targets/fuzz_wallet_spend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_eviction"
+path = "fuzz_targets/fuzz_eviction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tip_validation"
+path = "fuzz_targets/fuzz_tip_validation.rs"
 test = false
 doc = false
 bench = false

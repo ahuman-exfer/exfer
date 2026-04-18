@@ -372,6 +372,7 @@ dependencies = [
  "hex",
  "libfuzzer-sys",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

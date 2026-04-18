@@ -41,6 +41,59 @@ pub const ASSUME_VALID_HASH: [u8; 32] = [
     0x1f, 0x7e, 0x4b, 0xee, 0x8d, 0x6e, 0xe2, 0x18,
     0x64, 0x5c, 0x45, 0x03, 0xe5, 0x45, 0xa1, 0x7f,
 ];
+/// Cumulative work at ASSUME_VALID_HEIGHT on the canonical chain. Used by v1.5.0
+/// Fix 2 cold-bootstrap subpath 2b to derive `verified_cumulative_work` without
+/// walking storage below the checkpoint anchor. Big-endian 256-bit integer.
+///
+/// Value generated 2026-04-18 from the canonical chain by walking retarget
+/// boundaries via RPC against a trusted node (S2, 82.221.100.201) and summing
+/// `work_from_target(difficulty_target) × window_blocks` across heights
+/// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 31,710,391.
+///
+/// **Release procedure:** regenerate alongside `ASSUME_VALID_HEIGHT` and
+/// `ASSUME_VALID_HASH` if any of them are changed. The build-time consistency
+/// test `tests/assume_valid_cumulative_work_guard.rs` asserts the value is not
+/// the zero placeholder. A runtime guard in `process_block` (`src/network/sync.rs`)
+/// also compares this constant against the computed cumulative work when the
+/// node reaches the checkpoint via normal block-by-block validation, and flips
+/// `assume_valid_cumulative_work_trusted` to `false` on mismatch so cold-bootstrap
+/// tip validation falls through to `--verify-all`-equivalent.
+pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0xe3, 0xdc, 0xb7,
+];
+
+// ── v1.5.0 Fix 2 — tip-validation constants ──
+
+/// Maximum concurrent tip-validation attempts in the steady-state regime
+/// (our local tip > ASSUME_VALID_HEIGHT). The bootstrap regime uses 1.
+pub const MAX_CONCURRENT_TIP_VALIDATIONS: usize = 4;
+/// Bootstrap-regime concurrency: exactly 1 active validation. This is what makes
+/// the lifted bootstrap rate cap safe — only one peer's Argon2 burn runs at a time.
+pub const MAX_CONCURRENT_TIP_VALIDATIONS_BOOTSTRAP: usize = 1;
+/// Steady-state validation rate cap: 20 Argon2 evaluations per wall-clock second
+/// across all concurrent tip-validations. ~2 cores at ~100 ms/eval. Kept low so
+/// an adversarial flood of fake tips cannot starve normal mining / block validation.
+pub const MAX_VALIDATION_ARGON2_PER_SEC: u32 = 20;
+/// Bootstrap multiplier: during cold bootstrap the rate cap is scaled per-core so
+/// the one active validation can use available CPU (safe because concurrency=1
+/// by construction, see MAX_CONCURRENT_TIP_VALIDATIONS_BOOTSTRAP).
+///
+/// Effective bootstrap rate = num_cpus × this constant.
+pub const VALIDATION_ARGON2_PER_CORE_BOOTSTRAP: u32 = 10;
+/// Wall-clock timeout for the next batch of headers in a single tip-validation
+/// attempt. Matches the inline `Duration::from_secs(120)` used by the existing
+/// IBD path; named here for clarity and to allow future tuning.
+pub const TIP_VALIDATION_BATCH_TIMEOUT_SECS: u64 = 120;
+/// Floor on per-attempt wall-clock deadline (seconds). Actual deadline is
+/// `max(TIP_VALIDATION_DEADLINE_FLOOR_SECS, ceil(expected_argon2_seconds × 1.5))`.
+pub const TIP_VALIDATION_DEADLINE_FLOOR_SECS: u64 = 7200;
+/// Deadline-scaling multiplier over expected Argon2 time (1.5×). Provides
+/// ~50 % margin for RTT variance and scheduling jitter without letting an
+/// attacker pin us indefinitely.
+pub const TIP_VALIDATION_DEADLINE_SCALE_PCT: u64 = 150;
 
 // ── Emission constants ──
 
@@ -95,6 +148,13 @@ pub const MAX_MESSAGE_SIZE: usize = 8_388_608; // 8 MiB
 pub const MAX_OUTBOUND_PEERS: usize = 8;
 pub const MAX_INBOUND_PEERS: usize = 256;
 pub const MAX_INBOUND_PER_IP: usize = 1;
+/// Eviction overcommit: TCP accept allows up to MAX_INBOUND_PEERS + this many mid-handshake
+/// sockets before rejecting, giving post-handshake eviction room to land without dropping
+/// legitimate reconnect bursts. See v1.5.0 Fix 1.
+pub const EVICTION_PENDING_HEADROOM: usize = 32;
+/// Minimum session age (seconds) before an inbound peer becomes an eviction candidate.
+/// Prevents thrash where a burst of handshakes evicts each other in a loop.
+pub const EVICTION_MIN_AGE_SECS: u64 = 60;
 pub const PING_INTERVAL_SECS: u64 = 60;
 pub const PONG_DEADLINE_SECS: u64 = 15;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;

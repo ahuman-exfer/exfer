@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub type PeerId = [u8; 32];
 
@@ -73,6 +73,30 @@ pub enum SessionAttachResult {
     NewLogicalConnect,
     ReplacedExistingSession { old_shutdown: Arc<AtomicBool> },
     RejectedDuplicate,
+}
+
+/// Snapshot of an inbound session eligible for random eviction.
+///
+/// Contains everything needed to signal shutdown and log the eviction after the
+/// `PeerRegistry` borrow is released. Ownership: cloning `shutdown` is cheap
+/// (Arc); the caller triggers unwind by setting the flag. Slot-accounting state
+/// (the session entry in `LogicalPeer.session`) is cleared by calling
+/// `detach_session_if_current` separately after this is selected.
+pub struct EvictionCandidate {
+    pub identity: PeerId,
+    pub session_id: u64,
+    pub socket_addr: SocketAddr,
+    pub established_at: Instant,
+    pub shutdown: Arc<AtomicBool>,
+}
+
+/// Outcome of the atomic eviction decision. See `PeerRegistry::decide_inbound_eviction`.
+pub enum EvictionDecision {
+    NotNeeded,
+    DuplicateIdentity,
+    IpCapReached,
+    NoEligibleCandidates,
+    Evict(EvictionCandidate),
 }
 
 impl PeerRegistry {
@@ -157,6 +181,108 @@ impl PeerRegistry {
                     .is_some_and(|s| !s.is_outbound && s.socket_addr.ip() == ip)
             })
             .count()
+    }
+
+    /// Decide whether to evict an inbound session to make room for a new peer.
+    ///
+    /// This is the atomic decision path used by `handle_inbound` post-handshake.
+    /// Factored out for unit/integration testing without requiring TCP or real
+    /// handshakes. The caller must already hold the peers lock.
+    ///
+    /// Returns:
+    /// - `EvictionDecision::NotNeeded` — slots not at cap, no eviction required.
+    /// - `EvictionDecision::DuplicateIdentity` — the new peer's identity is
+    ///   already attached; skip eviction and let `attach_session`'s
+    ///   `ReplacedExistingSession` path swap the session in place.
+    /// - `EvictionDecision::IpCapReached` — new peer's IP already at
+    ///   `MAX_INBOUND_PER_IP`; reject without evicting (defense-in-depth vs.
+    ///   the accept-time check).
+    /// - `EvictionDecision::NoEligibleCandidates` — at cap but every inbound
+    ///   session is within `EVICTION_MIN_AGE_SECS` or is the active IBD peer.
+    ///   Caller rejects.
+    /// - `EvictionDecision::Evict(EvictionCandidate)` — selected victim. Caller
+    ///   must signal the victim's shutdown flag and call
+    ///   `detach_session_if_current` before completing admission.
+    ///
+    /// Selection is pure uniform random via `rand::thread_rng`. Production callers
+    /// should pass `MAX_INBOUND_PEERS` and `Duration::from_secs(EVICTION_MIN_AGE_SECS)`;
+    /// tests may pass smaller values to exercise small-scale scenarios.
+    pub fn decide_inbound_eviction(
+        &self,
+        new_peer_identity: &PeerId,
+        new_peer_ip: std::net::IpAddr,
+        active_ibd_peer: Option<(PeerId, u64)>,
+        max_inbound: usize,
+        min_age: Duration,
+    ) -> EvictionDecision {
+        if self.inbound_count() < max_inbound {
+            return EvictionDecision::NotNeeded;
+        }
+        if self
+            .by_identity
+            .get(new_peer_identity)
+            .is_some_and(|lp| lp.session.is_some())
+        {
+            return EvictionDecision::DuplicateIdentity;
+        }
+        if self.inbound_count_for_ip(new_peer_ip) >= MAX_INBOUND_PER_IP {
+            return EvictionDecision::IpCapReached;
+        }
+        let candidates = self.eligible_eviction_candidates_with_min_age(active_ibd_peer, min_age);
+        if candidates.is_empty() {
+            return EvictionDecision::NoEligibleCandidates;
+        }
+        use rand::Rng;
+        let idx = rand::thread_rng().gen_range(0..candidates.len());
+        EvictionDecision::Evict(candidates.into_iter().nth(idx).unwrap())
+    }
+
+    /// Enumerate inbound sessions eligible for random eviction per v1.5.0 Fix 1.
+    ///
+    /// Default production call uses `EVICTION_MIN_AGE_SECS`. Tests use
+    /// `eligible_eviction_candidates_with_min_age` for custom thresholds.
+    #[allow(dead_code)]
+    pub fn eligible_eviction_candidates(
+        &self,
+        active_ibd_peer: Option<(PeerId, u64)>,
+    ) -> Vec<EvictionCandidate> {
+        self.eligible_eviction_candidates_with_min_age(
+            active_ibd_peer,
+            Duration::from_secs(EVICTION_MIN_AGE_SECS),
+        )
+    }
+
+    /// Like `eligible_eviction_candidates` but with an explicit minimum age.
+    pub fn eligible_eviction_candidates_with_min_age(
+        &self,
+        active_ibd_peer: Option<(PeerId, u64)>,
+        min_age: Duration,
+    ) -> Vec<EvictionCandidate> {
+        let now = Instant::now();
+        self.by_identity
+            .iter()
+            .filter_map(|(id, lp)| {
+                let s = lp.session.as_ref()?;
+                if s.is_outbound {
+                    return None;
+                }
+                if now.duration_since(s.established_at) < min_age {
+                    return None;
+                }
+                if let Some((ibd_id, ibd_sid)) = active_ibd_peer {
+                    if ibd_id == *id && ibd_sid == s.session_id {
+                        return None;
+                    }
+                }
+                Some(EvictionCandidate {
+                    identity: *id,
+                    session_id: s.session_id,
+                    socket_addr: s.socket_addr,
+                    established_at: s.established_at,
+                    shutdown: s.shutdown.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn bind_dial_addr(&mut self, identity: PeerId, addr: SocketAddr) {
@@ -656,6 +782,19 @@ pub struct Node {
     /// `crate::network::peer::peak_prever_bytes`). This prevents a pool of
     /// 256 peers × 4 MiB blocks from consuming ~1 GiB of unverified RAM.
     pub frame_budget: Arc<crate::network::frame_budget::FrameBudget>,
+    /// v1.5.0 Fix 2: tip-validation state. Holds concurrency semaphores
+    /// (bootstrap + steady-state), the Argon2 rate limiter, the
+    /// HeadersResponse subscriber map (for routing replies back to spawned
+    /// validation tasks), and the pre-validated header cache used by IBD to
+    /// skip Argon2 re-evaluation on already-validated forward headers.
+    pub tip_validation_coord: Arc<crate::network::tip_validation::TipValidationCoordinator>,
+    /// v1.5.0 Fix 2 release-hardening guard. Initially true; flipped to false
+    /// at runtime if the hardcoded ASSUME_VALID_CUMULATIVE_WORK disagrees with
+    /// the computed cumulative work when the node reaches the checkpoint via
+    /// normal block-by-block validation. While false, cold-bootstrap tip
+    /// validation (path 2b) refuses to use the hardcoded constant and falls
+    /// through to --verify-all-equivalent behavior.
+    pub assume_valid_cumulative_work_trusted: AtomicBool,
 }
 
 impl Node {
@@ -1906,6 +2045,38 @@ impl Node {
             if block_id == expected {
                 self.assume_valid_verified.store(true, Ordering::SeqCst);
                 info!("Assume-valid checkpoint verified at height {}", ASSUME_VALID_HEIGHT);
+
+                // v1.5.0 Fix 2 runtime guard: verify the hardcoded
+                // ASSUME_VALID_CUMULATIVE_WORK matches the actual cumulative work
+                // at this height on our canonical chain. A mismatch indicates a
+                // bad release-time constant; we refuse to use it for cold-bootstrap
+                // tip-validation (path 2b) and log at ERROR. We do NOT panic — a
+                // running node that has already validated real blocks should not
+                // self-destruct over a build-time constant mistake.
+                if let Ok(Some(parent_work)) = self
+                    .storage
+                    .get_cumulative_work(&block.header.prev_block_id)
+                {
+                    let checkpoint_work = crate::consensus::difficulty::add_work(
+                        &parent_work,
+                        &crate::consensus::difficulty::work_from_target(
+                            &block.header.difficulty_target,
+                        ),
+                    );
+                    if checkpoint_work != ASSUME_VALID_CUMULATIVE_WORK {
+                        error!(
+                            "v1.5.0 Fix 2 guard: ASSUME_VALID_CUMULATIVE_WORK mismatch at height {}. \
+                             Hardcoded {:?}, computed {:?}. \
+                             Cold-bootstrap tip-validation (path 2b) will fall through to \
+                             --verify-all-equivalent until the constant is corrected.",
+                            ASSUME_VALID_HEIGHT,
+                            ASSUME_VALID_CUMULATIVE_WORK,
+                            checkpoint_work
+                        );
+                        self.assume_valid_cumulative_work_trusted
+                            .store(false, Ordering::SeqCst);
+                    }
+                }
             } else {
                 return Err(ProcessBlockError::Recoverable(format!(
                     "assume-valid checkpoint FAILED at height {}: expected {}, got {}",
@@ -2611,9 +2782,13 @@ impl Node {
 
             {
                 let mut peers = self.peers.lock().await;
-                let inbound_count = peers.inbound_count() + peers.pending_inbound_sockets.len();
-                if inbound_count >= MAX_INBOUND_PEERS {
-                    warn!("Max inbound peers reached, rejecting {}", addr);
+                // v1.5.0 Fix 1: accept-time check allows MAX_INBOUND_PEERS + EVICTION_PENDING_HEADROOM
+                // so post-handshake eviction can land without TCP-level rejection during small
+                // reconnect bursts. Handshakes that fail to complete are bounded by HANDSHAKE_TIMEOUT_SECS.
+                let pending_and_attached =
+                    peers.inbound_count() + peers.pending_inbound_sockets.len();
+                if pending_and_attached >= MAX_INBOUND_PEERS + EVICTION_PENDING_HEADROOM {
+                    warn!("Max inbound peers + headroom reached, rejecting {}", addr);
                     continue;
                 }
                 let ip = addr.ip();
@@ -2706,6 +2881,60 @@ impl Node {
         let emit_connected;
         {
             let mut peers = self.peers.lock().await;
+
+            // v1.5.0 Fix 1: random inbound eviction when at cap. Atomic under the peers lock
+            // with the subsequent attach_session call.
+            match peers.decide_inbound_eviction(
+                &peer.identity,
+                addr.ip(),
+                active_ibd,
+                MAX_INBOUND_PEERS,
+                Duration::from_secs(EVICTION_MIN_AGE_SECS),
+            ) {
+                EvictionDecision::NotNeeded | EvictionDecision::DuplicateIdentity => {}
+                EvictionDecision::IpCapReached => {
+                    peers.release_inbound_socket(&addr);
+                    warn!(
+                        "Max inbound per IP reached for {}, rejecting {} (post-handshake)",
+                        addr.ip(),
+                        addr
+                    );
+                    return Err(PeerError::Io("max inbound per ip".into()));
+                }
+                EvictionDecision::NoEligibleCandidates => {
+                    peers.release_inbound_socket(&addr);
+                    info!(
+                        "Max inbound peers reached, no eligible eviction candidates, rejecting {}",
+                        addr
+                    );
+                    return Err(PeerError::Io(
+                        "max inbound peers, no eviction candidates".into(),
+                    ));
+                }
+                EvictionDecision::Evict(victim) => {
+                    // Signal the victim's reader/writer/supervisor to unwind. Release pairs
+                    // with any future Acquire loader; zero cost on x86.
+                    victim.shutdown.store(true, Ordering::Release);
+                    // Free the slot in the logical-peer registry so the new peer's
+                    // attach_session succeeds. The reader exits on its own after observing
+                    // the shutdown flag; its FrameReservation releases via Drop at that point.
+                    peers.detach_session_if_current(victim.identity, victim.session_id);
+                    let id_prefix: String = victim
+                        .identity
+                        .iter()
+                        .take(4)
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+                    info!(
+                        "Evicted inbound peer {} (identity {}, age {}s) to admit {}",
+                        victim.socket_addr,
+                        id_prefix,
+                        victim.established_at.elapsed().as_secs(),
+                        addr
+                    );
+                }
+            }
+
             let catching_up = self.sync_state.load(std::sync::atomic::Ordering::Relaxed)
                 == SyncState::CatchingUp as u8;
             match peers.attach_session(
@@ -2777,6 +3006,20 @@ impl Node {
                 }
                 _ => {}
             }
+
+            // v1.5.0 Fix 2: clear this peer's pre-validated header cache on
+            // disconnect. Entries are only ever consumed by IBD block responses
+            // from this specific peer's identity; once the peer is gone they
+            // are retention-only overhead. Also releases any active
+            // validation reservation the peer may have held so a reconnect
+            // under a new session_id can dispatch a fresh validator.
+            {
+                let mut cache = self.tip_validation_coord.cache.lock().await;
+                cache.clear_peer(&peer_identity);
+            }
+            self.tip_validation_coord
+                .release_reservation(peer_identity, session_id)
+                .await;
 
             // Handle IBD cooldown + active_ibd_peer clearing
             let was_ibd_peer = {
@@ -2976,6 +3219,20 @@ impl Node {
                 }
                 _ => {}
             }
+
+            // v1.5.0 Fix 2: clear this peer's pre-validated header cache on
+            // disconnect. Entries are only ever consumed by IBD block responses
+            // from this specific peer's identity; once the peer is gone they
+            // are retention-only overhead. Also releases any active
+            // validation reservation the peer may have held so a reconnect
+            // under a new session_id can dispatch a fresh validator.
+            {
+                let mut cache = self.tip_validation_coord.cache.lock().await;
+                cache.clear_peer(&peer_identity);
+            }
+            self.tip_validation_coord
+                .release_reservation(peer_identity, session_id)
+                .await;
 
             // Handle IBD cooldown + active_ibd_peer clearing
             let was_ibd_peer = {
@@ -3393,20 +3650,46 @@ impl Node {
                     }
                     // Global block slot consumed in process_block_event after
                     // parent lookup — orphans don't count toward the cap.
+                    //
+                    // v1.5.0 Fix 2: if this block's header is in the pre-validated cache
+                    // (populated by a prior forward-chain tip validation from THIS peer),
+                    // mark the PeerEvent with pre_validated=true so the block-validation
+                    // path skips Argon2 re-evaluation. Body/merkle/tx validation still runs.
+                    let block_id_for_cache = block.header.block_id();
+                    let pre_validated = {
+                        let cache = self.tip_validation_coord.cache.lock().await;
+                        cache.lookup(&meta.identity, &block_id_for_cache).is_some()
+                    };
                     let _ = self.peer_events_tx.send(PeerEvent::BlockResponse {
                         from: meta.addr,
                         from_identity: meta.identity,
                         session_id,
                         block,
-                        pre_validated: false,
+                        pre_validated,
                     }).await;
                 }
                 Message::Headers(headers) => {
-                    let _ = self.peer_events_tx.send(PeerEvent::HeadersResponse {
-                        from_identity: meta.identity,
+                    // v1.5.0 Fix 2: if a tip-validation task has subscribed for this
+                    // (peer_identity, session_id), route the headers to that task's
+                    // channel instead of the main sync mpsc. Avoids interleaving
+                    // forward-chain validation state with the main event loop.
+                    let routed = crate::network::tip_validation::route_headers_if_subscribed(
+                        &self.tip_validation_coord.subscribers,
+                        meta.identity,
                         session_id,
-                        headers,
-                    }).await;
+                        headers.clone(),
+                    )
+                    .await;
+                    if !routed {
+                        let _ = self
+                            .peer_events_tx
+                            .send(PeerEvent::HeadersResponse {
+                                from_identity: meta.identity,
+                                session_id,
+                                headers,
+                            })
+                            .await;
+                    }
                 }
                 Message::Inv(_) => {
                     tracing::debug!("Ignoring Inv from {}", meta.addr);
@@ -4821,6 +5104,16 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             }
             // Clear IBD protection
             *node.active_ibd_peer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // v1.5.0 Fix 2: clear this peer's pre-validated header cache after IBD
+            // completes (success or failure). Entries were populated during tip
+            // validation before IBD started; once IBD is done they are no longer
+            // consulted for this peer's block responses (new blocks flow via
+            // NewBlock not BlockResponse, and they'd need fresh tip validation
+            // to repopulate). Bounded retention only.
+            {
+                let mut cache = node.tip_validation_coord.cache.lock().await;
+                cache.clear_peer(&peer_identity);
+            }
             continue;
         }
 
@@ -4941,6 +5234,15 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                         let deadline = Instant::now() + Duration::from_secs(10);
                         let mut verified = false;
                         let mut verified_header_target = Hash256([0xFF; 32]);
+                        // v1.5.0 Fix 2: when the handler dispatches to async
+                        // forward-chain validation, control breaks out of the
+                        // event loop here but the async task owns peer-tip
+                        // updates and strike decisions. This flag suppresses
+                        // the post-loop legacy "verified → confirm" and
+                        // "!verified → strike" branches, which would otherwise
+                        // self-strike honest peers whose forward validation
+                        // hasn't finished yet.
+                        let mut dispatched_async = false;
                         while Instant::now() < deadline {
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             match tokio::time::timeout(remaining, rx.recv()).await {
@@ -4955,17 +5257,138 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                         if hdr_block_id == block_id && header.height == height {
                                             verified_header_target = header.difficulty_target;
                                             // Validate difficulty target against our chain.
-                                            let difficulty_ok = if let Ok(Some(_parent)) = node.storage.get_header(&header.prev_block_id) {
-                                                // Parent exists — verify expected difficulty
+                                            //
+                                            // v1.5.0 Fix 2: when the parent is unknown AND we're in the
+                                            // steady-state regime (our local tip is past the assume-valid
+                                            // checkpoint), dispatch to the forward-chain validation path
+                                            // instead of accepting any difficulty. The full chain from our
+                                            // anchor up to the peer's claim is validated exactly, and the
+                                            // peer-supplied cumulative_work is replaced with the sum of the
+                                            // validated per-header work. Path 2b (cold bootstrap) is
+                                            // deferred — legacy accept-any-difficulty is retained there,
+                                            // with attack damage bounded by the existing checkpoint
+                                            // verification in process_block (`sync.rs:2030`).
+                                            let parent_known = node
+                                                .storage
+                                                .get_header(&header.prev_block_id)
+                                                .ok()
+                                                .flatten()
+                                                .is_some();
+                                            let our_h = node.tip.read().await.height;
+                                            let regime = crate::network::tip_validation::ValidationRegime::select(
+                                                our_h,
+                                                node.assume_valid,
+                                            );
+                                            // Path 2a (SteadyState) and path 2b (Bootstrap with trusted
+                                            // checkpoint constant) both dispatch to async forward
+                                            // validation. Path-2b-disabled bootstrap (fresh --verify-all
+                                            // node at genesis, or a run where the runtime guard flipped
+                                            // assume_valid_cumulative_work_trusted to false) falls
+                                            // through to the legacy accept-unknown-parent path.
+                                            let path_2b_usable = matches!(
+                                                regime,
+                                                crate::network::tip_validation::ValidationRegime::Bootstrap
+                                            )
+                                                && node.assume_valid
+                                                && node
+                                                    .assume_valid_cumulative_work_trusted
+                                                    .load(Ordering::SeqCst);
+                                            let dispatch_forward = !parent_known
+                                                && (matches!(
+                                                    regime,
+                                                    crate::network::tip_validation::ValidationRegime::SteadyState
+                                                ) || path_2b_usable);
+                                            let difficulty_ok = if parent_known {
                                                 match node.cached_expected_difficulty(&header.prev_block_id, header.height) {
                                                     Ok((expected_target, _)) => header.difficulty_target == expected_target,
                                                     Err(_) => false,
                                                 }
+                                            } else if dispatch_forward {
+                                                // Per-peer reservation: prevent repeat GetTip polls from
+                                                // overwriting the HeadersResponse subscriber of an
+                                                // in-flight validator. If a validation is already
+                                                // active for this (peer, session), skip dispatch —
+                                                // the existing validator will finish and update the tip.
+                                                let reserved = node
+                                                    .tip_validation_coord
+                                                    .try_reserve(from_identity, session_id)
+                                                    .await;
+                                                if !reserved {
+                                                    debug!(
+                                                        "v1.5.0 Fix 2: skipping duplicate forward-validation dispatch for peer {:?} session {} — already in-flight",
+                                                        &from_identity[..4], session_id
+                                                    );
+                                                    // Set dispatched=true so we DON'T fall into the
+                                                    // failed-PoW strike branch below.
+                                                    dispatched_async = true;
+                                                    break;
+                                                }
+                                                let node_arc = node.clone();
+                                                let peer_ip_opt = {
+                                                    let peers = node.peers.lock().await;
+                                                    peers.get_by_identity(&from_identity)
+                                                        .and_then(|lp| lp.session.as_ref().map(|s| s.socket_addr.ip()))
+                                                };
+                                                if let Some(peer_ip) = peer_ip_opt {
+                                                    tokio::spawn(async move {
+                                                        let result = run_tip_forward_validation(
+                                                            node_arc.clone(),
+                                                            from_identity,
+                                                            session_id,
+                                                            peer_ip,
+                                                            height,
+                                                            block_id,
+                                                        ).await;
+                                                        if result.record_strike {
+                                                            node_arc.record_ip_strike(peer_ip, Some(from_identity));
+                                                        }
+                                                        if let Ok(vt) = &result.outcome {
+                                                            let mut peers = node_arc.peers.lock().await;
+                                                            if let Some(lp) = peers.get_mut_by_identity(&from_identity) {
+                                                                if lp.session.as_ref().is_some_and(|s| s.session_id == session_id) {
+                                                                    lp.tip = Some(PeerTip {
+                                                                        height: vt.height,
+                                                                        cumulative_work: vt.verified_cumulative_work,
+                                                                        block_id: vt.block_id,
+                                                                        confirmed: true,
+                                                                    });
+                                                                }
+                                                            }
+                                                            info!(
+                                                                "v1.5.0 Fix 2 forward-chain validation ok: peer {:?} height {} forward_headers {}",
+                                                                &from_identity[..4], vt.height, vt.headers_validated
+                                                            );
+                                                        } else if let Err(e) = &result.outcome {
+                                                            warn!(
+                                                                "v1.5.0 Fix 2 forward-chain validation failed for peer {:?}: {}",
+                                                                &from_identity[..4], e
+                                                            );
+                                                        }
+                                                        // Always release reservation so a later GetTip
+                                                        // can trigger a fresh validation for this peer.
+                                                        node_arc
+                                                            .tip_validation_coord
+                                                            .release_reservation(from_identity, session_id)
+                                                            .await;
+                                                    });
+                                                } else {
+                                                    // Peer disconnected between ack and ip lookup —
+                                                    // release the reservation we just took.
+                                                    node.tip_validation_coord
+                                                        .release_reservation(from_identity, session_id)
+                                                        .await;
+                                                }
+                                                // Mark the TipResponse as dispatched-to-async so we do
+                                                // NOT fall through into the legacy "failed PoW → strike"
+                                                // branch at the end of this handler. The async task
+                                                // owns peer-tip and strike decisions from here.
+                                                dispatched_async = true;
+                                                break;
                                             } else {
-                                                // Parent unknown (peer is ahead). We can't verify
-                                                // the exact difficulty, but PoW validity still
-                                                // proves real work was done for the claimed target.
-                                                // The full chain will be validated during IBD.
+                                                // Bootstrap regime without trusted checkpoint constant
+                                                // (e.g., --verify-all on a fresh node with no local
+                                                // chain yet). Legacy fallback: accept any difficulty;
+                                                // attack bounded by existing checkpoint verification.
                                                 true
                                             };
                                             if difficulty_ok {
@@ -4989,7 +5412,10 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                 _ => break,
                             }
                         }
-                        if verified {
+                        if dispatched_async {
+                            // Async forward-validation task is in flight; peer
+                            // tip + strike decisions are owned by that task.
+                        } else if verified {
                             // Don't trust peer-supplied cumulative_work.
                             // If we have this block, use our own stored work.
                             // Otherwise, peer is ahead: use our tip's work plus
@@ -5151,4 +5577,579 @@ fn undo_applied_new_chain(
         }
     }
     Ok(())
+}
+
+// ── v1.5.0 Fix 2: forward-chain tip validation ──
+//
+// Runs as a spawned task per tip-validation attempt. Locates a common ancestor
+// via the existing height-based binary search, fetches forward headers from
+// anchor+1 to peer-claimed tip in batches of MAX_GETBLOCKS_ITEMS, validates
+// each header exactly (chain integrity + consensus difficulty via overlay +
+// rate-limited Argon2 PoW), derives verified cumulative work, rechecks that
+// the anchor is still canonical, and on success updates the peer's tip entry
+// and populates the pre-validated header cache for IBD double-Argon2 skip.
+//
+// Scope note: this implementation handles path 2a (running node, our local tip
+// at or past the assume-valid checkpoint). Path 2b (cold bootstrap where our
+// local tip is below the checkpoint) is documented in the v1.5.0-brief.md
+// spec; for this release the cold-bootstrap case falls through to the legacy
+// single-header validation path already in the TipResponse handler. Attack
+// damage in that path is bounded by the existing checkpoint verification in
+// `process_block` at `sync.rs:2030` — a fake peer cannot deliver a chain that
+// reaches the checkpoint with a mismatching hash without being rejected there.
+// Full path-2b implementation is tracked as follow-up work.
+
+/// Run forward-chain tip validation (Fix 2 path 2a) against a peer's claimed
+/// tip. Returns the verified tip or an error categorized by strike policy.
+pub async fn run_tip_forward_validation(
+    node: Arc<Node>,
+    peer_identity: PeerId,
+    session_id: u64,
+    _peer_ip: std::net::IpAddr,
+    claim_height: u64,
+    claim_block_id: Hash256,
+) -> crate::network::tip_validation::ValidationResult {
+    use crate::network::tip_validation::{
+        anchor_still_canonical, anchor_work, await_header_batch, build_get_headers,
+        compute_deadline, install_headers_subscriber, remove_headers_subscriber, should_strike,
+        sum_forward_work, validate_one_forward_header, TipValidationError, ValidationRegime,
+        ValidationResult, VerifiedTip,
+    };
+
+    let outcome: Result<VerifiedTip, TipValidationError> = async {
+        let our_height_start = node.tip.read().await.height;
+        let regime = ValidationRegime::select(our_height_start, node.assume_valid);
+
+        // Acquire concurrency semaphore for the regime (cloned Arc so we can own the permit).
+        let sem = node.tip_validation_coord.semaphore_for(regime).clone();
+        let permit = sem
+            .try_acquire_owned()
+            .map_err(|_| TipValidationError::NoSlotAvailable)?;
+
+        // Update the shared rate limiter to the regime's rate.
+        node.tip_validation_coord
+            .rate_limiter
+            .set_rate(regime.argon2_rate_per_sec());
+
+        // Install the HeadersResponse subscriber.
+        let mut subscriber = install_headers_subscriber(
+            &node.tip_validation_coord.subscribers,
+            peer_identity,
+            session_id,
+        )
+        .await;
+
+        // Compute deadline.
+        let expected_headers = claim_height.saturating_sub(our_height_start);
+        let deadline = Instant::now() + compute_deadline(expected_headers, regime);
+
+        // ── Anchor selection ──
+        // Path 2a (running node): common-ancestor binary search against storage.
+        // Path 2b (cold bootstrap under assume_valid): fetch the checkpoint
+        //   header at ASSUME_VALID_HEIGHT, verify its block_id against
+        //   ASSUME_VALID_HASH, use as anchor.
+        let use_path_2b = matches!(regime, ValidationRegime::Bootstrap)
+            && node.assume_valid
+            && node
+                .assume_valid_cumulative_work_trusted
+                .load(Ordering::SeqCst);
+
+        let (anchor_height, anchor_block_id, anchor_header, is_checkpoint_anchor) = if use_path_2b {
+            // Path 2b: fetch the checkpoint header.
+            if !node
+                .send_to_session(
+                    peer_identity,
+                    session_id,
+                    build_get_headers(ASSUME_VALID_HEIGHT, 1),
+                )
+                .await
+            {
+                return Err(TipValidationError::PeerDisconnected);
+            }
+            let hdrs = await_header_batch(&mut subscriber).await?;
+            let hdr = hdrs.first().ok_or_else(|| {
+                TipValidationError::DeliveredInvalidHeader(
+                    "empty response to checkpoint-header request".into(),
+                )
+            })?;
+            if hdr.height != ASSUME_VALID_HEIGHT {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "peer returned height {} for checkpoint request at {}",
+                    hdr.height, ASSUME_VALID_HEIGHT
+                )));
+            }
+            let computed = hdr.block_id();
+            if computed != Hash256(ASSUME_VALID_HASH) {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "peer served header at checkpoint height {} with block_id {} != ASSUME_VALID_HASH",
+                    ASSUME_VALID_HEIGHT, computed
+                )));
+            }
+            (ASSUME_VALID_HEIGHT, computed, hdr.clone(), true)
+        } else if matches!(regime, ValidationRegime::Bootstrap) {
+            // Bootstrap but assume_valid disabled or CUMULATIVE_WORK distrusted.
+            // Fall through to legacy single-header path.
+            return Err(TipValidationError::Internal(
+                "bootstrap regime without trusted checkpoint constant; legacy path handles this".into(),
+            ));
+        } else {
+            // Path 2a: binary-search common ancestor.
+            let our_height = our_height_start;
+            let hdrs = {
+                if !node
+                    .send_to_session(peer_identity, session_id, build_get_headers(our_height, 1))
+                    .await
+                {
+                    return Err(TipValidationError::PeerDisconnected);
+                }
+                await_header_batch(&mut subscriber).await?
+            };
+            let anchor_at_our_tip = hdrs.first().is_some_and(|h| {
+                h.height == our_height
+                    && node
+                        .storage
+                        .get_block_id_by_height(our_height)
+                        .ok()
+                        .flatten()
+                        == Some(h.block_id())
+            });
+            let ancestor_h = if anchor_at_our_tip {
+                our_height
+            } else {
+                let mut lo: u64 = 0;
+                let mut hi: u64 = our_height;
+                while lo < hi {
+                    if Instant::now() >= deadline {
+                        return Err(TipValidationError::DeadlineExceeded);
+                    }
+                    let mid = lo + (hi - lo).div_ceil(2);
+                    if !node
+                        .send_to_session(peer_identity, session_id, build_get_headers(mid, 1))
+                        .await
+                    {
+                        return Err(TipValidationError::PeerDisconnected);
+                    }
+                    let hdrs = await_header_batch(&mut subscriber).await?;
+                    let peer_bid = hdrs.first().filter(|h| h.height == mid).map(|h| h.block_id());
+                    let our_bid = node.storage.get_block_id_by_height(mid).ok().flatten();
+                    match (peer_bid, our_bid) {
+                        (Some(p), Some(o)) if p == o => lo = mid,
+                        _ => hi = mid.saturating_sub(1),
+                    }
+                }
+                lo
+            };
+            let anchor_bid = node
+                .storage
+                .get_block_id_by_height(ancestor_h)
+                .map_err(|e| TipValidationError::Internal(format!("storage: {}", e)))?
+                .ok_or_else(|| {
+                    TipValidationError::Internal(format!(
+                        "no block at anchor_height {} in storage",
+                        ancestor_h
+                    ))
+                })?;
+            let anchor_hdr = node
+                .storage
+                .get_header(&anchor_bid)
+                .map_err(|e| TipValidationError::Internal(format!("get_header: {}", e)))?
+                .ok_or_else(|| {
+                    TipValidationError::Internal(format!(
+                        "no header at anchor {:?}",
+                        anchor_bid
+                    ))
+                })?;
+            (ancestor_h, anchor_bid, anchor_hdr, false)
+        };
+
+        // Nothing to validate if the peer's claim is at or below the anchor.
+        if claim_height <= anchor_height {
+            // Path 2a: read cumulative work from storage.
+            // Path 2b: use the trusted checkpoint constant, since a fresh
+            //   cold-bootstrap node has NO pre-checkpoint blocks in storage yet
+            //   but still wants to track this peer as a known-tip reference.
+            let our_work = anchor_work(
+                &node.storage,
+                &anchor_block_id,
+                is_checkpoint_anchor,
+                node.assume_valid_cumulative_work_trusted
+                    .load(Ordering::SeqCst),
+            )?;
+            return Ok(VerifiedTip {
+                height: claim_height,
+                block_id: claim_block_id,
+                verified_cumulative_work: our_work,
+                anchor_height,
+                anchor_block_id,
+                headers_validated: 0,
+            });
+        }
+
+        // ── Forward chain fetch + validate ──
+        let mut overlay = crate::consensus::difficulty::ForwardHeaderOverlay::new(&node.storage);
+        overlay.insert(anchor_header.clone());
+
+        // v1.5.0 Fix 2 path 2b: pre-checkpoint retarget lookback.
+        //
+        // When the anchor is the checkpoint (fetched from the peer) and the
+        // forward chain crosses the first post-checkpoint retarget boundary,
+        // `expected_difficulty_overlay` needs ancestor headers from below the
+        // checkpoint that are not in storage. Fetch `RETARGET_WINDOW - 1` of
+        // them from the peer, authenticate via strict SHA256 hash-chain walk
+        // back from the authenticated checkpoint header, insert into overlay.
+        //
+        // No Argon2 on these — they are below `ASSUME_VALID_HEIGHT` and covered
+        // by the checkpoint trust anchor. The hash-chain authentication relies
+        // on SHA256 pre-image resistance: a peer cannot produce a chain that
+        // links correctly back to `ASSUME_VALID_HASH` without the headers being
+        // the real canonical pre-checkpoint ones.
+        {
+            // First retarget boundary strictly greater than ASSUME_VALID_HEIGHT:
+            // next multiple of RETARGET_WINDOW at or above ASSUME_VALID_HEIGHT + 1.
+            let first_post_checkpoint_retarget: u64 =
+                ((ASSUME_VALID_HEIGHT / RETARGET_WINDOW) + 1) * RETARGET_WINDOW;
+            if is_checkpoint_anchor && claim_height >= first_post_checkpoint_retarget {
+                let lookback_span: u64 = RETARGET_WINDOW - 1;
+                let lookback_start: u64 = ASSUME_VALID_HEIGHT.saturating_sub(lookback_span);
+                let expected = lookback_span as usize;
+                let mut collected_asc: Vec<BlockHeader> = Vec::with_capacity(expected);
+                let mut next_h = lookback_start;
+                while next_h < ASSUME_VALID_HEIGHT {
+                    if Instant::now() >= deadline {
+                        return Err(TipValidationError::DeadlineExceeded);
+                    }
+                    let remaining = ASSUME_VALID_HEIGHT - next_h;
+                    let count = remaining.min(MAX_GETBLOCKS_ITEMS as u64) as u32;
+                    if !node
+                        .send_to_session(peer_identity, session_id, build_get_headers(next_h, count))
+                        .await
+                    {
+                        return Err(TipValidationError::PeerDisconnected);
+                    }
+                    let batch = await_header_batch(&mut subscriber).await?;
+                    if batch.is_empty()
+                        || batch[0].height != next_h
+                        || batch.len() > count as usize
+                    {
+                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                            "malformed pre-checkpoint batch at start_height {}: len {}, first \
+                             height {:?} (expected start {}, max {})",
+                            next_h,
+                            batch.len(),
+                            batch.first().map(|h| h.height),
+                            next_h,
+                            count
+                        )));
+                    }
+                    next_h += batch.len() as u64;
+                    collected_asc.extend(batch);
+                }
+                if collected_asc.len() != expected {
+                    return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                        "pre-checkpoint fetch incomplete: got {}, expected {}",
+                        collected_asc.len(),
+                        expected
+                    )));
+                }
+                // Strict SHA256 hash-chain authentication: walk newest→oldest
+                // from anchor_header.prev_block_id. Abort on break.
+                let newest_first: Vec<BlockHeader> =
+                    collected_asc.iter().rev().cloned().collect();
+                crate::network::tip_validation::authenticate_prechckpt_headers(
+                    &anchor_header,
+                    &newest_first,
+                )?;
+                // Chain authenticated; insert into overlay (no Argon2 — covered
+                // by checkpoint trust). The insert key is block_id, so insertion
+                // order doesn't matter for overlay lookups.
+                for h in collected_asc {
+                    overlay.insert(h);
+                }
+            }
+        }
+
+        let mut validated_forward: Vec<BlockHeader> = Vec::new();
+        let mut last_block_id = anchor_block_id;
+        let mut next_height = anchor_height + 1;
+        let batch_size = MAX_GETBLOCKS_ITEMS as u32;
+
+        while next_height <= claim_height {
+            if Instant::now() >= deadline {
+                return Err(TipValidationError::DeadlineExceeded);
+            }
+            let count = ((claim_height - next_height + 1) as u32).min(batch_size);
+            if !node
+                .send_to_session(peer_identity, session_id, build_get_headers(next_height, count))
+                .await
+            {
+                return Err(TipValidationError::PeerDisconnected);
+            }
+            let batch = await_header_batch(&mut subscriber).await?;
+            if batch.is_empty() {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "empty forward batch starting at height {}",
+                    next_height
+                )));
+            }
+            if (batch[0].height != next_height) || batch.len() > count as usize {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "malformed batch: start height {}, got {}; batch len {}, max {}",
+                    next_height,
+                    batch[0].height,
+                    batch.len(),
+                    count
+                )));
+            }
+            for h in &batch {
+                validate_one_forward_header(
+                    &mut overlay,
+                    &last_block_id,
+                    next_height,
+                    h,
+                    &node.tip_validation_coord.rate_limiter,
+                )
+                .await?;
+                last_block_id = h.block_id();
+                next_height += 1;
+                validated_forward.push(h.clone());
+            }
+        }
+
+        // The final validated header must match the peer's claim.
+        if last_block_id != claim_block_id {
+            return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                "forward chain terminates at block_id {:?} but peer claimed {:?}",
+                last_block_id, claim_block_id
+            )));
+        }
+
+        // ── Verified cumulative work ──
+        let anchor_cum_work = anchor_work(
+            &node.storage,
+            &anchor_block_id,
+            is_checkpoint_anchor,
+            node.assume_valid_cumulative_work_trusted.load(Ordering::SeqCst),
+        )?;
+        let verified_cumulative_work = sum_forward_work(anchor_cum_work, &validated_forward);
+
+        // ── Snapshot-and-recheck anchor ──
+        // For path 2a, require the anchor to still be canonical in our storage.
+        // For path 2b (checkpoint anchor), the anchor is the hardcoded ASSUME_VALID_HASH
+        // fetched from the peer — it's stable across validation (no reorg can displace
+        // a constant). So the snapshot-recheck only applies to path 2a.
+        if !is_checkpoint_anchor
+            && !anchor_still_canonical(&node.storage, anchor_height, &anchor_block_id).await?
+        {
+            return Err(TipValidationError::AnchorOrphaned);
+        }
+
+        // ── Populate pre-validated cache ──
+        {
+            let mut cache = node.tip_validation_coord.cache.lock().await;
+            for h in &validated_forward {
+                cache.insert(peer_identity, h.clone());
+            }
+        }
+
+        let _ = permit; // held until end of scope
+
+        Ok(VerifiedTip {
+            height: claim_height,
+            block_id: claim_block_id,
+            verified_cumulative_work,
+            anchor_height,
+            anchor_block_id,
+            headers_validated: validated_forward.len(),
+        })
+    }
+    .await;
+
+    // Always remove subscriber on cleanup (even if a failure path didn't explicitly call it).
+    remove_headers_subscriber(
+        &node.tip_validation_coord.subscribers,
+        peer_identity,
+        session_id,
+    )
+    .await;
+
+    let record_strike = should_strike(&outcome);
+    ValidationResult {
+        outcome,
+        record_strike,
+    }
+}
+
+// ── v1.5.0 Fix 1: unit tests for PeerRegistry eviction helpers ──
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    fn make_session(
+        session_id: u64,
+        addr_octet_last: u8,
+        is_outbound: bool,
+        established_at: Instant,
+    ) -> PeerSession {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        PeerSession {
+            session_id,
+            socket_addr: format!("192.0.2.{}:8333", addr_octet_last).parse().unwrap(),
+            is_outbound,
+            tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            established_at,
+        }
+    }
+
+    fn attach_inbound(reg: &mut PeerRegistry, id: PeerId, session: PeerSession) {
+        let addr = session.socket_addr;
+        reg.connected_socket_to_identity.insert(addr, id);
+        reg.by_identity.insert(
+            id,
+            LogicalPeer {
+                identity: id,
+                session: Some(session),
+                known_addrs: HashSet::new(),
+                preferred_dial_addr: None,
+                desired_outbound: false,
+                retry: RetryState {
+                    backoff_secs: 5,
+                    next_attempt_at: std::time::Instant::now(),
+                },
+                tip: None,
+                ibd_cooldown_until: None,
+            },
+        );
+    }
+
+    fn pid(n: u8) -> PeerId {
+        let mut p = [0u8; 32];
+        p[0] = n;
+        p
+    }
+
+    #[test]
+    fn eviction_selects_uniformly_from_eligible_pool() {
+        let mut reg = PeerRegistry::new();
+        let old_enough = Instant::now() - Duration::from_secs(EVICTION_MIN_AGE_SECS + 10);
+        for i in 1..=10u8 {
+            attach_inbound(
+                &mut reg,
+                pid(i),
+                make_session(i as u64, i, false, old_enough),
+            );
+        }
+        use rand::Rng;
+        let mut counts = std::collections::HashMap::<PeerId, u32>::new();
+        let mut rng = rand::thread_rng();
+        for _ in 0..10_000 {
+            let candidates = reg.eligible_eviction_candidates(None);
+            assert_eq!(candidates.len(), 10);
+            let idx = rng.gen_range(0..candidates.len());
+            *counts.entry(candidates[idx].identity).or_default() += 1;
+        }
+        // Uniform expected = 1000 per bucket. 3σ on Binomial(10000, 0.1) ≈ 90.
+        // Allow a generous 5σ (150) to keep this test flake-free.
+        for (_id, c) in &counts {
+            let delta = (*c as i64 - 1000).abs();
+            assert!(
+                delta < 150,
+                "bucket deviation {} exceeds 5σ (150); counts = {:?}",
+                delta,
+                counts
+            );
+        }
+        assert_eq!(counts.len(), 10, "every peer selected at least once");
+    }
+
+    #[test]
+    fn eviction_skips_mid_handshake_peers() {
+        // Mid-handshake peers are in pending_inbound_sockets, not by_identity.
+        // The candidate enumeration operates on by_identity, so pending sockets
+        // are structurally excluded. Attaching 5 old and adding 3 pending sockets.
+        let mut reg = PeerRegistry::new();
+        let old_enough = Instant::now() - Duration::from_secs(EVICTION_MIN_AGE_SECS + 10);
+        for i in 1..=5u8 {
+            attach_inbound(
+                &mut reg,
+                pid(i),
+                make_session(i as u64, i, false, old_enough),
+            );
+        }
+        for i in 6..=8u8 {
+            let addr: SocketAddr = format!("192.0.2.{}:8333", i).parse().unwrap();
+            reg.pending_inbound_sockets.insert(addr);
+        }
+        for _ in 0..100 {
+            let candidates = reg.eligible_eviction_candidates(None);
+            assert_eq!(candidates.len(), 5);
+            assert!(candidates.iter().all(|c| (1..=5).contains(&c.identity[0])));
+        }
+    }
+
+    #[test]
+    fn eviction_skips_recently_admitted() {
+        let mut reg = PeerRegistry::new();
+        let now = Instant::now();
+        let ages_secs = [5u64, 30, 70, 120, 200];
+        for (i, age) in ages_secs.iter().enumerate() {
+            let identity = pid((i + 1) as u8);
+            let s = make_session(
+                (i + 1) as u64,
+                (i + 1) as u8,
+                false,
+                now - Duration::from_secs(*age),
+            );
+            attach_inbound(&mut reg, identity, s);
+        }
+        let candidates = reg.eligible_eviction_candidates(None);
+        let selected_ids: std::collections::HashSet<u8> =
+            candidates.iter().map(|c| c.identity[0]).collect();
+        // EVICTION_MIN_AGE_SECS = 60. Ages >= 60 are indices 2,3,4 (70s, 120s, 200s).
+        assert_eq!(selected_ids, [3u8, 4, 5].iter().copied().collect());
+    }
+
+    #[test]
+    fn eviction_skips_active_ibd_peer() {
+        let mut reg = PeerRegistry::new();
+        let old_enough = Instant::now() - Duration::from_secs(EVICTION_MIN_AGE_SECS + 10);
+        for i in 1..=5u8 {
+            attach_inbound(
+                &mut reg,
+                pid(i),
+                make_session(i as u64, i, false, old_enough),
+            );
+        }
+        let ibd_peer = pid(3);
+        let ibd_session_id = 3u64;
+        for _ in 0..100 {
+            let candidates = reg.eligible_eviction_candidates(Some((ibd_peer, ibd_session_id)));
+            assert_eq!(candidates.len(), 4, "ibd peer must be excluded");
+            assert!(candidates.iter().all(|c| c.identity != ibd_peer));
+        }
+    }
+
+    #[test]
+    fn eviction_falls_back_to_reject_when_pool_empty() {
+        let mut reg = PeerRegistry::new();
+        // All sessions within EVICTION_MIN_AGE window.
+        let too_young = Instant::now() - Duration::from_secs(5);
+        for i in 1..=5u8 {
+            attach_inbound(&mut reg, pid(i), make_session(i as u64, i, false, too_young));
+        }
+        let candidates = reg.eligible_eviction_candidates(None);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn eviction_skips_outbound_sessions() {
+        let mut reg = PeerRegistry::new();
+        let old_enough = Instant::now() - Duration::from_secs(EVICTION_MIN_AGE_SECS + 10);
+        attach_inbound(&mut reg, pid(1), make_session(1, 1, false, old_enough));
+        attach_inbound(&mut reg, pid(2), make_session(2, 2, true, old_enough)); // outbound
+        attach_inbound(&mut reg, pid(3), make_session(3, 3, false, old_enough));
+        let candidates = reg.eligible_eviction_candidates(None);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|c| c.identity != pid(2)));
+    }
 }

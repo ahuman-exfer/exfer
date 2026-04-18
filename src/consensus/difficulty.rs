@@ -1,6 +1,8 @@
 use crate::chain::storage::ChainStorage;
+use crate::types::block::BlockHeader;
 use crate::types::hash::Hash256;
 use crate::types::{MAX_RETARGET_FACTOR, RETARGET_WINDOW, TARGET_BLOCK_TIME_SECS};
+use std::collections::HashMap;
 
 /// Error from expected_difficulty when an ancestor header is missing.
 #[derive(Debug)]
@@ -93,6 +95,107 @@ pub fn expected_difficulty(
         .map_err(|e| DifficultyError::Other(e.to_string()))?
         .ok_or(DifficultyError::AncestorNotFound(current_id))?;
 
+    let actual_time = tip_timestamp.saturating_sub(window_start.timestamp);
+    Ok(retarget(&parent.difficulty_target, actual_time))
+}
+
+// ── v1.5.0 Fix 2: in-memory header overlay for forward-chain validation ──
+
+/// In-memory header overlay used during tip-validation.
+///
+/// During tip-confirmation of a peer's claimed chain above our local tip, the
+/// forward headers being validated are not yet in storage. This overlay provides
+/// a read path that checks an in-memory HashMap first and falls back to storage,
+/// so the exact-forward retarget math in `expected_difficulty_overlay` can walk
+/// forward-header ancestors that exist only in the overlay.
+///
+/// Invariant maintained by the caller: the overlay only contains headers that
+/// have already passed structural + difficulty + PoW checks for their position.
+/// An invalid header is never a retarget-lookback source.
+///
+/// Pre-checkpoint lookback (cold-bootstrap path 2b): headers below
+/// `ASSUME_VALID_HEIGHT` that are not yet in storage can be inserted into the
+/// overlay after strict SHA256 hash-chain authentication from the authenticated
+/// checkpoint header (no Argon2 required — covered by checkpoint trust).
+pub struct ForwardHeaderOverlay<'s> {
+    storage: &'s ChainStorage,
+    overlay: HashMap<Hash256, BlockHeader>,
+}
+
+impl<'s> ForwardHeaderOverlay<'s> {
+    pub fn new(storage: &'s ChainStorage) -> Self {
+        Self {
+            storage,
+            overlay: HashMap::new(),
+        }
+    }
+
+    /// Insert a header keyed by its block_id. Callers must have validated the
+    /// header before this call to preserve the no-invalid-headers invariant.
+    pub fn insert(&mut self, header: BlockHeader) {
+        let id = header.block_id();
+        self.overlay.insert(id, header);
+    }
+
+    /// Read a header by block_id — overlay first, storage fallback.
+    pub fn get_header(&self, id: &Hash256) -> Result<Option<BlockHeader>, DifficultyError> {
+        if let Some(h) = self.overlay.get(id) {
+            return Ok(Some(h.clone()));
+        }
+        self.storage
+            .get_header(id)
+            .map_err(|e| DifficultyError::Other(e.to_string()))
+    }
+
+    pub fn contains(&self, id: &Hash256) -> bool {
+        self.overlay.contains_key(id)
+    }
+
+    pub fn overlay_len(&self) -> usize {
+        self.overlay.len()
+    }
+
+    pub fn overlay_keys(&self) -> impl Iterator<Item = &Hash256> {
+        self.overlay.keys()
+    }
+}
+
+/// Like `expected_difficulty` but reads headers through a `ForwardHeaderOverlay`.
+///
+/// This is a byte-for-byte copy of the retarget algorithm in `expected_difficulty`
+/// — only the header-source access path changes. That coupling is deliberate: the
+/// spec requires that tip-validation use the same consensus difficulty as block
+/// validation, exactly. Any algorithmic change here MUST be mirrored in
+/// `expected_difficulty` (and vice-versa); out-of-date copies will cause
+/// confirmation-time validation to disagree with block-time validation and break
+/// IBD in subtle ways. A unit test in the consensus module asserts the two
+/// functions produce identical results for any header whose ancestors are in
+/// storage.
+pub fn expected_difficulty_overlay(
+    overlay: &ForwardHeaderOverlay,
+    prev_block_id: &Hash256,
+    height: u64,
+) -> Result<Hash256, DifficultyError> {
+    if height == 0 {
+        return Ok(genesis_target());
+    }
+    let parent = overlay
+        .get_header(prev_block_id)?
+        .ok_or(DifficultyError::AncestorNotFound(*prev_block_id))?;
+    if !height.is_multiple_of(RETARGET_WINDOW) {
+        return Ok(parent.difficulty_target);
+    }
+    let tip_timestamp = parent.timestamp;
+    let mut current_id = *prev_block_id;
+    for _ in 0..RETARGET_WINDOW - 1 {
+        let hdr = overlay
+            .get_header(&current_id)?
+            .ok_or(DifficultyError::AncestorNotFound(current_id))?;
+        current_id = hdr.prev_block_id;
+    }
+    let window_start = overlay
+        .get_header(&current_id)?
+        .ok_or(DifficultyError::AncestorNotFound(current_id))?;
     let actual_time = tip_timestamp.saturating_sub(window_start.timestamp);
     Ok(retarget(&parent.difficulty_target, actual_time))
 }
