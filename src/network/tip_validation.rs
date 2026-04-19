@@ -354,6 +354,16 @@ impl TipValidationCoordinator {
         let mut a = self.active.lock().await;
         a.remove(&(peer, session_id));
     }
+
+    /// Check if a forward-chain validation is currently in flight for this
+    /// (peer, session_id). Used by the TipResponse handler as a guard to skip
+    /// the legacy `GetHeaders` issuance — if a validation is already running,
+    /// the validator owns the subscriber for this session and any additional
+    /// outbound `GetHeaders` from the handler would race with the validator's
+    /// response stream (v1.5.2 hotfix; see docs/v1.5.2-brief.md).
+    pub async fn is_active(&self, peer: PeerId, session_id: u64) -> bool {
+        self.active.lock().await.contains(&(peer, session_id))
+    }
 }
 
 impl Default for TipValidationCoordinator {
@@ -1036,6 +1046,40 @@ mod tests {
         cache.clear_peer(&peer);
         assert_eq!(cache.len_for(&peer), 0);
         assert!(cache.lookup(&peer, &h1.block_id()).is_none());
+    }
+
+    // v1.5.2 hotfix — guard condition for TipResponse handler.
+    #[tokio::test]
+    async fn is_active_returns_true_after_reserve_and_false_after_release() {
+        let coord = TipValidationCoordinator::new();
+        let peer: PeerId = [0xAAu8; 32];
+        let sid: u64 = 42;
+        assert!(!coord.is_active(peer, sid).await, "fresh coord must be inactive");
+        let reserved = coord.try_reserve(peer, sid).await;
+        assert!(reserved, "first reserve returns true");
+        assert!(coord.is_active(peer, sid).await, "after reserve, is_active true");
+        // Different session_id must not alias.
+        assert!(!coord.is_active(peer, sid + 1).await, "different sid is separate");
+        // Different peer must not alias.
+        let other: PeerId = [0xBBu8; 32];
+        assert!(!coord.is_active(other, sid).await, "different peer is separate");
+        coord.release_reservation(peer, sid).await;
+        assert!(!coord.is_active(peer, sid).await, "after release, is_active false");
+        // Releasing twice is a no-op (idempotent).
+        coord.release_reservation(peer, sid).await;
+        assert!(!coord.is_active(peer, sid).await, "double-release still false");
+    }
+
+    #[tokio::test]
+    async fn try_reserve_is_idempotent_while_held() {
+        let coord = TipValidationCoordinator::new();
+        let peer: PeerId = [0xCCu8; 32];
+        let sid: u64 = 1;
+        assert!(coord.try_reserve(peer, sid).await);
+        // Second reserve for same (peer, sid) returns false — already held.
+        assert!(!coord.try_reserve(peer, sid).await);
+        // is_active stays true regardless.
+        assert!(coord.is_active(peer, sid).await);
     }
 
     #[tokio::test]

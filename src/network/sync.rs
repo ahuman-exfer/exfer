@@ -5217,6 +5217,26 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                         }
                     }
                 }
+                // v1.5.2 hotfix: if a forward-chain validation is already in
+                // flight for this (peer, session), do NOT issue the legacy
+                // single-header GetHeaders. The validator has installed a
+                // subscriber for this session; our response to a legacy
+                // GetHeaders would be siphoned into the validator's subscriber
+                // queue, corrupting its header stream and causing it to record
+                // `malformed batch` → DeliveredInvalidHeader → strike on an
+                // honest peer. Meanwhile our own rx.recv() here would time out
+                // and fall through to the "failed PoW" strike branch, doubling
+                // the damage. Skip the whole handler; the in-flight validator
+                // owns peer-tip and strike decisions for this session.
+                // See docs/v1.5.2-brief.md for the race analysis.
+                if node
+                    .tip_validation_coord
+                    .is_active(from_identity, session_id)
+                    .await
+                {
+                    continue;
+                }
+
                 // Verify the claim: request the header at the claimed height
                 // and check that block_id matches and PoW is valid.
                 if height > 0 {
