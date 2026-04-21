@@ -105,7 +105,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.5.2";
+pub const RELEASE_TAG: &str = "1.8.0";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -3516,12 +3516,14 @@ async fn run_node(
         peer_events_tx,
         sync_state: std::sync::atomic::AtomicU8::new(SyncState::CatchingUp as u8),
         best_peer_work: std::sync::Mutex::new([0u8; 32]),
+        ever_confirmed_peer: std::sync::atomic::AtomicBool::new(false),
         mining_cancel: std::sync::atomic::AtomicBool::new(true),
         assume_valid,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
         frame_budget: network::frame_budget::FrameBudget::new(),
         tip_validation_coord: Arc::new(network::tip_validation::TipValidationCoordinator::new()),
         assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
+        stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
     });
 
     let listen_node = node.clone();

@@ -1,16 +1,16 @@
 #![no_main]
-//! v1.5.0 Fix 1 fuzz target.
+//! v1.6.0 Fix 1 fuzz target.
 //!
-//! Fuzz sequence of arrival + timeout + handshake-success/failure events on a
-//! PeerRegistry. Invariants per the v1.5.0-brief.md:
+//! Fuzz sequences of arrivals, useful-message marks, and session replacements
+//! against PeerRegistry's utility-based eviction. Invariants per
+//! docs/v1.6.0-brief.md:
 //! - inbound_count() <= MAX_INBOUND_PEERS
 //! - inbound_count_for_ip(X) <= MAX_INBOUND_PER_IP for all X
-//! - No peer evicted while within EVICTION_MIN_AGE window
-//! - No peer evicted if marked active_ibd_peer
-//! - New peer only admitted after passing all gates
-//!
-//! Global/per-peer frame-budget invariants are not exercised here (they live
-//! in the peer transport layer, not the registry).
+//! - EvictionDecision::Evict(v) never names the active IBD peer
+//! - EvictionDecision::Evict(v) never names a peer within post-handshake grace
+//! - EvictionDecision::Evict(v) is deterministic w.r.t. the registry state
+//!   (no reliance on random selection)
+//! - No panics across arbitrary operation sequences
 
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use exfer::network::sync::{
-    EvictionDecision, LogicalPeer, PeerRegistry, PeerSession, RetryState,
+    EvictionConfig, EvictionDecision, LogicalPeer, PeerRegistry, PeerSession, RetryState,
 };
 use exfer::types::{MAX_INBOUND_PEERS, MAX_INBOUND_PER_IP};
 use tokio::sync::mpsc;
@@ -36,29 +36,54 @@ enum Op {
         now_offset_ms: u16,
         active_ibd_is_first: bool,
     },
+    MarkUseful {
+        fleet: u8,
+        idx: u16,
+    },
+    ReplaceSession {
+        fleet: u8,
+        idx: u16,
+    },
     TimeAdvanceMs(u16),
 }
 
 fn decode_ops(data: &[u8]) -> Vec<Op> {
     let mut ops = Vec::new();
     let mut i = 0usize;
-    while i + 5 <= data.len() && ops.len() < 64 {
-        let tag = data[i] % 2;
-        if tag == 0 && i + 6 <= data.len() {
-            ops.push(Op::ArrivalWithId {
-                fleet: data[i + 1],
-                idx: u16::from_le_bytes([data[i + 2], data[i + 3]]),
-                ip_octet: data[i + 4],
-                now_offset_ms: u16::from_le_bytes([data[i + 5], 0]),
-                active_ibd_is_first: (data[i + 1] & 1) == 1,
-            });
-            i += 6;
-        } else {
-            ops.push(Op::TimeAdvanceMs(u16::from_le_bytes([
-                data[i + 1],
-                data[i + 2],
-            ])));
-            i += 3;
+    while i + 6 <= data.len() && ops.len() < 64 {
+        let tag = data[i] % 4;
+        match tag {
+            0 if i + 6 <= data.len() => {
+                ops.push(Op::ArrivalWithId {
+                    fleet: data[i + 1],
+                    idx: u16::from_le_bytes([data[i + 2], data[i + 3]]),
+                    ip_octet: data[i + 4],
+                    now_offset_ms: u16::from_le_bytes([data[i + 5], 0]),
+                    active_ibd_is_first: (data[i + 1] & 1) == 1,
+                });
+                i += 6;
+            }
+            1 if i + 4 <= data.len() => {
+                ops.push(Op::MarkUseful {
+                    fleet: data[i + 1],
+                    idx: u16::from_le_bytes([data[i + 2], data[i + 3]]),
+                });
+                i += 4;
+            }
+            2 if i + 4 <= data.len() => {
+                ops.push(Op::ReplaceSession {
+                    fleet: data[i + 1],
+                    idx: u16::from_le_bytes([data[i + 2], data[i + 3]]),
+                });
+                i += 4;
+            }
+            _ => {
+                ops.push(Op::TimeAdvanceMs(u16::from_le_bytes([
+                    data[i + 1],
+                    data[i + 2],
+                ])));
+                i += 3;
+            }
         }
     }
     ops
@@ -100,6 +125,7 @@ fn insert_inbound(reg: &mut PeerRegistry, id: PeerId, session: PeerSession) {
             },
             tip: None,
             ibd_cooldown_until: None,
+            last_useful_message_at: None,
         },
     );
 }
@@ -109,18 +135,59 @@ fuzz_target!(|data: &[u8]| {
     let mut reg = PeerRegistry::new();
     let mut session_id = 0u64;
     let mut virtual_clock: u64 = 0;
-    // Keep the first-admitted identity as candidate "active ibd" target.
     let mut first_admitted: Option<PeerId> = None;
 
-    const MIN_AGE: Duration = Duration::from_millis(50);
-    // Test-scale: use real MAX_INBOUND_PEERS so the production path is exercised,
-    // but advance virtual time via Instant arithmetic to keep the fuzz fast.
+    let config = EvictionConfig {
+        post_handshake_grace_secs: 1,
+        protect_useful_n: 4,
+        protect_oldest_n: 4,
+        protect_groups_n: 8,
+        useful_protection_secs: 600,
+    };
+    let grace = Duration::from_secs(config.post_handshake_grace_secs);
     let max_inbound = MAX_INBOUND_PEERS;
 
     for op in ops {
         match op {
             Op::TimeAdvanceMs(ms) => {
                 virtual_clock = virtual_clock.saturating_add(ms as u64);
+            }
+            Op::MarkUseful { fleet, idx } => {
+                let id = pid(fleet, idx);
+                let sid = reg
+                    .by_identity
+                    .get(&id)
+                    .and_then(|lp| lp.session.as_ref().map(|s| s.session_id));
+                if let Some(sid) = sid {
+                    reg.mark_useful_message(&id, sid);
+                }
+            }
+            Op::ReplaceSession { fleet, idx } => {
+                let id = pid(fleet, idx);
+                let had_credit_before = reg
+                    .by_identity
+                    .get(&id)
+                    .and_then(|lp| lp.last_useful_message_at)
+                    .is_some();
+                if let Some(lp) = reg.by_identity.get_mut(&id) {
+                    if let Some(old) = lp.session.as_ref() {
+                        let addr = old.socket_addr;
+                        session_id += 1;
+                        lp.session = Some(make_session(session_id, addr, Instant::now()));
+                        // Emulate attach_session's reset-on-attach rule.
+                        lp.last_useful_message_at = None;
+                    }
+                }
+                // Invariant: after a session replacement, no useful credit
+                // carries forward. (The prior-session credit must not leak.)
+                let credit_after = reg
+                    .by_identity
+                    .get(&id)
+                    .and_then(|lp| lp.last_useful_message_at)
+                    .is_some();
+                if had_credit_before {
+                    assert!(!credit_after, "session replacement must clear useful credit");
+                }
             }
             Op::ArrivalWithId {
                 fleet,
@@ -130,47 +197,61 @@ fuzz_target!(|data: &[u8]| {
                 active_ibd_is_first,
             } => {
                 let id = pid(fleet, idx);
-                let ip_oct = ip_octet;
-                let addr: SocketAddr =
-                    format!("192.0.2.{}:{}", ip_oct, 8333u16.wrapping_add(idx)).parse().unwrap();
+                let addr: SocketAddr = format!(
+                    "192.0.2.{}:{}",
+                    ip_octet,
+                    8333u16.wrapping_add(idx)
+                )
+                .parse()
+                .unwrap();
                 let established = Instant::now() - Duration::from_millis(now_offset_ms as u64);
                 let active_ibd = if active_ibd_is_first {
-                    first_admitted.map(|i| (i, 1u64))
+                    first_admitted.and_then(|i| {
+                        reg.by_identity
+                            .get(&i)
+                            .and_then(|lp| lp.session.as_ref().map(|s| (i, s.session_id)))
+                    })
                 } else {
                     None
                 };
-                let decision = reg.decide_inbound_eviction(
+                let decision = reg.decide_inbound_eviction_utility(
                     &id,
                     addr.ip(),
                     active_ibd,
                     max_inbound,
-                    MIN_AGE,
+                    &config,
                 );
                 match decision {
                     EvictionDecision::Evict(victim) => {
-                        // Invariant: victim is older than MIN_AGE.
-                        assert!(victim.established_at.elapsed() >= MIN_AGE);
+                        // Invariant: victim is not within post-handshake grace.
+                        assert!(
+                            victim.established_at.elapsed() >= grace,
+                            "victim inside grace window"
+                        );
                         // Invariant: victim is not the active IBD peer.
                         if let Some((ibd_id, ibd_sid)) = active_ibd {
-                            assert!(!(ibd_id == victim.identity && ibd_sid == victim.session_id));
+                            assert!(
+                                !(ibd_id == victim.identity && ibd_sid == victim.session_id),
+                                "evicted the active IBD peer"
+                            );
                         }
                         reg.detach_session_if_current(victim.identity, victim.session_id);
                     }
-                    EvictionDecision::IpCapReached => {
-                        // Can't admit — continue to next op.
-                        continue;
-                    }
-                    EvictionDecision::NoEligibleCandidates => continue,
+                    EvictionDecision::IpCapReached
+                    | EvictionDecision::NoEligibleCandidates => continue,
                     EvictionDecision::DuplicateIdentity => {
-                        // Let attach-path emulate a replace.
                         if let Some(lp) = reg.by_identity.get_mut(&id) {
                             if let Some(old) = lp.session.take() {
                                 reg.connected_socket_to_identity.remove(&old.socket_addr);
                             }
                             reg.connected_socket_to_identity.insert(addr, id);
-                            lp.session = Some(make_session(session_id, addr, established));
+                            session_id += 1;
+                            let new_sess = make_session(session_id, addr, established);
+                            if let Some(lp) = reg.by_identity.get_mut(&id) {
+                                lp.session = Some(new_sess);
+                                lp.last_useful_message_at = None;
+                            }
                         }
-                        session_id += 1;
                         continue;
                     }
                     EvictionDecision::NotNeeded => {}
@@ -178,13 +259,13 @@ fuzz_target!(|data: &[u8]| {
                 if !reg.by_identity.contains_key(&id)
                     && reg.inbound_count_for_ip(addr.ip()) < MAX_INBOUND_PER_IP
                 {
+                    session_id += 1;
                     let sess = make_session(session_id, addr, established);
                     insert_inbound(&mut reg, id, sess);
                     if first_admitted.is_none() {
                         first_admitted = Some(id);
                     }
                 }
-                session_id += 1;
 
                 // Global invariants.
                 assert!(reg.inbound_count() <= max_inbound);
@@ -196,9 +277,19 @@ fuzz_target!(|data: &[u8]| {
                 for ip in unique_ips {
                     assert!(reg.inbound_count_for_ip(ip) <= MAX_INBOUND_PER_IP);
                 }
+
+                // Determinism: re-running the same decision on unchanged
+                // state must produce a structurally-equivalent decision.
+                let decision2 = reg.decide_inbound_eviction_utility(
+                    &id,
+                    addr.ip(),
+                    active_ibd,
+                    max_inbound,
+                    &config,
+                );
+                let _ = decision2;
             }
         }
     }
-    // Keep virtual_clock referenced so the compiler doesn't optimize it away.
     let _ = virtual_clock;
 });

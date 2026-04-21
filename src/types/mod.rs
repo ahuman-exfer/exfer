@@ -33,36 +33,44 @@ pub const BLOCK_HEADER_SIZE: usize = 156;
 
 /// Height at which the assume-valid checkpoint is verified.
 /// Blocks at or below this height skip Argon2id PoW during IBD/replay.
-pub const ASSUME_VALID_HEIGHT: u64 = 130_000;
+pub const ASSUME_VALID_HEIGHT: u64 = 302_400;
 /// Block hash at ASSUME_VALID_HEIGHT. Verified exactly once during sync.
 pub const ASSUME_VALID_HASH: [u8; 32] = [
-    0xe8, 0xb1, 0x06, 0xba, 0xaf, 0xf1, 0x42, 0x9b,
-    0x0d, 0x4b, 0x47, 0xfe, 0xcc, 0x6a, 0x1e, 0x2b,
-    0x1f, 0x7e, 0x4b, 0xee, 0x8d, 0x6e, 0xe2, 0x18,
-    0x64, 0x5c, 0x45, 0x03, 0xe5, 0x45, 0xa1, 0x7f,
+    0x67, 0x3c, 0x2a, 0x1e, 0x9a, 0x94, 0x8e, 0xd5,
+    0x19, 0x15, 0x98, 0x08, 0xee, 0xb0, 0xbd, 0x94,
+    0x37, 0x3e, 0xc8, 0x3e, 0xe8, 0x57, 0x3b, 0xef,
+    0x20, 0xb5, 0x24, 0x5f, 0x5e, 0x6c, 0x32, 0x17,
 ];
 /// Cumulative work at ASSUME_VALID_HEIGHT on the canonical chain. Used by v1.5.0
 /// Fix 2 cold-bootstrap subpath 2b to derive `verified_cumulative_work` without
 /// walking storage below the checkpoint anchor. Big-endian 256-bit integer.
 ///
-/// Value generated 2026-04-18 from the canonical chain by walking retarget
-/// boundaries via RPC against a trusted node (S2, 82.221.100.201) and summing
+/// Value generated 2026-04-19 from the canonical chain by walking retarget
+/// boundaries via RPC against TWO independent canonical nodes (S2 at
+/// 82.221.100.201 and S3 at 89.127.232.155), requiring byte-exact agreement
+/// on each of the 71 retarget-boundary targets, then summing
 /// `work_from_target(difficulty_target) × window_blocks` across heights
-/// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 31,710,391.
+/// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 3,839,137,688.
 ///
 /// **Release procedure:** regenerate alongside `ASSUME_VALID_HEIGHT` and
-/// `ASSUME_VALID_HASH` if any of them are changed. The build-time consistency
-/// test `tests/assume_valid_cumulative_work_guard.rs` asserts the value is not
-/// the zero placeholder. A runtime guard in `process_block` (`src/network/sync.rs`)
-/// also compares this constant against the computed cumulative work when the
-/// node reaches the checkpoint via normal block-by-block validation, and flips
-/// `assume_valid_cumulative_work_trusted` to `false` on mismatch so cold-bootstrap
-/// tip validation falls through to `--verify-all`-equivalent.
+/// `ASSUME_VALID_HASH` if any of them are changed. Multi-source verification
+/// (≥2 independent canonical nodes) is **required** per the v1.7.0 spec —
+/// single-source ceremonies are insufficient for a value that becomes a trusted
+/// release anchor. The retarget-boundary fixture in
+/// `tests/assume_valid_cumulative_work_guard.rs` must be regenerated alongside.
+/// The build-time consistency test `assume_valid_cumulative_work_guard.rs`
+/// asserts the value is not the zero placeholder AND that it matches the
+/// cumulative work recomputed from the regenerated fixture. A runtime guard in
+/// `process_block` (`src/network/sync.rs`) also compares this constant against
+/// the computed cumulative work when the node reaches the checkpoint via normal
+/// block-by-block validation, and flips `assume_valid_cumulative_work_trusted`
+/// to `false` on mismatch so cold-bootstrap tip validation falls through to
+/// `--verify-all`-equivalent.
 pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x01, 0xe3, 0xdc, 0xb7,
+    0x00, 0x00, 0x00, 0x00, 0xe4, 0xd9, 0xf5, 0x98,
 ];
 
 // ── v1.5.0 Fix 2 — tip-validation constants ──
@@ -70,9 +78,34 @@ pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
 /// Maximum concurrent tip-validation attempts in the steady-state regime
 /// (our local tip > ASSUME_VALID_HEIGHT). The bootstrap regime uses 1.
 pub const MAX_CONCURRENT_TIP_VALIDATIONS: usize = 4;
-/// Bootstrap-regime concurrency: exactly 1 active validation. This is what makes
-/// the lifted bootstrap rate cap safe — only one peer's Argon2 burn runs at a time.
-pub const MAX_CONCURRENT_TIP_VALIDATIONS_BOOTSTRAP: usize = 1;
+/// Bootstrap-regime concurrency: up to 4 simultaneous bootstrap coordinator
+/// instances, each validating a **distinct** `TargetTip`. Lifted from 1 in
+/// v1.7.0 (Change 3). Same-TargetTip peers join an existing coordinator's pool
+/// rather than spawning redundant coordinators (dedup rule); a 5th distinct
+/// target is silently dropped and re-considered on the next TipResponse
+/// re-advertisement. Rate limiter is shared across coordinators — total
+/// Argon2/sec throughput is unchanged, peer diversity + stall tolerance
+/// improve. See docs/v1.7.0-brief.md.
+pub const MAX_CONCURRENT_TIP_VALIDATIONS_BOOTSTRAP: usize = 4;
+
+/// v1.7.0 Change 4: bootstrap-regime coordinator wall-clock ceiling. Used as
+/// the deadline floor in `compute_deadline()`'s bootstrap branch in place of
+/// the generic `TIP_VALIDATION_DEADLINE_FLOOR_SECS = 7200`, which is far too
+/// lax now that the post-Change-1 forward span is <10K headers. Caps malicious
+/// slot-squatting to ~5 min per target instead of 2 h. Honest 5–10K-header
+/// bootstrap completes in ~1.5 min on a typical 8-core laptop, giving a >3×
+/// safety margin. See docs/v1.7.0-brief.md Change 4.
+pub const BOOTSTRAP_COORDINATOR_DEADLINE_SECS: u64 = 300;
+
+/// v1.7.0 Change 4: progress-based abort. A bootstrap coordinator aborts with
+/// `BootstrapStalled` if `validated_forward.len()` has not increased within
+/// this window, regardless of per-batch timeouts. Catches peers that reply
+/// "on time" (under `TIP_VALIDATION_BATCH_TIMEOUT_SECS`) with prefix-failing
+/// or empty batches that never advance the accumulated prefix. Coordinator
+/// abort is **coordinator-scope-only** — the active peer is removed from this
+/// coordinator's pool but receives NO identity/IP strike (matches the narrow
+/// `should_strike()` policy that only strikes on `DeliveredInvalidHeader`).
+pub const BOOTSTRAP_COORDINATOR_STALL_SECS: u64 = 90;
 /// Steady-state validation rate cap: 20 Argon2 evaluations per wall-clock second
 /// across all concurrent tip-validations. ~2 cores at ~100 ms/eval. Kept low so
 /// an adversarial flood of fake tips cannot starve normal mining / block validation.
@@ -152,9 +185,28 @@ pub const MAX_INBOUND_PER_IP: usize = 1;
 /// sockets before rejecting, giving post-handshake eviction room to land without dropping
 /// legitimate reconnect bursts. See v1.5.0 Fix 1.
 pub const EVICTION_PENDING_HEADROOM: usize = 32;
-/// Minimum session age (seconds) before an inbound peer becomes an eviction candidate.
-/// Prevents thrash where a burst of handshakes evicts each other in a loop.
-pub const EVICTION_MIN_AGE_SECS: u64 = 60;
+/// v1.6.0 Fix 1 redesign: handshake + initial-exchange settle window. Peers
+/// younger than this are unconditionally protected from eviction selection.
+/// Shorter than v1.5.0's EVICTION_MIN_AGE_SECS=60 because eviction is now
+/// utility-based, not age-gated; this window only ensures GetTip/GetAddr
+/// exchanges can complete before the peer is scored.
+pub const POST_HANDSHAKE_GRACE_SECS: u64 = 15;
+
+/// Number of inbound peers protected by most-recent useful-message timestamp.
+pub const PROTECT_USEFUL_N: usize = 8;
+
+/// Number of inbound peers protected by session age (oldest first).
+pub const PROTECT_OLDEST_N: usize = 8;
+
+/// Number of unique network-groups whose oldest member is protected.
+/// Deterministic selection: groups ranked by age of their oldest member
+/// (oldest first), ties by NetworkGroup byte-order. If the pool has fewer
+/// than N groups, all groups' oldest members are protected.
+pub const PROTECT_GROUPS_N: usize = 16;
+
+/// Useful-message freshness window: a peer that sent a useful message within
+/// the last N seconds is eligible for the useful-protection top-N.
+pub const USEFUL_PROTECTION_SECS: u64 = 600;
 pub const PING_INTERVAL_SECS: u64 = 60;
 pub const PONG_DEADLINE_SECS: u64 = 15;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;

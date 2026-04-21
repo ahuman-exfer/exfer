@@ -68,6 +68,13 @@ pub enum TipValidationError {
     NoSlotAvailable,
     /// Peer disconnected mid-validation.
     PeerDisconnected,
+    /// v1.7.0 Change 4: bootstrap coordinator saw no forward-prefix progress
+    /// for `BOOTSTRAP_COORDINATOR_STALL_SECS`. Coordinator-scope abort; the
+    /// active peer at stall time is removed from this coordinator's pool but
+    /// receives NO identity/IP strike. Matches the narrow `should_strike()`
+    /// policy — the stall is an *absence* of progress, not a delivered
+    /// offence, so identity-level penalties do not apply.
+    BootstrapStalled,
     /// Internal storage / consensus error.
     Internal(String),
 }
@@ -81,6 +88,7 @@ impl std::fmt::Display for TipValidationError {
             TipValidationError::AnchorOrphaned => write!(f, "anchor orphaned by local reorg"),
             TipValidationError::NoSlotAvailable => write!(f, "no concurrent validation slot available"),
             TipValidationError::PeerDisconnected => write!(f, "peer disconnected mid-validation"),
+            TipValidationError::BootstrapStalled => write!(f, "bootstrap coordinator stalled — no forward progress"),
             TipValidationError::Internal(m) => write!(f, "internal: {}", m),
         }
     }
@@ -375,13 +383,27 @@ impl Default for TipValidationCoordinator {
 // ── Deadline formula ──
 
 /// Wall-clock deadline for a single validation attempt.
-/// `max(TIP_VALIDATION_DEADLINE_FLOOR_SECS, ceil(expected_argon2_seconds × 1.5))`.
+///
+/// - Bootstrap regime (v1.7.0 Change 4): floor is `BOOTSTRAP_COORDINATOR_DEADLINE_SECS`
+///   (300 s) — tight enough that four malicious targets cannot squat concurrent
+///   slots for hours. Honest 5–10K-header post-checkpoint bootstrap completes
+///   in ~1.5 min on a typical 8-core laptop, giving >3× safety margin.
+/// - Steady-state regime: floor is `TIP_VALIDATION_DEADLINE_FLOOR_SECS` (7200 s) —
+///   unchanged from v1.5.0; large window because steady-state can span tens of
+///   thousands of headers if the node was offline for a while.
+///
+/// In both regimes the scaled component `ceil(expected_argon2_seconds × 1.5)`
+/// also applies; the larger of (floor, scaled) wins.
 pub fn compute_deadline(expected_headers: u64, regime: ValidationRegime) -> Duration {
     let rate = regime.argon2_rate_per_sec().max(1) as u64;
     let expected_argon2_secs = expected_headers / rate;
     let scaled =
         (expected_argon2_secs * TIP_VALIDATION_DEADLINE_SCALE_PCT + 99) / 100;
-    Duration::from_secs(scaled.max(TIP_VALIDATION_DEADLINE_FLOOR_SECS))
+    let floor = match regime {
+        ValidationRegime::Bootstrap => BOOTSTRAP_COORDINATOR_DEADLINE_SECS,
+        ValidationRegime::SteadyState => TIP_VALIDATION_DEADLINE_FLOOR_SECS,
+    };
+    Duration::from_secs(scaled.max(floor))
 }
 
 // ── Strict pre-checkpoint hash-chain authentication ──
@@ -561,7 +583,16 @@ pub async fn install_headers_subscriber(
     peer: PeerId,
     session_id: u64,
 ) -> mpsc::Receiver<Vec<BlockHeader>> {
-    let (tx, rx) = mpsc::channel::<Vec<BlockHeader>>(4);
+    // v1.8.0 Stage A runs with up to 8 `GetHeaders` in flight on a single
+    // session; responses can queue briefly between bursts from the peer and
+    // our receive-side processing. Capacity must cover that burst plus margin,
+    // otherwise `route_headers_if_subscribed`'s `try_send` silently drops
+    // responses and the Stage A coordinator sees off-by-N correlation gaps
+    // (`first.height != expected_start`), aborts, and moves to the next peer.
+    // Previous capacity 4 caused exactly this failure in the v1.8.0 gate
+    // run (2026-04-20). 32 is well above the 8-in-flight window and trivial
+    // memory (~32 × ~13 KB = ~416 KB worst case per active subscriber).
+    let (tx, rx) = mpsc::channel::<Vec<BlockHeader>>(32);
     let mut m = map.lock().await;
     m.insert((peer, session_id), tx);
     rx
@@ -708,13 +739,23 @@ mod tests {
 
     #[test]
     fn compute_deadline_scales_with_work() {
-        // Bootstrap regime with 1 core → rate = 10. 100_000 headers = 10_000 sec = 2.78 h.
-        // Expected deadline = max(7200, 1.5 × 10_000) = 15_000 s.
-        // Since num_cpus is host-dependent, just assert the floor-respecting behavior.
+        // v1.7.0 Change 4: bootstrap regime uses BOOTSTRAP_COORDINATOR_DEADLINE_SECS = 300
+        // as its floor instead of TIP_VALIDATION_DEADLINE_FLOOR_SECS = 7200. Small-load
+        // case respects the tighter bootstrap floor.
         let d_small = compute_deadline(100, ValidationRegime::Bootstrap);
-        assert!(d_small >= Duration::from_secs(TIP_VALIDATION_DEADLINE_FLOOR_SECS));
+        assert!(
+            d_small >= Duration::from_secs(BOOTSTRAP_COORDINATOR_DEADLINE_SECS),
+            "bootstrap deadline must respect BOOTSTRAP_COORDINATOR_DEADLINE_SECS floor"
+        );
+        assert!(
+            d_small < Duration::from_secs(TIP_VALIDATION_DEADLINE_FLOOR_SECS),
+            "bootstrap deadline for small load must NOT inherit the 7200s steady-state floor"
+        );
         let d_large = compute_deadline(1_000_000_000, ValidationRegime::Bootstrap);
         assert!(d_large > d_small);
+        // Steady-state regime keeps its 7200s floor unchanged from v1.5.0.
+        let d_steady = compute_deadline(100, ValidationRegime::SteadyState);
+        assert!(d_steady >= Duration::from_secs(TIP_VALIDATION_DEADLINE_FLOOR_SECS));
     }
 
     #[test]
@@ -726,6 +767,11 @@ mod tests {
         assert!(!should_strike(&Err(TipValidationError::DeadlineExceeded)));
         assert!(!should_strike(&Err(TipValidationError::AnchorOrphaned)));
         assert!(!should_strike(&Err(TipValidationError::PeerDisconnected)));
+        // v1.7.0 Change 4: BootstrapStalled is NEVER a strike. Absence of
+        // progress is not a delivered offence; attributing timing failures to
+        // whichever peer happened to be active would violate the narrow-strike
+        // design.
+        assert!(!should_strike(&Err(TipValidationError::BootstrapStalled)));
         assert!(!should_strike(&Ok(VerifiedTip {
             height: 0,
             block_id: Hash256::ZERO,
