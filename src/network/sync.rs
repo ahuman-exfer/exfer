@@ -2340,9 +2340,9 @@ impl Node {
                     );
                     if checkpoint_work != ASSUME_VALID_CUMULATIVE_WORK {
                         error!(
-                            "v1.5.0 Fix 2 guard: ASSUME_VALID_CUMULATIVE_WORK mismatch at height {}. \
+                            "Release-hardening guard: ASSUME_VALID_CUMULATIVE_WORK mismatch at height {}. \
                              Hardcoded {:?}, computed {:?}. \
-                             Cold-bootstrap tip-validation (path 2b) will fall through to \
+                             Cold-bootstrap tip-validation will fall through to \
                              --verify-all-equivalent until the constant is corrected.",
                             ASSUME_VALID_HEIGHT,
                             ASSUME_VALID_CUMULATIVE_WORK,
@@ -6636,7 +6636,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                                     .await;
                                                 if !reserved {
                                                     debug!(
-                                                        "v1.5.0 Fix 2: skipping duplicate forward-validation dispatch for peer {:?} session {} — already in-flight",
+                                                        "Skipping duplicate forward-validation dispatch for peer {:?} session {} — already in-flight",
                                                         &from_identity[..4], session_id
                                                     );
                                                     // Set dispatched=true so we DON'T fall into the
@@ -6686,14 +6686,33 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                                                 }
                                                             }
                                                             info!(
-                                                                "v1.5.0 Fix 2 forward-chain validation ok: peer {:?} height {} forward_headers {}",
+                                                                "Forward-chain tip validation ok: peer {:?} height {} forward_headers {}",
                                                                 &from_identity[..4], vt.height, vt.headers_validated
                                                             );
                                                         } else if let Err(e) = &result.outcome {
-                                                            warn!(
-                                                                "v1.5.0 Fix 2 forward-chain validation failed for peer {:?}: {}",
-                                                                &from_identity[..4], e
-                                                            );
+                                                            // Demote expected rate-limit hits to debug; log real
+                                                            // validation failures at warn. NoSlotAvailable is an
+                                                            // expected back-pressure signal when many peers send
+                                                            // TipResponses concurrently (post-anchor transition
+                                                            // commonly floods this), not a security-relevant
+                                                            // failure. Previously logged at warn with a stale
+                                                            // "v1.5.0 Fix 2" prefix that misled users into
+                                                            // thinking they were running v1.5.x — see v1.8.1
+                                                            // release notes.
+                                                            if matches!(
+                                                                e,
+                                                                crate::network::tip_validation::TipValidationError::NoSlotAvailable
+                                                            ) {
+                                                                tracing::debug!(
+                                                                    "Forward-chain tip validation slot unavailable for peer {:?} (rate-limit; expected under load)",
+                                                                    &from_identity[..4]
+                                                                );
+                                                            } else {
+                                                                warn!(
+                                                                    "Forward-chain tip validation failed for peer {:?}: {}",
+                                                                    &from_identity[..4], e
+                                                                );
+                                                            }
                                                         }
                                                         // Always release reservation so a later GetTip
                                                         // can trigger a fresh validation for this peer.
