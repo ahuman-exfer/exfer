@@ -75,8 +75,24 @@ mod ping_pong_tests {
     }
 
     #[test]
-    fn pong_deadline_is_15s() {
-        assert_eq!(PONG_DEADLINE_SECS, 15);
+    fn pong_deadline_is_90s() {
+        // v1.8.2: bumped 15 → 90 to tolerate the peer's 60-s
+        // MAX_RESPONSE_BYTES_PER_MIN tumbling-reset window plus mid-frame
+        // writer latency on slow links. See src/types/mod.rs comment block
+        // and docs/v1.8.2-brief.md for full rationale.
+        assert_eq!(PONG_DEADLINE_SECS, 90);
+    }
+
+    #[test]
+    fn pong_deadline_exceeds_budget_window() {
+        // Invariant: PONG_DEADLINE_SECS must exceed the peer's 60-s
+        // response-byte tumbling window so a peer in budget-silence never
+        // falsely trips PongTimeout. Pinning this prevents future drift back
+        // toward a value that races the boundary.
+        assert!(
+            PONG_DEADLINE_SECS as usize > 60,
+            "pong deadline must exceed the 60-s response-budget window"
+        );
     }
 
     #[test]

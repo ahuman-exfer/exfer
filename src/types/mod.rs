@@ -208,7 +208,25 @@ pub const PROTECT_GROUPS_N: usize = 16;
 /// the last N seconds is eligible for the useful-protection top-N.
 pub const USEFUL_PROTECTION_SECS: u64 = 600;
 pub const PING_INTERVAL_SECS: u64 = 60;
-pub const PONG_DEADLINE_SECS: u64 = 15;
+/// Time the supervisor will wait for a Pong reply after firing a keepalive
+/// Ping before tearing down the peer with `PeerError::PongTimeout`.
+///
+/// Must EXCEED the peer's 60-s `MAX_RESPONSE_BYTES_PER_MIN` tumbling-reset
+/// window. v1.8.0 introduced per-peer paced transport: when a peer hits its
+/// 16 MiB/min response-byte budget mid-cycle, it goes silent for up to 60 s
+/// while waiting for the window to roll over. With the previous 15-s value,
+/// the supervisor's 60-s ping interval + 15-s deadline tore down healthy
+/// peers at the 75-s mark — exactly when budget-paced peers were structurally
+/// quiet. Empirical observation: ~7 such drops per 44-min Stage B IBD on a
+/// residential link, costing ~7-14 min of cold-boot wall-clock. v1.8.2 raises
+/// to 90 s = 1.5× the 60-s budget window, with margin for mid-frame writer
+/// head-of-line blocking on slow links (a ~4 MiB BlockResponse can take
+/// 20-30 s to drain before a queued Pong reaches the wire). Aligns with the
+/// v1.8.0 paced-transport timeout family (`STAGE_A_PROGRESS_TIMEOUT = 120`,
+/// `TIP_VALIDATION_BATCH_TIMEOUT_SECS = 120`). PongTimeout does not strike
+/// (per v1.7.2 round-2 fix), so the cost of a longer deadline is bounded:
+/// a truly-dead-but-app-alive peer lingers ~75 s longer before reconnect.
+pub const PONG_DEADLINE_SECS: u64 = 90;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 #[allow(dead_code)]
