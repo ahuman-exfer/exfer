@@ -81,14 +81,14 @@ type TxRateLimiter =
     Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>>;
 
 const MAX_RPC_TX_PER_MIN: u32 = 60;
-/// Per-IP rate limit for UTXO scan endpoints (get_balance, get_address_utxos).
+/// Per-IP rate limit for UTXO scan endpoints (get_balance, get_address_utxos, get_script_utxos).
 const MAX_RPC_SCAN_PER_MIN: u32 = 30;
 /// Maximum concurrent RPC connections.
 const MAX_RPC_CONNECTIONS: usize = 32;
 /// Per-connection read timeout (seconds).
 const RPC_TIMEOUT_SECS: u64 = 30;
 
-/// Semaphore for UTXO-scanning RPC endpoints (get_balance, get_address_utxos).
+/// Semaphore for UTXO-scanning RPC endpoints (get_balance, get_address_utxos, get_script_utxos).
 /// Capped at 1 so at most one scan holds the utxo_set read lock at a time.
 /// Prevents public RPC traffic from stalling process_block's write lock.
 type UtxoScanSemaphore = Arc<tokio::sync::Semaphore>;
@@ -209,8 +209,11 @@ async fn handle_connection(
     // Extract Content-Length
     let content_length = extract_content_length(&header_str).unwrap_or(0);
     // 2.5 MiB hard cap: send_raw_transaction carries hex-encoded 1 MiB txs.
+    // get_script_utxos lifted to 200 KiB so the full 65,535-byte output-script
+    // wire range is queryable (script_hex doubles bytes; +JSON wrapping).
     // All other methods are post-parse capped at 64 KB.
     const MAX_RPC_BODY: usize = 2_621_440; // 2.5 MiB
+    const MAX_RPC_BODY_SCRIPT: usize = 200_000; // ~200 KB for get_script_utxos
     const MAX_RPC_BODY_SMALL: usize = 65_536; // 64 KB
     if content_length == 0 || content_length > MAX_RPC_BODY {
         send_http_response(&mut stream, 400, b"Invalid Content-Length").await?;
@@ -235,15 +238,19 @@ async fn handle_connection(
         }
     };
 
-    // Enforce 64 KB cap for all methods except send_raw_transaction.
-    // Bounds worst-case memory from malicious JSON to ~2 MB across 32 connections.
-    if rpc_req.method != "send_raw_transaction" && content_length > MAX_RPC_BODY_SMALL {
+    // Per-method body cap. Bounds worst-case memory across 32 connections.
+    let method_cap = match rpc_req.method.as_str() {
+        "send_raw_transaction" => MAX_RPC_BODY,
+        "get_script_utxos" => MAX_RPC_BODY_SCRIPT,
+        _ => MAX_RPC_BODY_SMALL,
+    };
+    if content_length > method_cap {
         let resp = RpcResponse::err(
             rpc_req.id,
             PARSE_ERROR,
             format!(
                 "Request too large: {} bytes (max {} for this method)",
-                content_length, MAX_RPC_BODY_SMALL
+                content_length, method_cap
             ),
         );
         send_rpc_response(&mut stream, &resp).await?;
@@ -289,7 +296,7 @@ async fn dispatch(
     let id = req.id.clone();
     match req.method.as_str() {
         "get_block_height" => handle_get_block_height(id, node).await,
-        "get_balance" | "get_address_utxos" => {
+        "get_balance" | "get_address_utxos" | "get_script_utxos" => {
             // Rate limit UTXO scan endpoints: 30/min/IP
             {
                 let mut limiter = scan_limiter.lock().unwrap_or_else(|e| e.into_inner());
@@ -312,6 +319,7 @@ async fn dispatch(
             match req.method.as_str() {
                 "get_balance" => handle_get_balance(id, req.params, node).await,
                 "get_address_utxos" => handle_get_address_utxos(id, req.params, node).await,
+                "get_script_utxos" => handle_get_script_utxos(id, req.params, node).await,
                 _ => unreachable!(),
             }
         }
@@ -439,12 +447,15 @@ async fn handle_get_address_utxos(
     let tip_height = node.tip.read().await.height;
     let current_height = tip_height.saturating_add(1);
 
-    // Use dedicated method to minimize read-lock hold time.
+    // Probe for limit+1 so we can flag truncation; clients have no other way
+    // to distinguish a complete set from "first 1000 only".
     const MAX_UTXO_RESULTS: usize = 1000;
-    let matched = {
+    let mut matched = {
         let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script(&addr_bytes, current_height, MAX_UTXO_RESULTS)
+        utxo_set.utxos_for_script(&addr_bytes, current_height, MAX_UTXO_RESULTS + 1)
     };
+    let truncated = matched.len() > MAX_UTXO_RESULTS;
+    matched.truncate(MAX_UTXO_RESULTS);
     // Lock released — format JSON without holding any chainstate locks.
     let utxos: Vec<serde_json::Value> = matched
         .iter()
@@ -464,6 +475,89 @@ async fn handle_get_address_utxos(
         serde_json::json!({
             "address": parsed.address,
             "utxos": utxos,
+            "truncated": truncated,
+            "tip_height": tip_height,
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// get_script_utxos
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GetScriptUtxosParams {
+    script_hex: String,
+}
+
+async fn handle_get_script_utxos(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: GetScriptUtxosParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+
+    let script_bytes = match hex::decode(&parsed.script_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            return RpcResponse::err(
+                id,
+                INVALID_PARAMS,
+                format!("Invalid hex in script_hex: {}", e),
+            );
+        }
+    };
+    // Output scripts are u16 varbytes-prefixed on the wire (max 65,535 bytes).
+    // Reject queries longer than that — they cannot have been indexed.
+    if script_bytes.len() > 65_535 {
+        return RpcResponse::err(
+            id,
+            INVALID_PARAMS,
+            format!(
+                "script_hex exceeds max output-script size (got {} bytes, max 65535)",
+                script_bytes.len()
+            ),
+        );
+    }
+
+    // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
+    let tip_height = node.tip.read().await.height;
+    let current_height = tip_height.saturating_add(1);
+
+    // Probe for limit+1 so we can flag truncation; clients have no other way
+    // to distinguish a complete set from "first 1000 only".
+    const MAX_UTXO_RESULTS: usize = 1000;
+    let mut matched = {
+        let utxo_set = node.utxo_set.read().await;
+        utxo_set.utxos_for_script(&script_bytes, current_height, MAX_UTXO_RESULTS + 1)
+    };
+    let truncated = matched.len() > MAX_UTXO_RESULTS;
+    matched.truncate(MAX_UTXO_RESULTS);
+    // Lock released — format JSON without holding any chainstate locks.
+    let script_len = script_bytes.len();
+    let utxos: Vec<serde_json::Value> = matched
+        .iter()
+        .map(|(outpoint, val, h, cb)| {
+            serde_json::json!({
+                "tx_id": hex::encode(outpoint.tx_id.as_bytes()),
+                "output_index": outpoint.output_index,
+                "value": val,
+                "script_len": script_len,
+                "height": h,
+                "is_coinbase": cb,
+            })
+        })
+        .collect();
+
+    RpcResponse::ok(
+        id,
+        serde_json::json!({
+            "script_hex": parsed.script_hex,
+            "utxos": utxos,
+            "truncated": truncated,
             "tip_height": tip_height,
         }),
     )

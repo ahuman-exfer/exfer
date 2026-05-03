@@ -901,6 +901,7 @@ All methods use JSON-RPC 2.0 over HTTP POST.
 | `get_block_height` | `{}` | Current tip height and block ID |
 | `get_balance` | `{"address": "hex"}` | Spendable balance for an address |
 | `get_address_utxos` | `{"address": "hex"}` | List of spendable UTXOs for an address (max 1,000) |
+| `get_script_utxos` | `{"script_hex": "hex"}` | List of spendable UTXOs locked to an exact output script (max 1,000) |
 | `get_block` | `{"height": u64}` or `{"hash": "hex"}` | Block info including transaction list |
 | `get_transaction` | `{"hash": "hex"}` | Transaction details, mempool status, block height |
 | `send_raw_transaction` | `{"tx_hex": "hex"}` | Submit a serialized signed transaction |
