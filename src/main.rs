@@ -105,7 +105,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.9.0";
+pub const RELEASE_TAG: &str = "1.9.1";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -2165,8 +2165,6 @@ fn run_init_inner(
     }
 
     // Step 7: Print summary
-    let task_server = "http://82.221.100.201:8080/api/v1/tasks";
-
     if json_output {
         let j = serde_json::json!({
             "address": address,
@@ -2181,7 +2179,6 @@ fn run_init_inner(
                 "current_height": sync_height,
                 "status": if sync_height.is_some() { "syncing" } else { "starting" },
             },
-            "task_server": task_server,
         });
         println!("{}", serde_json::to_string_pretty(&j).unwrap());
     } else {
@@ -2203,8 +2200,6 @@ fn run_init_inner(
         if mine {
             println!("Mining enabled. Rewards go to {}", address);
         }
-        println!();
-        println!("Earn EXFER by completing tasks: {}", task_server);
         println!();
         println!(
             "To check balance:  exfer wallet balance --wallet {} --rpc {}",
