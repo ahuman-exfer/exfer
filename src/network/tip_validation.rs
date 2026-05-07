@@ -75,6 +75,12 @@ pub enum TipValidationError {
     /// policy — the stall is an *absence* of progress, not a delivered
     /// offence, so identity-level penalties do not apply.
     BootstrapStalled,
+    /// v1.9.2: peer returned an empty `Headers` batch. Wire-indistinguishable
+    /// from a rate-limited responder, so the caller MUST NOT strike. The
+    /// validation task ends quietly; subsequent `TipResponse` from this peer
+    /// triggers a fresh attempt once the responder's per-minute byte budget
+    /// has refilled.
+    PeerNoForwardData(String),
     /// Internal storage / consensus error.
     Internal(String),
 }
@@ -89,6 +95,7 @@ impl std::fmt::Display for TipValidationError {
             TipValidationError::NoSlotAvailable => write!(f, "no concurrent validation slot available"),
             TipValidationError::PeerDisconnected => write!(f, "peer disconnected mid-validation"),
             TipValidationError::BootstrapStalled => write!(f, "bootstrap coordinator stalled — no forward progress"),
+            TipValidationError::PeerNoForwardData(m) => write!(f, "peer returned no data: {}", m),
             TipValidationError::Internal(m) => write!(f, "internal: {}", m),
         }
     }

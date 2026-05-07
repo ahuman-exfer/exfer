@@ -105,7 +105,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.9.1";
+pub const RELEASE_TAG: &str = "1.10.0";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -141,6 +141,11 @@ enum Commands {
         /// even below the hardcoded checkpoint height.
         #[arg(long)]
         no_assume_valid: bool,
+        /// One-shot: wipe all persisted IP and identity bans on startup, then
+        /// run normally. Use after upgrading from a release that over-banned
+        /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
+        #[arg(long)]
+        purge_bans: bool,
     },
     /// Run the miner
     Mine {
@@ -180,6 +185,11 @@ enum Commands {
         /// even below the hardcoded checkpoint height.
         #[arg(long)]
         no_assume_valid: bool,
+        /// One-shot: wipe all persisted IP and identity bans on startup, then
+        /// run normally. Use after upgrading from a release that over-banned
+        /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
+        #[arg(long)]
+        purge_bans: bool,
     },
     /// Wallet operations
     Wallet {
@@ -772,9 +782,10 @@ async fn main() {
             rpc_bind,
             verify_all,
             no_assume_valid,
+            purge_bans,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -791,6 +802,7 @@ async fn main() {
             rpc_bind,
             verify_all,
             no_assume_valid,
+            purge_bans,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -813,7 +825,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -3108,6 +3120,7 @@ async fn run_node(
     rpc_bind: Option<SocketAddr>,
     verify_all: bool,
     no_assume_valid: bool,
+    purge_bans: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
     std::fs::create_dir_all(&datadir)
@@ -3344,6 +3357,21 @@ async fn run_node(
     let restored_fork_blocks = storage
         .load_fork_blocks(MAX_FORK_BLOCKS)
         .map_err(|e| format!("Failed to load fork blocks: {e}. Database may be corrupt."))?;
+
+    // v1.9.2 operator recovery: --purge-bans wipes both ban tables before
+    // they're loaded, so accumulated v1.8.x/v1.9.x over-bans don't survive
+    // the upgrade. Fail loud — if the purge can't complete, the operator
+    // needs to know before the node starts using stale ban state.
+    if purge_bans {
+        let ip_n = storage
+            .clear_ip_bans()
+            .map_err(|e| format!("--purge-bans: failed to clear IP bans: {e}"))?;
+        info!("--purge-bans: cleared {} persisted IP ban(s)", ip_n);
+        let id_n = storage
+            .clear_identity_bans()
+            .map_err(|e| format!("--purge-bans: failed to clear identity bans: {e}"))?;
+        info!("--purge-bans: cleared {} persisted identity ban(s)", id_n);
+    }
 
     // Load persisted IP bans (P2a)
     let mut restored_ip_abuse = HashMap::new();

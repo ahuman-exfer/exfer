@@ -422,10 +422,27 @@ impl Peer {
         .await
         .map_err(|_| PeerError::Io("read timeout".into()))?
         .map_err(|e| {
-            if e.to_string().contains("HMAC verification failed") {
+            // v1.10.0: align with main reader 4-way split (peer.rs:622-625).
+            // Helper is dead-code today (#[allow(dead_code)]); aligning so
+            // a future revival doesn't reintroduce strike-honest-peer bugs.
+            let s = e.to_string();
+            if s.contains("HMAC verification failed") {
                 PeerError::HmacFailure
+            } else if s.starts_with("frame budget exhausted") {
+                PeerError::FrameBudgetExceeded(s)
             } else {
-                PeerError::SlowPeer(e.to_string())
+                match e.kind() {
+                    std::io::ErrorKind::TimedOut => PeerError::SlowPeerTimeout(s),
+                    std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WriteZero
+                    | std::io::ErrorKind::NotConnected => PeerError::TransportIo(s),
+                    std::io::ErrorKind::InvalidData => PeerError::MalformedFrame(s),
+                    _ => PeerError::TransportIo(s),
+                }
             }
         })?;
         if counter < self.recv_counter {
@@ -558,7 +575,9 @@ pub async fn reader_recv(
             if started.elapsed() >= Duration::from_secs(COUNTER_DEADLINE_SECS) {
                 state.counter_buf_len = 0;
                 state.counter_started = None;
-                return Err(PeerError::SlowPeer(
+                // v1.10.0: was SlowPeer (strike). Trickle timeout is transient
+                // peer slowness, not sequence misuse. Demoted to no-strike.
+                return Err(PeerError::SlowPeerTimeout(
                     "frame counter trickle timeout (5s)".into(),
                 ));
             }
@@ -592,7 +611,9 @@ pub async fn reader_recv(
                 if !had_partial && state.counter_buf_len == 0 {
                     return Ok(None); // clean timeout, no data
                 }
-                return Err(PeerError::SlowPeer(
+                // v1.10.0: was SlowPeer (strike). Partial-counter-read timeout
+                // is transient peer slowness, not sequence misuse.
+                return Err(PeerError::SlowPeerTimeout(
                     "timeout during partial frame counter read".into(),
                 ));
             }
@@ -619,16 +640,38 @@ pub async fn reader_recv(
     {
         Ok(Ok(msg)) => msg,
         Ok(Err(e)) => {
-            return Err(if e.to_string().contains("HMAC verification failed") {
+            // v1.10.0: 4-way split. Was SlowPeer-for-everything-non-HMAC,
+            // which struck honest peers on transport I/O / budget shedding /
+            // chunk timeout. Now only true wire garbage (InvalidData) strikes.
+            // Default for unknown ErrorKind is no-strike (TransportIo) — the
+            // safer side; specific kinds can be promoted to MalformedFrame
+            // later if real wire-garbage signals emerge there.
+            let s = e.to_string();
+            return Err(if s.contains("HMAC verification failed") {
                 PeerError::HmacFailure
+            } else if s.starts_with("frame budget exhausted") {
+                PeerError::FrameBudgetExceeded(s)
             } else {
-                PeerError::SlowPeer(e.to_string())
-            })
+                match e.kind() {
+                    std::io::ErrorKind::TimedOut => PeerError::SlowPeerTimeout(s),
+                    std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WriteZero
+                    | std::io::ErrorKind::NotConnected => PeerError::TransportIo(s),
+                    std::io::ErrorKind::InvalidData => PeerError::MalformedFrame(s),
+                    _ => PeerError::TransportIo(s),
+                }
+            });
         }
         Err(_) => {
-            return Err(PeerError::SlowPeer(
+            // v1.10.0: was SlowPeer (strike). Frame-read deadline = transient
+            // peer slowness.
+            return Err(PeerError::SlowPeerTimeout(
                 "frame read timeout: peer too slow mid-message".into(),
-            ))
+            ));
         }
     };
 
@@ -1200,6 +1243,12 @@ pub enum PeerError {
     VersionMismatch,
     UnexpectedMessage,
     PongTimeout,
+    /// v1.10.0: deprecated. All construction sites migrated to typed
+    /// variants (TrafficQuotaExceeded, AbuseThresholdExceeded,
+    /// ProtocolGarbage, etc.). Retained in the supervisor's strike arm
+    /// as defensive fallback in case any future change accidentally
+    /// reintroduces this. Should never be constructed in normal operation.
+    #[allow(dead_code)]
     RateLimitExceeded,
     SerializationError(String),
     NonceMismatch,
@@ -1214,6 +1263,36 @@ pub enum PeerError {
     /// Connection rejected because this identity already has a live session.
     /// Carries the authenticated identity so the reconnect loop can suppress.
     DuplicateIdentity([u8; 32]),
+    /// v1.9.2: peer reconnected during an existing IP or identity ban window.
+    /// Disconnect without re-striking — re-striking would refresh the ban
+    /// window on every reconnect attempt and effectively make bans permanent.
+    /// Caller MUST NOT call `record_ip_strike()` on this variant.
+    PeerAlreadyBanned,
+    /// v1.10.0: honest peer exceeded a per-minute rate quota (chatter).
+    /// NO STRIKE.
+    TrafficQuotaExceeded,
+    /// v1.10.0: peer crossed a per-connection abuse counter (pure
+    /// counter-overrun WITHOUT inline strike already fired). STRIKE.
+    AbuseThresholdExceeded,
+    /// v1.10.0: post-handshake message we don't recognize (repeated
+    /// Hello/AuthAck or unknown variant). STRIKE.
+    ProtocolGarbage,
+    /// v1.10.0: read deadline / per-chunk timeout / frame counter trickle.
+    /// NO STRIKE — transient peer slowness.
+    SlowPeerTimeout(String),
+    /// v1.10.0: mid-frame transport I/O failure (UnexpectedEof,
+    /// ConnectionReset, BrokenPipe, etc.). NO STRIKE — peer's transport
+    /// collapsed.
+    TransportIo(String),
+    /// v1.10.0: local frame-budget exhaustion ("frame budget exhausted —
+    /// shedding peer"). NO STRIKE — our resource decision, not peer fault.
+    FrameBudgetExceeded(String),
+    /// v1.10.0: true wire-level garbage — InvalidData / deserialize
+    /// failure / oversized declared payload. STRIKE.
+    MalformedFrame(String),
+    /// v1.10.0: caller already invoked `record_ip_strike()` inline before
+    /// returning. Supervisor MUST NOT strike again on this variant.
+    DisconnectAfterInlineStrike,
 }
 
 impl std::fmt::Display for PeerError {
@@ -1233,6 +1312,15 @@ impl std::fmt::Display for PeerError {
             PeerError::SlowPeer(e) => write!(f, "slow peer: {}", e),
             PeerError::HmacFailure => write!(f, "HMAC verification failed (tampered frame)"),
             PeerError::DuplicateIdentity(_) => write!(f, "duplicate identity"),
+            PeerError::PeerAlreadyBanned => write!(f, "peer already banned (reconnect during ban window)"),
+            PeerError::TrafficQuotaExceeded => write!(f, "traffic quota exceeded (honest-peer chatter)"),
+            PeerError::AbuseThresholdExceeded => write!(f, "abuse threshold exceeded"),
+            PeerError::ProtocolGarbage => write!(f, "post-handshake protocol garbage"),
+            PeerError::SlowPeerTimeout(e) => write!(f, "slow peer timeout: {}", e),
+            PeerError::TransportIo(e) => write!(f, "transport I/O error: {}", e),
+            PeerError::FrameBudgetExceeded(e) => write!(f, "frame budget exceeded (local shedding): {}", e),
+            PeerError::MalformedFrame(e) => write!(f, "malformed frame: {}", e),
+            PeerError::DisconnectAfterInlineStrike => write!(f, "disconnect after inline strike"),
         }
     }
 }

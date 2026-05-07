@@ -1168,6 +1168,66 @@ impl ChainStorage {
         Ok(result)
     }
 
+    /// v1.9.2: wipe all persisted IP bans. Used by `--purge-bans` operator
+    /// recovery to clear bans accumulated under v1.8.x/v1.9.x before the
+    /// empty-batch IBD-cascade fix.
+    ///
+    /// Iteration errors propagate; this is the operator recovery path, so
+    /// silently skipping bad entries would leave bans in place and defeat
+    /// the purpose. Caller must surface the failure.
+    pub fn clear_ip_bans(&self) -> Result<usize, StorageError> {
+        let keys: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(IP_BAN_TABLE)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (k, _) = entry?;
+                out.push(k.value().to_vec());
+            }
+            out
+        };
+        let count = keys.len();
+        if count > 0 {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(IP_BAN_TABLE)?;
+                for key in &keys {
+                    table.remove(key.as_slice())?;
+                }
+            }
+            write_txn.commit()?;
+        }
+        Ok(count)
+    }
+
+    /// v1.9.2: wipe all persisted identity bans. See `clear_ip_bans`.
+    ///
+    /// Iteration errors propagate, same rationale as `clear_ip_bans`.
+    pub fn clear_identity_bans(&self) -> Result<usize, StorageError> {
+        let keys: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(IDENTITY_BAN_TABLE)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (k, _) = entry?;
+                out.push(k.value().to_vec());
+            }
+            out
+        };
+        let count = keys.len();
+        if count > 0 {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(IDENTITY_BAN_TABLE)?;
+                for key in &keys {
+                    table.remove(key.as_slice())?;
+                }
+            }
+            write_txn.commit()?;
+        }
+        Ok(count)
+    }
+
     /// Check if the HEIGHT_INDEX table is empty (no blocks indexed).
     pub fn height_index_is_empty(&self) -> Result<bool, redb::Error> {
         let read_txn = self.db.begin_read()?;

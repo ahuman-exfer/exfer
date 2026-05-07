@@ -1201,7 +1201,18 @@ impl Node {
     /// all post-handshake strikes so that abusive peers accumulate identity bans,
     /// not just IP bans. Only pass `None` for pre-handshake failures where the
     /// peer's identity has not yet been cryptographically verified.
+    #[track_caller]
     fn record_ip_strike(&self, ip: std::net::IpAddr, identity: Option<[u8; 32]>) -> bool {
+        // v1.9.2: log call-site so silent strike paths (whose surrounding
+        // log lines are at `debug!` level or were missed during code review)
+        // can be attributed without per-site instrumentation. Debug-level
+        // here keeps it cheap in release; flip RUST_LOG to enable.
+        tracing::debug!(
+            "record_ip_strike from {} on ip={} identity={:?}",
+            std::panic::Location::caller(),
+            ip,
+            identity.map(|pk| hex::encode(&pk[..4]))
+        );
         let mut abuse = self.ip_abuse.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let decay = std::time::Duration::from_secs(BAN_DECAY_SECS);
@@ -3282,7 +3293,16 @@ impl Node {
             // this arm is either a content-wrapper exit (inline strike
             // already fired) or a terminal ban wrapper.
             match &result {
-                Err(PeerError::HmacFailure) | Err(PeerError::RateLimitExceeded) => {
+                // v1.10.0: typed PeerError split. Strike only on real abuse
+                // signals; transient/quota/inline-already-struck cases
+                // disconnect quietly. See project_v1_10_0_spec_signoff for
+                // the full rev6 audit table.
+                Err(PeerError::HmacFailure)
+                | Err(PeerError::ProtocolGarbage)
+                | Err(PeerError::AbuseThresholdExceeded)
+                | Err(PeerError::SlowPeer(_))
+                | Err(PeerError::MalformedFrame(_))
+                | Err(PeerError::RateLimitExceeded) => {
                     warn!(
                         "Authenticated peer {} disconnected ({}) — recording IP strike",
                         addr,
@@ -3290,22 +3310,36 @@ impl Node {
                     );
                     self.record_ip_strike(addr.ip(), Some(peer_identity));
                 }
-                Err(PeerError::SlowPeer(_)) => {
-                    if self.ever_confirmed_peer.load(Ordering::Relaxed) {
-                        warn!(
-                            "Authenticated peer {} disconnected ({}) — recording IP strike",
-                            addr,
-                            result.as_ref().unwrap_err()
-                        );
-                        self.record_ip_strike(addr.ip(), Some(peer_identity));
-                    } else {
-                        info!(
-                            "Authenticated peer {} disconnected ({}) — pre-confirmation, no strike",
-                            addr,
-                            result.as_ref().unwrap_err()
-                        );
-                    }
+                Err(PeerError::TrafficQuotaExceeded)
+                | Err(PeerError::SlowPeerTimeout(_))
+                | Err(PeerError::TransportIo(_))
+                | Err(PeerError::FrameBudgetExceeded(_))
+                | Err(PeerError::DisconnectAfterInlineStrike) => {
+                    debug!(
+                        "Authenticated peer {} disconnected ({}) — no strike (v1.10.0 transient/quota/inline)",
+                        addr,
+                        result.as_ref().unwrap_err()
+                    );
                 }
+                Err(PeerError::PeerAlreadyBanned) => {
+                    // v1.9.2: peer reconnected during an existing ban window.
+                    // Disconnect quietly — re-striking would refresh the ban
+                    // counter and overwrite `banned_until`, turning a 600s
+                    // ban into an effectively permanent one under reconnect
+                    // churn from honest seed peers (see local soak test
+                    // 2026-05-05 stall at height 320,544).
+                    debug!(
+                        "Authenticated peer {} disconnected (already banned) — no strike",
+                        addr
+                    );
+                }
+                // v1.10.0: pre-existing SlowPeer arm removed (unreachable
+                // — caught by the v1.10.0 strike arm above). The old arm
+                // pre-confirmation skip handled transient-flakiness cases
+                // that are now SlowPeerTimeout / TransportIo /
+                // FrameBudgetExceeded (no-strike regardless of confirmation
+                // state). Remaining SlowPeer (frame counter replay) is
+                // sequence misuse and strikes regardless of confirmation.
                 _ => {}
             }
 
@@ -3519,7 +3553,16 @@ impl Node {
             // this arm is either a content-wrapper exit (inline strike
             // already fired) or a terminal ban wrapper.
             match &result {
-                Err(PeerError::HmacFailure) | Err(PeerError::RateLimitExceeded) => {
+                // v1.10.0: typed PeerError split. Strike only on real abuse
+                // signals; transient/quota/inline-already-struck cases
+                // disconnect quietly. See project_v1_10_0_spec_signoff for
+                // the full rev6 audit table.
+                Err(PeerError::HmacFailure)
+                | Err(PeerError::ProtocolGarbage)
+                | Err(PeerError::AbuseThresholdExceeded)
+                | Err(PeerError::SlowPeer(_))
+                | Err(PeerError::MalformedFrame(_))
+                | Err(PeerError::RateLimitExceeded) => {
                     warn!(
                         "Authenticated peer {} disconnected ({}) — recording IP strike",
                         addr,
@@ -3527,22 +3570,36 @@ impl Node {
                     );
                     self.record_ip_strike(addr.ip(), Some(peer_identity));
                 }
-                Err(PeerError::SlowPeer(_)) => {
-                    if self.ever_confirmed_peer.load(Ordering::Relaxed) {
-                        warn!(
-                            "Authenticated peer {} disconnected ({}) — recording IP strike",
-                            addr,
-                            result.as_ref().unwrap_err()
-                        );
-                        self.record_ip_strike(addr.ip(), Some(peer_identity));
-                    } else {
-                        info!(
-                            "Authenticated peer {} disconnected ({}) — pre-confirmation, no strike",
-                            addr,
-                            result.as_ref().unwrap_err()
-                        );
-                    }
+                Err(PeerError::TrafficQuotaExceeded)
+                | Err(PeerError::SlowPeerTimeout(_))
+                | Err(PeerError::TransportIo(_))
+                | Err(PeerError::FrameBudgetExceeded(_))
+                | Err(PeerError::DisconnectAfterInlineStrike) => {
+                    debug!(
+                        "Authenticated peer {} disconnected ({}) — no strike (v1.10.0 transient/quota/inline)",
+                        addr,
+                        result.as_ref().unwrap_err()
+                    );
                 }
+                Err(PeerError::PeerAlreadyBanned) => {
+                    // v1.9.2: peer reconnected during an existing ban window.
+                    // Disconnect quietly — re-striking would refresh the ban
+                    // counter and overwrite `banned_until`, turning a 600s
+                    // ban into an effectively permanent one under reconnect
+                    // churn from honest seed peers (see local soak test
+                    // 2026-05-05 stall at height 320,544).
+                    debug!(
+                        "Authenticated peer {} disconnected (already banned) — no strike",
+                        addr
+                    );
+                }
+                // v1.10.0: pre-existing SlowPeer arm removed (unreachable
+                // — caught by the v1.10.0 strike arm above). The old arm
+                // pre-confirmation skip handled transient-flakiness cases
+                // that are now SlowPeerTimeout / TransportIo /
+                // FrameBudgetExceeded (no-strike regardless of confirmation
+                // state). Remaining SlowPeer (frame counter replay) is
+                // sequence misuse and strikes regardless of confirmation.
                 _ => {}
             }
 
@@ -3652,15 +3709,23 @@ impl Node {
             }
 
             // Check IP ban
+            //
+            // v1.9.2: returns `PeerAlreadyBanned` (no-strike) instead of
+            // `RateLimitExceeded`. Pre-v1.9.2, every reconnect attempt during
+            // the ban window triggered another `record_ip_strike()` in the
+            // supervisor, which incremented the strike counter AND overwrote
+            // `banned_until` — turning a 600s ban into an effectively
+            // permanent one under reconnect churn. (Local soak test
+            // 2026-05-05 reproduced this with S1/S2/S3 from the seed list.)
             if self.is_ip_banned(meta.addr.ip()) {
-                warn!("Disconnecting banned IP {}", meta.addr.ip());
-                return Err(PeerError::RateLimitExceeded);
+                debug!("Disconnecting banned IP {} (reconnect during ban window)", meta.addr.ip());
+                return Err(PeerError::PeerAlreadyBanned);
             }
 
-            // Check identity ban
+            // Check identity ban — same rationale as the IP-ban arm above.
             if self.is_identity_banned(&meta.identity) {
-                warn!("Disconnecting banned identity from {}", meta.addr);
-                return Err(PeerError::RateLimitExceeded);
+                debug!("Disconnecting banned identity from {} (reconnect during ban window)", meta.addr);
+                return Err(PeerError::PeerAlreadyBanned);
             }
 
             // Read one message (1s poll timeout built into reader_recv)
@@ -3678,7 +3743,18 @@ impl Node {
                     if self.ever_confirmed_peer.load(Ordering::Relaxed) {
                         ping_count += 1;
                         if ping_count > MAX_PINGS_PER_MIN {
-                            return Err(PeerError::RateLimitExceeded);
+                            // v1.10.0 rev9: soft-drop the count (no strike,
+                            // no disconnect) but STILL send Pong below. Pre-rev9
+                            // we returned TrafficQuotaExceeded → disconnect,
+                            // which broke peer-side liveness because we'd stop
+                            // answering their keepalives — peer would then
+                            // disconnect us reciprocally. Soft-drop preserves
+                            // liveness while still capping our own ping_count
+                            // accounting for telemetry.
+                            tracing::debug!(
+                                "Soft-drop over-cap Ping from {} (still answering Pong)",
+                                meta.addr
+                            );
                         }
                     }
                     let _ = ctrl_tx.try_send(WriterControl::SendPong);
@@ -3689,29 +3765,70 @@ impl Node {
                     } else {
                         // v1.7.2 Change A: skip-increment during
                         // pre-confirmation bootstrap.
+                        //
+                        // v1.9.2: over-cap unsolicited Pong soft-drops instead
+                        // of `return Err(RateLimitExceeded)`. Counter still
+                        // increments for telemetry; we just don't disconnect-
+                        // and-strike honest peers whose Pong cadence races
+                        // briefly with our awaiting_pong state. (Local soak
+                        // test 2026-05-06 traced the unsolicited-counter
+                        // strike path back to this and two sibling sites.)
                         if self.ever_confirmed_peer.load(Ordering::Relaxed) {
                             unsolicited_count += 1;
                             if unsolicited_count > MAX_UNSOLICITED_PER_MIN {
-                                return Err(PeerError::RateLimitExceeded);
+                                tracing::debug!(
+                                    "Soft-drop unsolicited Pong from {} (over MAX_UNSOLICITED_PER_MIN)",
+                                    meta.addr
+                                );
                             }
                         }
                     }
                 }
                 Message::NewBlock(block) => {
-                    // During IBD (CatchingUp), exempt from per-peer block rate
-                    // limit — the sync peer legitimately sends many blocks.
-                    let catching_up = self.sync_state.load(
-                        std::sync::atomic::Ordering::Relaxed,
-                    ) == SyncState::CatchingUp as u8;
+                    // v1.10.0 rev9: stronger freshness gate (mirrors the rev8
+                    // NewTx fix). The previous `sync_state == CatchingUp`
+                    // gate had the same flicker class as NewTx — sync_state
+                    // can transiently flip to Live during IBD when the
+                    // 60s-no-peers fallback fires or a peer briefly
+                    // disconnects, even though our local tip is hundreds
+                    // of blocks behind. Under the old code an honest
+                    // peer broadcasting blocks while we were behind
+                    // would trip MAX_BLOCKS_PER_MIN during the flicker
+                    // and disconnect. Use active_ibd_peer + peer-work
+                    // signal instead so the per-min cap only applies
+                    // when we're TRULY at tip (network produces ~6 b/h
+                    // = 0.1 b/min, so > 12 b/min when truly at tip is
+                    // genuinely anomalous).
+                    let actually_caught_up = {
+                        let no_active_ibd = self
+                            .active_ibd_peer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_none();
+                        if !no_active_ibd {
+                            false
+                        } else {
+                            let our_work = self.tip.read().await.cumulative_work;
+                            let peers = self.peers.lock().await;
+                            !peers.by_identity.iter().any(|(_, lp)| {
+                                lp.tip.as_ref().map_or(false, |t| t.cumulative_work > our_work)
+                            })
+                        }
+                    };
                     // v1.7.2 Change A: skip-increment during pre-confirmation
-                    // bootstrap. Defense-in-depth alongside the existing
-                    // `catching_up` exemption — covers the 60s-no-peers
-                    // fallback-to-Live window (src/network/sync.rs:5466)
-                    // before any confirmation has landed.
-                    if !catching_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
+                    // bootstrap. Defense-in-depth alongside the freshness
+                    // gate above — covers the 60s-no-peers fallback-to-Live
+                    // window (src/network/sync.rs:5466) before any
+                    // confirmation has landed.
+                    if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                         block_count += 1;
                         if block_count > MAX_BLOCKS_PER_MIN {
-                            return Err(PeerError::RateLimitExceeded);
+                            // v1.10.0: TrafficQuotaExceeded — at-tip NewBlock chatter is not a strike signal.
+                            // Disconnect (no strike); peer can reconnect cleanly.
+                            // Soft-drop deferred — blanket soft-drop weakens
+                            // bandwidth/CPU defense against valid-block replay
+                            // floods (per expert rev9 review).
+                            return Err(PeerError::TrafficQuotaExceeded);
                         }
                     }
                     if self.is_ip_banned(meta.addr.ip()) {
@@ -3729,10 +3846,13 @@ impl Node {
                         warn!("Rejected trivially invalid block from {}", meta.addr);
                         invalid_block_count += 1;
                         if self.record_ip_strike(meta.addr.ip(), Some(meta.identity)) {
-                            return Err(PeerError::RateLimitExceeded);
+                            // v1.10.0: inline strike already fired — supervisor must not double-strike.
+                            return Err(PeerError::DisconnectAfterInlineStrike);
                         }
                         if invalid_block_count > MAX_INVALID_BLOCKS_PER_PEER {
-                            return Err(PeerError::RateLimitExceeded);
+                            // v1.10.0: counter cap reached AFTER inline strike fired this iteration
+                            // (line above always strikes on every invalid block). Inline-already-struck.
+                            return Err(PeerError::DisconnectAfterInlineStrike);
                         }
                         continue;
                     }
@@ -3754,9 +3874,70 @@ impl Node {
                     });
                 }
                 Message::NewTx(tx) => {
+                    // v1.10.0 rev8: stronger freshness gate.
+                    //
+                    // sync_state is scheduler mode, NOT "our UTXO view is
+                    // current enough to judge live mempool traffic." It can
+                    // flick to Live during IBD (60s-no-peers fallback, brief
+                    // peer disconnects) even though our UTXO is hundreds of
+                    // blocks behind. Validating NewTx during such a flick
+                    // fails with UtxoNotFound for honest at-tip peers' txes,
+                    // building up invalid_tx_count toward the per-min cap →
+                    // AbuseThresholdExceeded → strike. Soak test 2026-05-06
+                    // (PID 7816) reproduced this: 24 silent strikes from
+                    // sync.rs:3982 banned S2+S3 within 90 min despite the
+                    // catching_up gate.
+                    //
+                    // Stronger work-based signal: drop NewTx without
+                    // validation AND without counter increment when
+                    // (a) any peer is actively serving us blocks
+                    //     (active_ibd_peer.is_some()), OR
+                    // (b) any known peer claims more cumulative work than
+                    //     our tip.
+                    // Either condition means our UTXO view is stale and we
+                    // can't fairly judge live mempool traffic.
+                    //
+                    // tx_count is gated on actually_caught_up too — over-cap
+                    // detection during catch-up was a v1.9.2 anti-flood
+                    // measure but stale-state validation never runs anyway,
+                    // so per-peer NewTx flood during catchup is harmless to
+                    // us (we drop them all). Counting them risks the same
+                    // false-positive ban under TrafficQuotaExceeded once
+                    // out of catchup.
+                    let actually_caught_up = {
+                        let no_active_ibd = self
+                            .active_ibd_peer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_none();
+                        if !no_active_ibd {
+                            false
+                        } else {
+                            let our_work = self.tip.read().await.cumulative_work;
+                            let peers = self.peers.lock().await;
+                            !peers.by_identity.iter().any(|(_, lp)| {
+                                lp.tip.as_ref().map_or(false, |t| t.cumulative_work > our_work)
+                            })
+                        }
+                    };
+                    if !actually_caught_up {
+                        let _ = tx; // explicit drop for clarity
+                        continue;
+                    }
                     tx_count += 1;
                     if tx_count > MAX_TXS_PER_MIN {
-                        return Err(PeerError::RateLimitExceeded);
+                        // v1.10.0 rev9: was return Err(TrafficQuotaExceeded)
+                        // (disconnect). Disconnecting on at-tip NewTx flood
+                        // recreated the rev8 cascade where peers cycle
+                        // through reconnect/disconnect, breaking IBD-peer
+                        // stability. Soft-drop instead — actually_caught_up
+                        // gate above ensures we only reach here when truly
+                        // live, so over-cap NewTx is genuine at-tip chatter.
+                        tracing::debug!(
+                            "Soft-drop over-cap NewTx from {} (at-tip chatter)",
+                            meta.addr
+                        );
+                        continue;
                     }
                     if self.is_ip_banned(meta.addr.ip()) {
                         warn!("Dropping tx from banned IP {}", meta.addr.ip());
@@ -3781,7 +3962,8 @@ impl Node {
                             if matches!(e, MempoolError::DoubleSpend(_)) {
                                 invalid_tx_count += 1;
                                 if invalid_tx_count > MAX_INVALID_TXS_PER_PEER {
-                                    return Err(PeerError::RateLimitExceeded);
+                                    // v1.10.0: pure counter-overrun (no inline strike).
+                                    return Err(PeerError::AbuseThresholdExceeded);
                                 }
                             }
                             self.refund_global_tx_slot();
@@ -3849,7 +4031,8 @@ impl Node {
                                     if matches!(e, MempoolError::DoubleSpend(_)) {
                                         invalid_tx_count += 1;
                                         if invalid_tx_count > MAX_INVALID_TXS_PER_PEER {
-                                            return Err(PeerError::RateLimitExceeded);
+                                            // v1.10.0: pure counter-overrun (no inline strike).
+                                            return Err(PeerError::AbuseThresholdExceeded);
                                         }
                                     }
                                 }
@@ -3859,9 +4042,24 @@ impl Node {
                             tracing::debug!("Rejected tx from {}: {:?}", meta.addr, e);
                             self.refund_global_tx_slot();
                             invalid_tx_count += 1;
-                            self.record_ip_strike(meta.addr.ip(), Some(meta.identity));
+                            // v1.10.0 rev7 (post-soak-test 2026-05-06): inline
+                            // strike removed. NewTx validation errors include
+                            // UtxoNotFound for txes whose inputs reference
+                            // outputs spent in blocks we haven't received yet
+                            // — common when the local UTXO snapshot is stale
+                            // (catch-up, sync_state flicker, or just lag from
+                            // a recent reorg). Striking honest peers for these
+                            // false-positives drove the v1.10.0 soak test
+                            // stall: 24 silent strikes from this site banned
+                            // S2+S3 within 90 min despite the catching_up
+                            // skip at sync.rs:3833 (sync_state can flick to
+                            // Live briefly during IBD).
+                            //
+                            // The per-min TrafficQuotaExceeded cap at
+                            // sync.rs:3845 still covers NewTx flood.
                             if invalid_tx_count > MAX_INVALID_TXS_PER_PEER {
-                                return Err(PeerError::RateLimitExceeded);
+                                // No prior inline strike now; pure counter overrun.
+                                return Err(PeerError::AbuseThresholdExceeded);
                             }
                         }
                     }
@@ -3869,21 +4067,36 @@ impl Node {
                 Message::GetTip => {
                     // v1.7.2 Change A: skip-increment during pre-confirmation
                     // bootstrap.
+                    //
+                    // v1.9.2: over-budget GetTip is soft-throttled (response
+                    // dropped) instead of `return Err(RateLimitExceeded)`.
+                    // GetTip is a polling message — honest peers in steady
+                    // state across many concurrent connections naturally
+                    // exceed `MAX_REQUESTS_PER_MIN`. Pre-v1.9.2 the response
+                    // was a disconnect-and-strike, which banned honest
+                    // pollers within 10–15 minutes of Stage B starting and
+                    // produced the IBD-cascade-stall the local soak test
+                    // (2026-05-05) caught at height 320,544.
+                    let mut over_budget = false;
                     if self.ever_confirmed_peer.load(Ordering::Relaxed) {
                         request_count += 1;
                         if request_count > MAX_REQUESTS_PER_MIN {
-                            return Err(PeerError::RateLimitExceeded);
+                            over_budget = true;
                         }
                     }
-                    let (tip_height, tip_block_id, tip_work) = {
-                        let tip = self.tip.read().await;
-                        (tip.height, tip.block_id, tip.cumulative_work)
-                    };
-                    let _ = normal_tx.try_send(Message::TipResponse(TipResponseMsg {
-                        height: tip_height,
-                        block_id: tip_block_id,
-                        cumulative_work: tip_work,
-                    }));
+                    if !over_budget {
+                        let (tip_height, tip_block_id, tip_work) = {
+                            let tip = self.tip.read().await;
+                            (tip.height, tip.block_id, tip.cumulative_work)
+                        };
+                        let _ = normal_tx.try_send(Message::TipResponse(TipResponseMsg {
+                            height: tip_height,
+                            block_id: tip_block_id,
+                            cumulative_work: tip_work,
+                        }));
+                    }
+                    // Over budget: silently drop. Peer retries naturally; no
+                    // strike, no disconnect. Connection stays open.
                 }
                 Message::GetBlocks(hashes) => {
                     let catching_up = self.sync_state.load(std::sync::atomic::Ordering::Relaxed)
@@ -3983,8 +4196,20 @@ impl Node {
                         !self.ever_confirmed_peer.load(Ordering::Relaxed);
                     if !is_ibd_peer && !pre_confirmation_bootstrap {
                         block_count += 1;
+                        // v1.9.2: over-cap BlockResponse from a non-active-IBD
+                        // peer is soft-dropped instead of `return Err(RateLimitExceeded)`.
+                        // BlockResponses are responses to our earlier GetBlocks
+                        // requests — when we rotate IBD peer mid-flight, residual
+                        // legitimate responses keep arriving from the previous
+                        // peer and were striking honest peers (local soak test
+                        // 2026-05-05 caught this at sync.rs:4034 against S2).
+                        // Drop the response, keep the connection open.
                         if block_count > MAX_BLOCKS_PER_MIN {
-                            return Err(PeerError::RateLimitExceeded);
+                            tracing::debug!(
+                                "Soft-dropping BlockResponse from non-IBD peer {} (over MAX_BLOCKS_PER_MIN cap)",
+                                meta.addr
+                            );
+                            continue;
                         }
                     }
                     if self.is_ip_banned(meta.addr.ip()) {
@@ -4005,7 +4230,8 @@ impl Node {
                         );
                         invalid_block_count += 1;
                         if self.record_ip_strike(meta.addr.ip(), Some(meta.identity)) {
-                            return Err(PeerError::RateLimitExceeded);
+                            // v1.10.0: inline strike already fired — no double-strike.
+                            return Err(PeerError::DisconnectAfterInlineStrike);
                         }
                         continue;
                     }
@@ -4065,10 +4291,22 @@ impl Node {
                     if getaddr_count > MAX_GETADDR_PER_CONN {
                         // v1.7.2 Change A: skip-increment during
                         // pre-confirmation bootstrap.
+                        //
+                        // v1.9.2: over-cap unsolicited soft-drops instead of
+                        // `return Err(RateLimitExceeded)`. `getaddr_count` is
+                        // a per-connection lifetime counter (intentionally,
+                        // per expert review — not reset on the 60s window),
+                        // so a long-lived honest connection can naturally
+                        // exceed MAX_GETADDR_PER_CONN over time without
+                        // being malicious. Counter still increments;
+                        // connection stays open.
                         if self.ever_confirmed_peer.load(Ordering::Relaxed) {
                             unsolicited_count += 1;
                             if unsolicited_count > MAX_UNSOLICITED_PER_MIN {
-                                return Err(PeerError::RateLimitExceeded);
+                                tracing::debug!(
+                                    "Soft-drop over-cap GetAddr from {} (per-conn cap exceeded, MAX_UNSOLICITED_PER_MIN reached)",
+                                    meta.addr
+                                );
                             }
                         }
                         continue;
@@ -4087,10 +4325,22 @@ impl Node {
                         if unsolicited_addr_count > MAX_UNSOLICITED_ADDR_PER_MIN {
                             // v1.7.2 Change A: skip-increment during
                             // pre-confirmation bootstrap.
+                            //
+                            // v1.9.2: over-cap soft-drops instead of
+                            // `return Err(RateLimitExceeded)`. At-tip honest
+                            // peers (e.g. miners broadcasting addr-gossip
+                            // bursts when their addrbook changes) trip
+                            // MAX_UNSOLICITED_ADDR_PER_MIN=3 routinely;
+                            // striking honest peers for normal addr-gossip
+                            // was the primary path that drove the local soak-
+                            // test ban cascade against S3 (2026-05-06).
                             if self.ever_confirmed_peer.load(Ordering::Relaxed) {
                                 unsolicited_count += 1;
                                 if unsolicited_count > MAX_UNSOLICITED_PER_MIN {
-                                    return Err(PeerError::RateLimitExceeded);
+                                    tracing::debug!(
+                                        "Soft-drop over-cap Addr from {} (addr-rate exceeded, MAX_UNSOLICITED_PER_MIN reached)",
+                                        meta.addr
+                                    );
                                 }
                             }
                         }
@@ -4119,9 +4369,14 @@ impl Node {
                     });
                 }
                 _ => {
+                    // v1.10.0: post-handshake catch-all. At this point in the
+                    // match every legitimate message variant has been handled,
+                    // so this arm fires on protocol garbage (repeat Hello/
+                    // AuthAck or unknown message type). STRIKE — this is one
+                    // of the few remaining authenticated-peer abuse levers.
                     unsolicited_count += 1;
                     if unsolicited_count > MAX_UNSOLICITED_PER_MIN {
-                        return Err(PeerError::RateLimitExceeded);
+                        return Err(PeerError::ProtocolGarbage);
                     }
                 }
             }
@@ -4274,11 +4529,16 @@ impl Node {
                     }
 
                     // Check IP/identity bans
+                    //
+                    // v1.10.0: returns PeerAlreadyBanned (no-strike) instead
+                    // of RateLimitExceeded. Mirrors the handshake-time ban
+                    // check at sync.rs:3698-3705 (rev10). Was striking peers
+                    // mid-session for already being banned, double-recording.
                     if self.is_ip_banned(peer_addr.ip()) {
-                        break Err(PeerError::RateLimitExceeded);
+                        break Err(PeerError::PeerAlreadyBanned);
                     }
                     if self.is_identity_banned(&peer_identity) {
-                        break Err(PeerError::RateLimitExceeded);
+                        break Err(PeerError::PeerAlreadyBanned);
                     }
 
                     let now = Instant::now();
@@ -4353,8 +4613,21 @@ impl Node {
             return Err("failed to send to peer".into());
         }
         let headers = recv_ibd_headers(self, rx, peer_identity, session_id, deadline).await?;
+        // v1.9.2 site 7: max_count=1 IBD ancestor probe.
+        //   empty   → Ok(None); peer rate-limited or has no data, no strike.
+        //   len > 1 → Err("returned N headers..."); IBD path treats as cooldown,
+        //             no strike (no IBD-side strike plumbing in v1.9.2; deferred
+        //             to v1.9.3 follow-up).
+        //   wrong h → Err propagated (already).
         if headers.is_empty() {
             return Ok(None);
+        }
+        if headers.len() != 1 {
+            return Err(format!(
+                "ancestor probe at height {} returned {} headers, expected 1",
+                height,
+                headers.len()
+            ));
         }
         if headers[0].height != height {
             return Err(format!(
@@ -4371,20 +4644,39 @@ impl Node {
     }
 
     /// Find common ancestor between our chain and a peer using binary search.
+    ///
+    /// v1.9.2: takes the peer's claimed tip height to clamp probes. Without
+    /// the clamp, a legitimate fork-choice candidate (peer with cumulative_work
+    /// > ours but height < ours) returns empty at the initial probe at our_height,
+    /// which would then bail the search instead of finding the common ancestor.
+    /// Clamping to `min(our_height, claim_height)` ensures every probe is at-or-
+    /// below the peer's claim, where empty is unambiguously rate-limited.
     async fn find_common_ancestor_via_events(
         &self,
         peer_identity: PeerId,
         session_id: u64,
+        claim_height: u64,
         rx: &mut mpsc::Receiver<PeerEvent>,
     ) -> Result<u64, String> {
-        let our_height = self.tip.read().await.height;
+        let our_height = std::cmp::min(self.tip.read().await.height, claim_height);
         let deadline = Instant::now() + Duration::from_secs(120);
 
-        if let Some(true) = self
+        // v1.9.2 site 8: at the clamped probe height (≤ claim_height),
+        // None is unambiguously rate-limited / no-data; bail the search.
+        // Some(false) is real divergence; descend.
+        match self
             .check_shared_block_via_events(peer_identity, session_id, our_height, rx, deadline)
             .await?
         {
-            return Ok(our_height);
+            Some(true) => return Ok(our_height),
+            Some(false) => {}
+            None => {
+                return Err(format!(
+                    "peer returned no data at initial ancestor probe (clamped height {}, \
+                     claim_height {}), bailing",
+                    our_height, claim_height
+                ));
+            }
         }
 
         let mut lo: u64 = 0;
@@ -4397,7 +4689,12 @@ impl Node {
             {
                 Some(true) => lo = mid,
                 Some(false) => hi = mid.saturating_sub(1),
-                None => hi = mid.saturating_sub(1),
+                None => {
+                    return Err(format!(
+                        "peer returned no data at ancestor midpoint (height {}), bailing",
+                        mid
+                    ));
+                }
             }
         }
         Ok(lo)
@@ -4459,7 +4756,7 @@ async fn recv_ibd_headers(
 /// The wrong-identity / stale-session arm is unchanged in both modes: those
 /// are background events, not answers to our in-flight `GetBlocks`.
 async fn recv_ibd_block(
-    node: &Node,
+    node: &Arc<Node>,
     rx: &mut mpsc::Receiver<PeerEvent>,
     sync_identity: PeerId,
     sync_session_id: u64,
@@ -4542,7 +4839,7 @@ async fn recv_ibd_block(
                 }
             }
             Ok(Some(event)) => {
-                handle_background_event(node, event).await;
+                handle_background_event_with_dispatch(node, event).await;
             }
             Ok(None) => return Err("event channel closed".into()),
             Err(_) => return Err("IBD block timeout".into()),
@@ -4551,13 +4848,26 @@ async fn recv_ibd_block(
 }
 
 /// Handle a non-IBD event that arrives while waiting for an IBD response.
-async fn handle_background_event(
-    node: &Node,
+/// v1.10.0 rev10: Arc-aware background event handler that can spawn the
+/// async forward-chain tip validation. Used by IBD code paths that have
+/// `&Arc<Node>` in scope (run_ibd, recv_ibd_block). The original
+/// `&Node` variant `handle_background_event_no_spawn` is retained for
+/// method-self call sites (check_shared_block_via_events → recv_ibd_headers)
+/// that can't materialise an Arc.
+async fn handle_background_event_with_dispatch(
+    node: &Arc<Node>,
     event: PeerEvent,
 ) {
     match event {
-        PeerEvent::Connected { .. } => {
-            // Tip is already written by attach_session; nothing to do here.
+        PeerEvent::Connected { identity, .. } => {
+            // v1.10.0 rev11: send the immediate GetTip kick-off here so that
+            // peers connecting while the sync manager is inside `run_ibd`
+            // still get polled. Pre-rev11 this arm was a no-op and the only
+            // GetTip-on-Connect lived in the main sync loop at sync.rs:6977,
+            // which is blocked while run_ibd owns the scheduler. Without
+            // this poll the peer never sends a TipResponse, so the rev10
+            // background dispatch never fires for them.
+            node.send_to_peer(&identity, Message::GetTip).await;
         }
         PeerEvent::Disconnected { identity, session_id } => {
             node.peers.lock().await.detach_session_if_current(identity, session_id);
@@ -4590,17 +4900,188 @@ async fn handle_background_event(
             block_id,
             cumulative_work,
         } => {
-            // Store tip as unconfirmed — only the main sync loop verifies
-            // via header PoW before setting confirmed: true.
+            // v1.10.0 rev10: pre-rev10 this arm only stored an unconfirmed
+            // tip and relied on the main sync loop to confirm. While the
+            // main loop was inside `run_ibd`, no peer could be promoted
+            // to `confirmed: true` via this path. If the active IBD peer
+            // then failed and its session ended, the post-anchor scheduler
+            // (sync.rs:6567 requires `tip.confirmed`) had no candidate.
+            // Observed in v1.10.0 rev9 soak test: stalled at height
+            // 334,032 with S2/S3 connected but never confirmed.
+            //
+            // Fix: (1) preserve `confirmed: true` if it was already set
+            // (don't eagerly de-confirm); (2) dispatch the same async
+            // forward-chain tip validation the main loop's TipResponse
+            // handler dispatches, so the peer can be promoted to
+            // `confirmed: true` while the main loop is still in run_ibd.
+            //
+            // Genesis (height==0) and pre-Stage-A tips skip dispatch —
+            // forward-chain validation requires an authenticated anchor.
+            {
+                let mut peers = node.peers.lock().await;
+                if let Some(lp) = peers.get_mut_by_identity(&from_identity) {
+                    if lp.session.as_ref().is_some_and(|s| s.session_id == session_id) {
+                        let preserve_confirmed = lp.tip.as_ref().is_some_and(|t| t.confirmed);
+                        if !preserve_confirmed {
+                            lp.tip = Some(PeerTip {
+                                height,
+                                cumulative_work,
+                                block_id,
+                                confirmed: false,
+                            });
+                        }
+                    }
+                }
+            }
+            if height == 0 || !node.ever_confirmed_peer.load(Ordering::Relaxed) {
+                return;
+            }
+            if node
+                .tip_validation_coord
+                .is_active(from_identity, session_id)
+                .await
+            {
+                return;
+            }
+            let our_h = node.tip.read().await.height;
+            let regime = crate::network::tip_validation::ValidationRegime::select(
+                our_h,
+                node.assume_valid,
+            );
+            let path_2b_usable = matches!(
+                regime,
+                crate::network::tip_validation::ValidationRegime::Bootstrap
+            )
+                && node.assume_valid
+                && node
+                    .assume_valid_cumulative_work_trusted
+                    .load(Ordering::SeqCst);
+            let dispatch_forward = matches!(
+                regime,
+                crate::network::tip_validation::ValidationRegime::SteadyState
+            ) || path_2b_usable;
+            if !dispatch_forward {
+                return;
+            }
+            let reserved = node
+                .tip_validation_coord
+                .try_reserve(from_identity, session_id)
+                .await;
+            if !reserved {
+                return;
+            }
+            let peer_ip_opt = {
+                let peers = node.peers.lock().await;
+                peers
+                    .get_by_identity(&from_identity)
+                    .and_then(|lp| lp.session.as_ref().map(|s| s.socket_addr.ip()))
+            };
+            if let Some(peer_ip) = peer_ip_opt {
+                let node_arc = Arc::clone(node);
+                tokio::spawn(async move {
+                    let result = run_tip_forward_validation(
+                        node_arc.clone(),
+                        from_identity,
+                        session_id,
+                        peer_ip,
+                        height,
+                        block_id,
+                    )
+                    .await;
+                    if result.record_strike {
+                        node_arc.record_ip_strike(peer_ip, Some(from_identity));
+                    }
+                    if let Ok(vt) = &result.outcome {
+                        let mut peers = node_arc.peers.lock().await;
+                        if let Some(lp) = peers.get_mut_by_identity(&from_identity) {
+                            if lp.session.as_ref().is_some_and(|s| s.session_id == session_id) {
+                                lp.tip = Some(PeerTip {
+                                    height: vt.height,
+                                    cumulative_work: vt.verified_cumulative_work,
+                                    block_id: vt.block_id,
+                                    confirmed: true,
+                                });
+                                node_arc.ever_confirmed_peer.store(true, Ordering::Relaxed);
+                                lp.last_useful_message_at = Some(Instant::now());
+                            }
+                        }
+                        info!(
+                            "Background forward-chain tip validation ok: peer {:?} height {} forward_headers {}",
+                            &from_identity[..4], vt.height, vt.headers_validated
+                        );
+                    } else if let Err(e) = &result.outcome {
+                        use crate::network::tip_validation::TipValidationError;
+                        match e {
+                            TipValidationError::NoSlotAvailable
+                            | TipValidationError::PeerNoForwardData(_) => {
+                                tracing::debug!(
+                                    "Background forward-chain validation: peer {:?} no-strike outcome: {}",
+                                    &from_identity[..4], e
+                                );
+                            }
+                            _ => {
+                                warn!(
+                                    "Background forward-chain tip validation failed for peer {:?}: {}",
+                                    &from_identity[..4], e
+                                );
+                            }
+                        }
+                    }
+                    node_arc
+                        .tip_validation_coord
+                        .release_reservation(from_identity, session_id)
+                        .await;
+                });
+            } else {
+                node.tip_validation_coord
+                    .release_reservation(from_identity, session_id)
+                    .await;
+            }
+        }
+    }
+}
+
+/// v1.10.0 rev10: no-spawn variant of `handle_background_event_with_dispatch`.
+/// Used by `recv_ibd_headers` (called from `check_shared_block_via_events`,
+/// a `&self` method on `Node` that can't construct `Arc<Self>`). Stores
+/// TipResponse as unconfirmed only — does NOT dispatch async forward-chain
+/// validation, so peers whose TipResponse arrives during the brief
+/// ancestor-search window won't be promoted to `confirmed: true` until
+/// the next event is delivered to a spawn-capable handler. This is an
+/// acceptable trade-off because ancestor search is short (sub-second)
+/// and TipResponses keep arriving from peers periodically.
+async fn handle_background_event(node: &Node, event: PeerEvent) {
+    match event {
+        PeerEvent::Connected { identity, .. } => {
+            // v1.10.0 rev11: same kick-off as the spawn-capable variant.
+            // recv_ibd_headers is the only caller of this no-spawn variant
+            // (via Node::check_shared_block_via_events), and it runs only
+            // during the brief ancestor-search window. Sending GetTip here
+            // is safe — no spawn required.
+            node.send_to_peer(&identity, Message::GetTip).await;
+        }
+        PeerEvent::Disconnected { identity, session_id } => {
+            node.peers.lock().await.detach_session_if_current(identity, session_id);
+        }
+        PeerEvent::NewBlock { from, from_identity, session_id, block, pre_validated } => {
+            process_block_event(node, from, from_identity, session_id, block, pre_validated).await;
+        }
+        PeerEvent::BlockResponse { from, from_identity, session_id, block, pre_validated } => {
+            process_block_event(node, from, from_identity, session_id, block, pre_validated).await;
+        }
+        PeerEvent::HeadersResponse { .. } => {}
+        PeerEvent::TipResponse {
+            from_identity, session_id, height, block_id, cumulative_work,
+        } => {
             let mut peers = node.peers.lock().await;
             if let Some(lp) = peers.get_mut_by_identity(&from_identity) {
                 if lp.session.as_ref().is_some_and(|s| s.session_id == session_id) {
-                    lp.tip = Some(PeerTip {
-                        height,
-                        cumulative_work,
-                        block_id,
-                        confirmed: false,
-                    });
+                    let preserve_confirmed = lp.tip.as_ref().is_some_and(|t| t.confirmed);
+                    if !preserve_confirmed {
+                        lp.tip = Some(PeerTip {
+                            height, cumulative_work, block_id, confirmed: false,
+                        });
+                    }
                 }
             }
         }
@@ -5181,7 +5662,7 @@ async fn stage_a_inner(
 /// `assume_valid_verified` is already true by the time this runs (set by the
 /// Stage A coordinator before calling into `run_ibd`).
 async fn run_stage_b_below_or_at_anchor(
-    node: &Node,
+    node: &Arc<Node>,
     rx: &mut mpsc::Receiver<PeerEvent>,
     peer_identity: PeerId,
     session_id: u64,
@@ -5390,7 +5871,7 @@ async fn flip_stage_b_anchor_apply(node: &Node, peer_identity: PeerId) {
 
 /// Run IBD (Initial Block Download) from a specific peer.
 async fn run_ibd(
-    node: &Node,
+    node: &Arc<Node>,
     rx: &mut mpsc::Receiver<PeerEvent>,
     peer_identity: PeerId,
     session_id: u64,
@@ -5404,7 +5885,7 @@ async fn run_ibd(
     };
 
     let fork_point = node
-        .find_common_ancestor_via_events(peer_identity, session_id, rx)
+        .find_common_ancestor_via_events(peer_identity, session_id, their_height, rx)
         .await?;
 
     info!(
@@ -5473,9 +5954,27 @@ async fn run_ibd(
         let deadline = Instant::now() + Duration::from_secs(120);
         let headers = recv_ibd_headers(node, rx, peer_identity, session_id, deadline).await?;
 
+        // v1.9.2 site 9: multi-header IBD batch fetch.
+        //   empty       → Err propagated; IBD path applies 60s cooldown, no
+        //                 strike (no IBD-side strike plumbing in v1.9.2).
+        //   len > batch → Err propagated; treated identically to empty.
+        //   shorter     → process; outer loop advances by headers.len() and
+        //                 re-requests the remainder on the next iteration
+        //                 (preserve existing tolerance — short non-empty
+        //                 batches are honest under partial responses).
+        //   wrong h     → Err propagated (already).
         if headers.is_empty() {
             return Err(format!(
                 "peer returned empty headers at height {}",
+                current_height
+            ));
+        }
+
+        if headers.len() > batch_size as usize {
+            return Err(format!(
+                "peer returned {} headers but requested at most {} at height {}",
+                headers.len(),
+                batch_size,
                 current_height
             ));
         }
@@ -6376,7 +6875,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                     }
                                 }
                                 Ok(Some(other)) => {
-                                    handle_background_event(&node, other).await;
+                                    handle_background_event_with_dispatch(&node, other).await;
                                 }
                                 Ok(None) => break,
                                 Err(_) => {}
@@ -6504,17 +7003,31 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 block_id,
                 cumulative_work,
             })) => {
-                // Store the claim as unconfirmed first
+                // v1.10.0 rev10: don't eagerly de-confirm. If the peer's
+                // tip was previously `confirmed: true`, leave it in place
+                // until the validation flow below succeeds; the success
+                // path overwrites with the new claim + confirmed: true.
+                // Without this preservation, a transient validation
+                // failure (timeout, empty header response, mid-validation
+                // disconnect) on a routine tip-poll silently strips the
+                // peer's IBD eligibility — observed during v1.10.0 rev9
+                // soak-test stall at height 334,032 where the only
+                // confirmed peer was de-confirmed while [130,220,26,241]'s
+                // session was still alive, leaving zero IBD candidates
+                // for the post-anchor scheduler.
                 {
                     let mut peers = node.peers.lock().await;
                     if let Some(lp) = peers.get_mut_by_identity(&from_identity) {
                         if lp.session.as_ref().is_some_and(|s| s.session_id == session_id) {
-                            lp.tip = Some(PeerTip {
-                                height,
-                                cumulative_work,
-                                block_id,
-                                confirmed: false,
-                            });
+                            let preserve_confirmed = lp.tip.as_ref().is_some_and(|t| t.confirmed);
+                            if !preserve_confirmed {
+                                lp.tip = Some(PeerTip {
+                                    height,
+                                    cumulative_work,
+                                    block_id,
+                                    confirmed: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -6572,6 +7085,30 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                     session_id: hdr_sid,
                                     headers,
                                 })) if hdr_id == from_identity && hdr_sid == session_id => {
+                                    // v1.9.2 site 1: empty response = peer rate-limited or has
+                                    // no data at the claimed height. Wire-indistinguishable from
+                                    // a budget-exhausted responder, so suppress the legacy
+                                    // failed-PoW strike. Next TipResponse from this peer triggers
+                                    // a fresh attempt once the responder's per-minute byte budget
+                                    // refills.
+                                    if headers.is_empty() {
+                                        debug!(
+                                            "Peer {:?} returned empty headers for tip-followup at height {} — no strike, will retry on next TipResponse",
+                                            &from_identity[..4], height
+                                        );
+                                        dispatched_async = true;
+                                        break;
+                                    }
+                                    // v1.9.2 site 1: max_count=1 was requested; anything else is
+                                    // a protocol violation. Bail with verified=false /
+                                    // dispatched_async=false so the post-loop strike branch fires.
+                                    if headers.len() != 1 {
+                                        warn!(
+                                            "Peer {:?} returned {} headers for max_count=1 tip-followup at height {} — malformed",
+                                            &from_identity[..4], headers.len(), height
+                                        );
+                                        break;
+                                    }
                                     if let Some(header) = headers.first() {
                                         let hdr_block_id = header.block_id();
                                         // Bind header to claimed height AND block_id
@@ -6690,28 +7227,39 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                                                 &from_identity[..4], vt.height, vt.headers_validated
                                                             );
                                                         } else if let Err(e) = &result.outcome {
-                                                            // Demote expected rate-limit hits to debug; log real
-                                                            // validation failures at warn. NoSlotAvailable is an
-                                                            // expected back-pressure signal when many peers send
-                                                            // TipResponses concurrently (post-anchor transition
-                                                            // commonly floods this), not a security-relevant
-                                                            // failure. Previously logged at warn with a stale
-                                                            // "v1.5.0 Fix 2" prefix that misled users into
-                                                            // thinking they were running v1.5.x — see v1.8.1
-                                                            // release notes.
-                                                            if matches!(
-                                                                e,
-                                                                crate::network::tip_validation::TipValidationError::NoSlotAvailable
-                                                            ) {
-                                                                tracing::debug!(
-                                                                    "Forward-chain tip validation slot unavailable for peer {:?} (rate-limit; expected under load)",
-                                                                    &from_identity[..4]
-                                                                );
-                                                            } else {
-                                                                warn!(
-                                                                    "Forward-chain tip validation failed for peer {:?}: {}",
-                                                                    &from_identity[..4], e
-                                                                );
+                                                            // Demote expected rate-limit / no-data hits to debug;
+                                                            // log real validation failures at warn. NoSlotAvailable
+                                                            // is an expected back-pressure signal when many peers
+                                                            // send TipResponses concurrently (post-anchor
+                                                            // transition commonly floods this), not a security-
+                                                            // relevant failure. v1.9.2 PeerNoForwardData is the
+                                                            // honest "peer rate-limited, returned empty Headers"
+                                                            // signal that drove the empty-batch IBD-cascade fix —
+                                                            // demoting it avoids re-creating warn-spam under the
+                                                            // exact scenario this release silences. Previously
+                                                            // logged at warn with a stale "v1.5.0 Fix 2" prefix
+                                                            // that misled users into thinking they were running
+                                                            // v1.5.x — see v1.8.1 release notes.
+                                                            use crate::network::tip_validation::TipValidationError;
+                                                            match e {
+                                                                TipValidationError::NoSlotAvailable => {
+                                                                    tracing::debug!(
+                                                                        "Forward-chain tip validation slot unavailable for peer {:?} (rate-limit; expected under load)",
+                                                                        &from_identity[..4]
+                                                                    );
+                                                                }
+                                                                TipValidationError::PeerNoForwardData(m) => {
+                                                                    tracing::debug!(
+                                                                        "Forward-chain tip validation: peer {:?} returned no data ({}); will retry on next TipResponse",
+                                                                        &from_identity[..4], m
+                                                                    );
+                                                                }
+                                                                _ => {
+                                                                    warn!(
+                                                                        "Forward-chain tip validation failed for peer {:?}: {}",
+                                                                        &from_identity[..4], e
+                                                                    );
+                                                                }
                                                             }
                                                         }
                                                         // Always release reservation so a later GetTip
@@ -6757,7 +7305,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                 }
                                 Ok(Some(other)) => {
                                     // Handle other events while waiting
-                                    handle_background_event(&node, other).await;
+                                    handle_background_event_with_dispatch(&node, other).await;
                                 }
                                 _ => break,
                             }
@@ -7024,11 +7572,23 @@ pub async fn run_tip_forward_validation(
                 return Err(TipValidationError::PeerDisconnected);
             }
             let hdrs = await_header_batch(&mut subscriber).await?;
-            let hdr = hdrs.first().ok_or_else(|| {
-                TipValidationError::DeliveredInvalidHeader(
+            // v1.9.2 site 2: max_count=1 checkpoint-header probe.
+            //   empty   → PeerNoForwardData (no strike); peer rate-limited.
+            //   len > 1 → DeliveredInvalidHeader (strike); protocol violation.
+            //   wrong h → DeliveredInvalidHeader (strike); preserved.
+            //   wrong b → DeliveredInvalidHeader (strike); preserved.
+            if hdrs.is_empty() {
+                return Err(TipValidationError::PeerNoForwardData(
                     "empty response to checkpoint-header request".into(),
-                )
-            })?;
+                ));
+            }
+            if hdrs.len() != 1 {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "checkpoint fetch returned {} headers, expected 1",
+                    hdrs.len()
+                )));
+            }
+            let hdr = &hdrs[0];
             if hdr.height != ASSUME_VALID_HEIGHT {
                 return Err(TipValidationError::DeliveredInvalidHeader(format!(
                     "peer returned height {} for checkpoint request at {}",
@@ -7051,7 +7611,20 @@ pub async fn run_tip_forward_validation(
             ));
         } else {
             // Path 2a: binary-search common ancestor.
-            let our_height = our_height_start;
+            //
+            // v1.9.2: clamp the probe height to `min(our_height, claim_height)`.
+            // The peer cannot have headers above their own claimed tip, so a
+            // probe above `claim_height` would legitimately return empty —
+            // wire-indistinguishable from rate-limiting. Clamping to claim_height
+            // means every probe is at-or-below the peer's claim, where empty is
+            // unambiguously the rate-limited / no-data case (peer has a gap),
+            // not a higher-work-shorter-chain peer responding honestly.
+            //
+            // Without this clamp, a legitimate fork-choice candidate (peer
+            // with cumulative_work > ours but height < ours) returns empty at
+            // the initial probe, which would then bail validation entirely
+            // instead of finding the common ancestor below.
+            let our_height = std::cmp::min(our_height_start, claim_height);
             let hdrs = {
                 if !node
                     .send_to_session(peer_identity, session_id, build_get_headers(our_height, 1))
@@ -7061,16 +7634,40 @@ pub async fn run_tip_forward_validation(
                 }
                 await_header_batch(&mut subscriber).await?
             };
-            let anchor_at_our_tip = hdrs.first().is_some_and(|h| {
-                h.height == our_height
-                    && node
-                        .storage
-                        .get_block_id_by_height(our_height)
-                        .ok()
-                        .flatten()
-                        == Some(h.block_id())
-            });
-            let ancestor_h = if anchor_at_our_tip {
+            // v1.9.2 site 3: max_count=1 initial ancestor probe at clamped
+            // height (≤ claim_height).
+            //   empty   → PeerNoForwardData (bail no-strike); rate-limited.
+            //   len > 1 → DeliveredInvalidHeader (strike); protocol violation.
+            //   wrong h → DeliveredInvalidHeader (strike); protocol violation.
+            //   match   → anchor at clamped probe height (no fork below).
+            //   diverge → fall into binary search.
+            if hdrs.is_empty() {
+                return Err(TipValidationError::PeerNoForwardData(format!(
+                    "empty response to ancestor probe at clamped height {} \
+                     (our_height_start={}, claim_height={})",
+                    our_height, our_height_start, claim_height
+                )));
+            }
+            if hdrs.len() != 1 {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "ancestor probe at height {} returned {} headers, expected 1",
+                    our_height,
+                    hdrs.len()
+                )));
+            }
+            if hdrs[0].height != our_height {
+                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                    "ancestor probe returned height {}, expected {}",
+                    hdrs[0].height, our_height
+                )));
+            }
+            let anchor_at_clamped_probe = node
+                .storage
+                .get_block_id_by_height(our_height)
+                .ok()
+                .flatten()
+                == Some(hdrs[0].block_id());
+            let ancestor_h = if anchor_at_clamped_probe {
                 our_height
             } else {
                 let mut lo: u64 = 0;
@@ -7087,10 +7684,37 @@ pub async fn run_tip_forward_validation(
                         return Err(TipValidationError::PeerDisconnected);
                     }
                     let hdrs = await_header_batch(&mut subscriber).await?;
-                    let peer_bid = hdrs.first().filter(|h| h.height == mid).map(|h| h.block_id());
+                    // v1.9.2 site 4: max_count=1 ancestor midpoint probe.
+                    // Bounds clamped above, so mid ≤ claim_height; empty here
+                    // is unambiguously rate-limited / no-data.
+                    //   empty   → PeerNoForwardData (bail no-strike).
+                    //   len > 1 → DeliveredInvalidHeader (strike).
+                    //   wrong h → DeliveredInvalidHeader (strike).
+                    //   match   → lo = mid (continue search up).
+                    //   diverge → hi = mid - 1 (continue search down, no strike).
+                    if hdrs.is_empty() {
+                        return Err(TipValidationError::PeerNoForwardData(format!(
+                            "empty response to ancestor midpoint probe at height {}",
+                            mid
+                        )));
+                    }
+                    if hdrs.len() != 1 {
+                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                            "ancestor midpoint probe at height {} returned {} headers, expected 1",
+                            mid,
+                            hdrs.len()
+                        )));
+                    }
+                    if hdrs[0].height != mid {
+                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                            "ancestor midpoint probe returned height {}, expected {}",
+                            hdrs[0].height, mid
+                        )));
+                    }
+                    let peer_bid = hdrs[0].block_id();
                     let our_bid = node.storage.get_block_id_by_height(mid).ok().flatten();
-                    match (peer_bid, our_bid) {
-                        (Some(p), Some(o)) if p == o => lo = mid,
+                    match our_bid {
+                        Some(o) if o == peer_bid => lo = mid,
                         _ => hi = mid.saturating_sub(1),
                     }
                 }
@@ -7184,16 +7808,24 @@ pub async fn run_tip_forward_validation(
                         return Err(TipValidationError::PeerDisconnected);
                     }
                     let batch = await_header_batch(&mut subscriber).await?;
-                    if batch.is_empty()
-                        || batch[0].height != next_h
-                        || batch.len() > count as usize
-                    {
+                    // v1.9.2 site 5: multi-header pre-checkpoint lookback batch.
+                    //   empty   → PeerNoForwardData (no strike); rate-limited.
+                    //   overrun → DeliveredInvalidHeader (strike).
+                    //   wrong h → DeliveredInvalidHeader (strike).
+                    //   shorter → process and re-request remainder on next iter.
+                    if batch.is_empty() {
+                        return Err(TipValidationError::PeerNoForwardData(format!(
+                            "empty pre-checkpoint batch at start_height {}",
+                            next_h
+                        )));
+                    }
+                    if batch[0].height != next_h || batch.len() > count as usize {
                         return Err(TipValidationError::DeliveredInvalidHeader(format!(
                             "malformed pre-checkpoint batch at start_height {}: len {}, first \
-                             height {:?} (expected start {}, max {})",
+                             height {} (expected start {}, max {})",
                             next_h,
                             batch.len(),
-                            batch.first().map(|h| h.height),
+                            batch[0].height,
                             next_h,
                             count
                         )));
@@ -7259,8 +7891,16 @@ pub async fn run_tip_forward_validation(
                 return Err(TipValidationError::PeerDisconnected);
             }
             let batch = await_header_batch(&mut subscriber).await?;
+            // v1.9.2 site 6: multi-header forward-walk batch.
+            //   empty   → PeerNoForwardData (no strike); rate-limited responder.
+            //             Originally raised "delivered invalid header: empty
+            //             forward batch", which struck honest peers and drove
+            //             the IBD-cascade ban.
+            //   overrun → DeliveredInvalidHeader (strike).
+            //   wrong h → DeliveredInvalidHeader (strike).
+            //   shorter → process; loop re-requests remainder on next iter.
             if batch.is_empty() {
-                return Err(TipValidationError::DeliveredInvalidHeader(format!(
+                return Err(TipValidationError::PeerNoForwardData(format!(
                     "empty forward batch starting at height {}",
                     next_height
                 )));
