@@ -1,6 +1,6 @@
 ---
 name: exfer
-version: 1.0.0
+version: 1.1.0
 description: >
   Exfer is a permissionless proof-of-work blockchain for autonomous machine-to-machine
   commerce. It combines Argon2id memory-hard mining, an extended UTXO model, and Exfer
