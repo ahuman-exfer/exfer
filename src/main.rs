@@ -3018,14 +3018,18 @@ fn replay_chain(
             }
         }
 
-        // Full transaction validation with automatic rollback on failure
-        let (_fees, spent_utxos) = validate_and_apply_block_transactions_atomic(&block, utxo_set)
+        // Full transaction validation with automatic rollback on failure.
+        // `spent_utxos` was historically re-persisted here; it's already on
+        // disk from the original commit (see below), so the value is only
+        // used for the in-memory state mutation that `validate_and_apply_*`
+        // performs internally.
+        let (_fees, _spent_utxos) = validate_and_apply_block_transactions_atomic(&block, utxo_set)
             .map_err(|e| {
-            format!(
-                "block transaction validation failed at height {}: {:?}",
-                block.header.height, e
-            )
-        })?;
+                format!(
+                    "block transaction validation failed at height {}: {:?}",
+                    block.header.height, e
+                )
+            })?;
 
         // TX indexing during replay is deferred — commit_block_atomic and
         // commit_reorg_atomic index new blocks as they arrive. Doing per-block
@@ -3041,21 +3045,20 @@ fn replay_chain(
             ));
         }
 
-        // Persist spent-UTXO metadata so reorg undo works
-        storage
-            .store_spent_utxos(&block_id, &spent_utxos)
-            .map_err(|e| {
-                format!(
-                    "failed to store spent UTXOs at height {}: {}",
-                    block.header.height, e
-                )
-            })?;
-
+        // NOTE: `store_spent_utxos` and `put_cumulative_work` were called
+        // here per-block in earlier versions, but both are *already*
+        // persisted atomically by `commit_block_atomic` /
+        // `commit_reorg_atomic` (chain/storage.rs) when the block first
+        // arrives. Re-writing them on every replay was duplicate I/O —
+        // 2 extra redb write transactions per block, each with its own
+        // fsync. At chain heights in the 100k+ range this dominated
+        // replay wall time on slow / network-attached storage.
+        //
+        // Atomicity invariant: if `storage.get_block(&block_id)` succeeded
+        // above, then the commit transaction that wrote the block also
+        // wrote spent_utxos + cumulative_work, so they are present.
         let block_work = work_from_target(&block.header.difficulty_target);
         cumulative_work = add_work(&cumulative_work, &block_work);
-        storage
-            .put_cumulative_work(&block_id, &cumulative_work)
-            .map_err(|e| format!("failed to store work at height {}: {}", height, e))?;
 
         // Progress logging every 1000 blocks
         if (height + 1) % 1000 == 0 || height == tip_height {
