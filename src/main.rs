@@ -2407,26 +2407,16 @@ fn rebuild_utxo_set_inner(datadir: &Path) -> Result<(UtxoSet, u64), String> {
             })?;
         }
 
-        // Use the same assume-valid fast path as startup replay: blocks at
-        // or below the checkpoint were validated when first imported, so
-        // wallet replay can skip per-input signature/script verification.
-        // The downstream per-block state-root check still detects any
-        // mis-application bug.
-        let skip_tx_validation = wallet_assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
-        let apply_result = if skip_tx_validation {
-            apply_block_transactions_assume_valid(&block, &mut utxo_set)
-        } else {
-            validate_and_apply_block_transactions_atomic(&block, &mut utxo_set)
-        };
-        let (_fees, _spent_utxos) = apply_result.map_err(|e| {
-            format!(
-                "block transaction {} failed at height {}: {:?}",
-                if skip_tx_validation { "apply" } else { "validation" },
-                height,
-                e
-            )
-        })?;
+        let (_fees, spent_utxos) =
+            validate_and_apply_block_transactions_atomic(&block, &mut utxo_set).map_err(|e| {
+                format!(
+                    "block transaction validation failed at height {}: {:?}",
+                    height, e
+                )
+            })?;
+
         // Wallet replay is read-only — do NOT write spent-UTXO metadata here.
+        let _ = spent_utxos; // silence unused warning
 
         // State root verification
         let computed = utxo_set.state_root();
