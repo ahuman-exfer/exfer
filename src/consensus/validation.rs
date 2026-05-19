@@ -1877,6 +1877,27 @@ mod tests {
 
     use crate::consensus::reward::block_reward;
     use crate::types::transaction::{TxInput, TxOutput, TxWitness};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Deterministic Ed25519 keypair for tests. Seed must not collide with
+    /// any small-order point — these are explicit values known safe.
+    fn signing_key_from_seed(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build a Phase 1 witness (`pubkey || signature`) for a given tx.
+    fn phase1_witness_for(tx: &Transaction, signer: &SigningKey) -> TxWitness {
+        let msg = tx.sig_message().unwrap();
+        let sig = signer.sign(&msg).to_bytes();
+        let pubkey = signer.verifying_key().to_bytes();
+        let mut bytes = Vec::with_capacity(96);
+        bytes.extend_from_slice(&pubkey);
+        bytes.extend_from_slice(&sig);
+        TxWitness {
+            witness: bytes,
+            redeemer: None,
+        }
+    }
 
     fn coinbase_tx(height: u64, pubkey: &[u8; 32]) -> Transaction {
         Transaction {
@@ -2035,5 +2056,171 @@ mod tests {
             "UTXO state must be rolled back"
         );
         assert_eq!(utxo.len(), pre_len);
+    }
+
+    /// Real-spend parity: a single non-coinbase tx with a valid Ed25519
+    /// signature. Both paths must accept it and produce byte-identical
+    /// `(fees, spent_utxos)` plus the same post-apply state_root.
+    ///
+    /// This exercises the new function's fee-derivation
+    /// (`input_sum - output_sum`), spent_utxos collection, and the apply
+    /// step — none of which the coinbase-only parity test reached.
+    #[test]
+    fn apply_assume_valid_matches_validated_with_real_signed_spend() {
+        let signer_a = signing_key_from_seed(0x11);
+        let pubkey_a: [u8; 32] = signer_a.verifying_key().to_bytes();
+        let pubkey_b: [u8; 32] = signing_key_from_seed(0x22).verifying_key().to_bytes();
+
+        // Pre-fund: coinbase at height 1 paying pubkey_a.
+        let cb_funding = coinbase_tx(1, &pubkey_a);
+        let cb_funding_tx_id = cb_funding.tx_id().unwrap();
+        let reward_1 = block_reward(1);
+
+        // Build two identical UTXO sets, seeded with the funding output.
+        let mut utxo_v = UtxoSet::new();
+        let mut utxo_a = UtxoSet::new();
+        utxo_v.apply_transaction(&cb_funding, 1).unwrap();
+        utxo_a.apply_transaction(&cb_funding, 1).unwrap();
+
+        // Build the block: coinbase + spend tx that consumes pubkey_a's
+        // output and pays pubkey_b. Block height must clear COINBASE_MATURITY
+        // (360) — the validated path enforces that.
+        let block_height = COINBASE_MATURITY + 5;
+        let fee = 1_000u64;
+        let spend_value = reward_1 - fee;
+        let cb_at_block = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: Hash256::ZERO,
+                output_index: block_height as u32,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(
+                block_reward(block_height) + fee,
+                &pubkey_a,
+            )],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        // Spend skeleton (no witness yet), then sign + attach witness.
+        let mut spend = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: cb_funding_tx_id,
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(spend_value, &pubkey_b)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        spend.witnesses[0] = phase1_witness_for(&spend, &signer_a);
+        let block = make_block_with(block_height, vec![cb_at_block, spend], Hash256::ZERO);
+
+        let (fees_v, spent_v) =
+            validate_and_apply_block_transactions_atomic(&block, &mut utxo_v).unwrap();
+        let (fees_a, spent_a) = apply_block_transactions_assume_valid(&block, &mut utxo_a).unwrap();
+
+        assert_eq!(fees_v, fee, "validated path computed wrong fee");
+        assert_eq!(fees_a, fees_v, "fees must match validated path");
+        assert_eq!(spent_a, spent_v, "spent_utxos must match validated path");
+        assert_eq!(
+            utxo_a.state_root(),
+            utxo_v.state_root(),
+            "post-apply state_root must match"
+        );
+    }
+
+    /// Intra-block dependency parity: tx_B spends an output created by tx_A
+    /// in the *same* block. This is the subtle case where `spent_utxos`
+    /// snapshot logic must capture the intermediate output between apply of
+    /// tx_A and apply of tx_B (it's not in storage; it lives only in the
+    /// transient utxo_set state). Both paths must agree.
+    #[test]
+    fn apply_assume_valid_matches_validated_with_intra_block_dependency() {
+        let signer_a = signing_key_from_seed(0x33);
+        let pubkey_a: [u8; 32] = signer_a.verifying_key().to_bytes();
+        let signer_b = signing_key_from_seed(0x44);
+        let pubkey_b: [u8; 32] = signer_b.verifying_key().to_bytes();
+        let pubkey_c: [u8; 32] = signing_key_from_seed(0x55).verifying_key().to_bytes();
+
+        // Pre-fund: coinbase at height 1 to pubkey_a.
+        let cb_funding = coinbase_tx(1, &pubkey_a);
+        let cb_funding_tx_id = cb_funding.tx_id().unwrap();
+        let reward_1 = block_reward(1);
+
+        let mut utxo_v = UtxoSet::new();
+        let mut utxo_a = UtxoSet::new();
+        utxo_v.apply_transaction(&cb_funding, 1).unwrap();
+        utxo_a.apply_transaction(&cb_funding, 1).unwrap();
+
+        let block_height = COINBASE_MATURITY + 10;
+
+        // tx_A: A → B (consumes pre-funded coinbase, sends to B).
+        let fee_a = 500u64;
+        let a_to_b_value = reward_1 - fee_a;
+        let mut tx_a = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: cb_funding_tx_id,
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(a_to_b_value, &pubkey_b)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        tx_a.witnesses[0] = phase1_witness_for(&tx_a, &signer_a);
+        let tx_a_id = tx_a.tx_id().unwrap();
+
+        // tx_B: B → C (consumes tx_A's output — created in *this same block*).
+        let fee_b = 700u64;
+        let b_to_c_value = a_to_b_value - fee_b;
+        let mut tx_b = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: tx_a_id,
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(b_to_c_value, &pubkey_c)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        tx_b.witnesses[0] = phase1_witness_for(&tx_b, &signer_b);
+
+        let total_fees = fee_a + fee_b;
+        let cb_at_block = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: Hash256::ZERO,
+                output_index: block_height as u32,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(
+                block_reward(block_height) + total_fees,
+                &pubkey_a,
+            )],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        let block = make_block_with(block_height, vec![cb_at_block, tx_a, tx_b], Hash256::ZERO);
+
+        let (fees_v, spent_v) =
+            validate_and_apply_block_transactions_atomic(&block, &mut utxo_v).unwrap();
+        let (fees_a, spent_a) = apply_block_transactions_assume_valid(&block, &mut utxo_a).unwrap();
+
+        assert_eq!(fees_v, total_fees);
+        assert_eq!(fees_a, fees_v);
+        // Both spent_utxos lists must include the intra-block dependency
+        // (tx_A's output being consumed by tx_B). Two entries total: one
+        // pre-block (the funding coinbase) and one intra-block (tx_A → tx_B).
+        assert_eq!(spent_a.len(), 2);
+        assert_eq!(spent_a, spent_v, "spent_utxos (incl. intra-block) must match");
+        assert_eq!(
+            utxo_a.state_root(),
+            utxo_v.state_root(),
+            "post-apply state_root must match"
+        );
     }
 }
