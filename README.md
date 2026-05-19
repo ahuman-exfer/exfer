@@ -35,6 +35,14 @@ Run:
 - [EXFER.md](EXFER.md) — protocol specification
 - [SECURITY.md](SECURITY.md) — security considerations
 
+
+## Developer SDKs
+
+| Language | Package | Repository |
+|---|---|---|
+| JavaScript / TypeScript | [exfer-js](https://www.npmjs.com/package/exfer-js) | [exferdev/exfer-js](https://github.com/exferdev/exfer-js) |
+
+
 ## License
 
 MIT
