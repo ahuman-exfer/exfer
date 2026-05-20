@@ -1,4 +1,5 @@
 pub mod fork_choice;
+pub mod open;
 pub mod smt;
 pub mod state;
 pub mod storage;
