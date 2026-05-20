@@ -76,3 +76,7 @@ path = "src/bin/covenant_test2.rs"
 [[bin]]
 name = "stress_test"
 path = "src/bin/stress_test.rs"
+
+[[bin]]
+name = "bench_phase3a"
+path = "src/bin/bench_phase3a.rs"
