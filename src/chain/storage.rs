@@ -954,12 +954,28 @@ impl ChainStorage {
     /// All new-chain blocks are (re-)inserted into BLOCKS_TABLE/HEADERS_TABLE
     /// to prevent a race where fork eviction deletes an ancestor's data
     /// between the reorg walk and this commit.
+    /// Phase 3a — `old_chain_blocks` is the list of orphaned blocks (the
+    /// reorg's losing branch, in any order — UTXOS_TABLE undo iterates them
+    /// regardless of order since each block's effect is reversible
+    /// independently). For each orphan: outputs are removed from
+    /// UTXOS_TABLE (looked up from the block body) and previously-spent
+    /// UTXOs are re-inserted (read from the existing SPENT_UTXOS_TABLE
+    /// row — same source the in-memory `undo_block_transactions` uses, so
+    /// no drift between in-memory and on-disk views).
+    ///
+    /// `new_chain_mutations` is aligned to `new_chain_blocks` (oldest-first)
+    /// and contains each block's full mutation log from
+    /// `validate_and_apply_block_transactions_atomic`. UTXOS_TABLE
+    /// forward-applies these inside the same write_txn, keeping the
+    /// in-memory UtxoSet and on-disk snapshot in lockstep.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_reorg_atomic(
         &self,
         trigger_block: &Block,
         cumulative_work: &[u8; 32],
+        old_chain_blocks: &[Block],
         new_chain_spent: &[(Hash256, Vec<(OutPoint, UtxoEntry)>)],
+        new_chain_mutations: &[(Hash256, Vec<UtxoMutation>)],
         new_chain_heights: &[(u64, Hash256)],
         new_chain_blocks: &[Block],
         new_chain_work: &[(Hash256, [u8; 32])],
@@ -1085,6 +1101,59 @@ impl ChainStorage {
                         tx_idx.insert(tid.as_bytes().as_ref(), blk.header.height)?;
                     }
                 }
+            }
+
+            // Phase 3a — keep UTXOS_TABLE consistent with the post-reorg
+            // in-memory UtxoSet. Two passes inside the same write_txn:
+            //
+            // 1. Undo orphans on disk by reversing their per-block effect:
+            //    remove every output (block body), re-insert every spent
+            //    UTXO (read from SPENT_UTXOS_TABLE — same source the
+            //    in-memory undo_block_transactions reads, so the two
+            //    derivations cannot drift).
+            //
+            // 2. Apply new chain mutations forward via the same helper that
+            //    commit_block_atomic uses, in oldest-first order.
+            {
+                let mut utxos = write_txn.open_table(UTXOS_TABLE)?;
+                let spent_table = write_txn.open_table(SPENT_UTXOS_TABLE)?;
+                for orphan in old_chain_blocks {
+                    let orphan_id = orphan.header.block_id();
+                    for tx in &orphan.transactions {
+                        let tx_id = match tx.tx_id() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        for (idx, _) in tx.outputs.iter().enumerate() {
+                            let op = OutPoint::new(tx_id, idx as u32);
+                            let key = serialize_outpoint_key(&op);
+                            utxos.remove(key.as_slice())?;
+                        }
+                    }
+                    // Restore inputs the orphan had consumed.
+                    if let Some(spent_guard) = spent_table.get(orphan_id.as_bytes().as_ref())? {
+                        let bytes = spent_guard.value();
+                        if let Some(spent) = deserialize_spent_utxos(bytes) {
+                            for (op, entry) in spent {
+                                let key = serialize_outpoint_key(&op);
+                                let value = serialize_utxo_entry(&entry)?;
+                                utxos.insert(key.as_slice(), value.as_slice())?;
+                            }
+                        } else {
+                            return Err(StorageError::Corruption(format!(
+                                "SPENT_UTXOS_TABLE entry for orphan {} failed to deserialize",
+                                orphan_id
+                            )));
+                        }
+                    }
+                    // Orphans with no spent_utxos row (e.g. coinbase-only
+                    // historical blocks) are fine — nothing to restore.
+                }
+                drop(spent_table);
+                drop(utxos);
+            }
+            for (_blk_id, mutations) in new_chain_mutations {
+                apply_utxo_mutations(&write_txn, mutations)?;
             }
         }
         write_txn.commit()?;

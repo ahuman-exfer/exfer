@@ -2644,6 +2644,10 @@ impl Node {
                 // 3. Apply new chain with full tx validation (oldest first)
                 new_chain.reverse();
                 let mut all_spent: Vec<(Hash256, Vec<(OutPoint, UtxoEntry)>)> = Vec::new();
+                // Per-block mutation log: aligned with new_chain order so
+                // commit_reorg_atomic can forward-apply UTXOS_TABLE writes
+                // in the same write_txn as the rest of the reorg.
+                let mut all_mutations: Vec<(Hash256, Vec<UtxoMutation>)> = Vec::new();
                 let mut new_applied = 0; // count of fully-applied new-chain blocks
 
                 let apply_err: Option<ProcessBlockError> = 'apply: {
@@ -2720,14 +2724,16 @@ impl Node {
 
                         // Validate and apply — mutation log captures Insert
                         // and Remove in apply order, including intra-block
-                        // dependency spends. Derive legacy spent_utxos until
-                        // commit 4 refactors undo + reorg consumers.
-                        let spent_utxos = match validate_and_apply_block_transactions_atomic(
-                            blk,
-                            &mut utxo_set,
-                        ) {
+                        // dependency spends. We stash the full log per block
+                        // for commit_reorg_atomic and derive the legacy
+                        // spent_utxos slice for undo_block_transactions /
+                        // SPENT_UTXOS_TABLE consumers.
+                        let (mutations_this_block, spent_utxos) = match
+                            validate_and_apply_block_transactions_atomic(blk, &mut utxo_set)
+                        {
                             Ok((_fees, mutations)) => {
-                                UtxoMutation::collect_spent_utxos(&mutations)
+                                let spent = UtxoMutation::collect_spent_utxos(&mutations);
+                                (mutations, spent)
                             }
                             Err(ValidationError::StateCorrupted(msg)) => {
                                 // Atomic apply hit state corruption — fatal
@@ -2763,6 +2769,7 @@ impl Node {
                         }
 
                         all_spent.push((blk.header.block_id(), spent_utxos));
+                        all_mutations.push((blk.header.block_id(), mutations_this_block));
                         new_applied += 1;
                     }
                     None
@@ -2833,7 +2840,9 @@ impl Node {
                 if let Err(e) = self.storage.commit_reorg_atomic(
                     &block,
                     &new_tip.cumulative_work,
+                    &old_chain,
                     &all_spent,
+                    &all_mutations,
                     &new_chain_heights,
                     &new_chain,
                     &new_chain_work,
