@@ -1762,4 +1762,180 @@ mod tests {
         let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
         assert!(storage.get_utxo_snapshot_tip().unwrap().is_none());
     }
+
+    // -------- Phase 3a behavior: persist + load + idempotency invariants -------
+
+    fn sample_utxo(tag: u8) -> (OutPoint, UtxoEntry) {
+        let op = OutPoint::new(Hash256([tag; 32]), tag as u32);
+        let entry = UtxoEntry {
+            output: TxOutput::new_p2pkh(1_000 + tag as u64, &[tag; 32]),
+            height: tag as u64,
+            is_coinbase: tag % 2 == 0,
+        };
+        (op, entry)
+    }
+
+    #[test]
+    fn finalize_utxo_snapshot_writes_both_markers_atomically() {
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+
+        let mut set = crate::chain::state::UtxoSet::new();
+        let entries: Vec<_> = (1u8..=5).map(sample_utxo).collect();
+        for (op, e) in &entries {
+            set.insert(*op, e.clone()).unwrap();
+        }
+        let tip = Hash256([0x77; 32]);
+
+        // Pre-condition: neither marker set, UTXOS_TABLE empty.
+        assert!(storage.get_utxo_snapshot_tip().unwrap().is_none());
+        assert!(storage.iter_utxos().unwrap().is_empty());
+
+        storage.finalize_utxo_snapshot(&set, &tip).unwrap();
+
+        // Post-condition: marker present AND points at exactly the tip we
+        // passed in. Both keys must be set; neither can land in isolation.
+        assert_eq!(storage.get_utxo_snapshot_tip().unwrap(), Some(tip));
+        let loaded = storage.iter_utxos().unwrap();
+        assert_eq!(loaded.len(), entries.len());
+        // iter_utxos is key-ordered — check pairwise equality after sorting
+        // entries by serialized OutPoint key (matches redb's iteration).
+        let mut expected = entries.clone();
+        expected.sort_by_key(|(op, _)| serialize_outpoint_key(op));
+        for ((lop, le), (eop, ee)) in loaded.iter().zip(expected.iter()) {
+            assert_eq!(lop, eop);
+            assert_eq!(le, ee);
+        }
+    }
+
+    #[test]
+    fn iter_utxos_byte_stable_across_two_reads() {
+        // Pins reviewer's iter-order concern: two open_chain calls on the
+        // same datadir must produce the same UTXO sequence, otherwise the
+        // SMT rebuild yields different state_roots and the cross-check
+        // would falsely flag corruption.
+        let tmpdir = TempDir::new().unwrap();
+        let path = tmpdir.path().join("test.redb");
+        let storage = ChainStorage::open(&path).unwrap();
+        let mut set = crate::chain::state::UtxoSet::new();
+        for tag in (1u8..=10).rev() {
+            // Insert in REVERSE order to verify iter() doesn't reflect
+            // insertion order — must reflect key order.
+            let (op, e) = sample_utxo(tag);
+            set.insert(op, e).unwrap();
+        }
+        storage
+            .finalize_utxo_snapshot(&set, &Hash256([0x55; 32]))
+            .unwrap();
+
+        let first = storage.iter_utxos().unwrap();
+        let second = storage.iter_utxos().unwrap();
+        assert_eq!(first, second);
+        // Re-open the database fresh and assert the same sequence is
+        // returned — proves the order is on-disk-determined, not
+        // process-dependent.
+        drop(storage);
+        let reopened = ChainStorage::open(&path).unwrap();
+        let third = reopened.iter_utxos().unwrap();
+        assert_eq!(first, third);
+    }
+
+    #[test]
+    fn apply_utxo_mutations_intra_block_dependency_order() {
+        // Apply order matters: a Remove of outpoint X must be observable
+        // even when followed by an Insert of outpoint X within the same
+        // mutation log — and the final state must reflect the LAST
+        // mutation for any key. Models tx_A creates → tx_B consumes →
+        // tx_C re-creates the same OutPoint (legal in principle if
+        // tx_A's output had a deterministic id; here we force the
+        // pattern explicitly to pin redb's behavior).
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+
+        let (op, entry_v1) = sample_utxo(3);
+        let entry_v2 = UtxoEntry {
+            output: TxOutput::new_p2pkh(999_999, &[0xee; 32]),
+            height: 99,
+            is_coinbase: false,
+        };
+
+        let write_txn = storage.db.begin_write().unwrap();
+        {
+            apply_utxo_mutations(
+                &write_txn,
+                &[
+                    UtxoMutation::Insert(op, entry_v1.clone()),
+                    UtxoMutation::Remove(op, entry_v1.clone()),
+                    UtxoMutation::Insert(op, entry_v2.clone()),
+                ],
+            )
+            .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let loaded = storage.iter_utxos().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, op);
+        assert_eq!(loaded[0].1, entry_v2, "final state reflects last mutation");
+    }
+
+    #[test]
+    fn commit_block_atomic_writes_utxos_table_in_lockstep() {
+        // commit_block_atomic should persist UTXO mutations alongside the
+        // block in the SAME write_txn. Verify by writing two blocks with
+        // distinct mutation logs and reading UTXOS_TABLE between.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let block = test_block();
+        let work = [0u8; 32];
+
+        let (op_a, entry_a) = sample_utxo(1);
+        let (op_b, entry_b) = sample_utxo(2);
+
+        storage
+            .commit_block_atomic(
+                &block,
+                &work,
+                &[],
+                &[
+                    UtxoMutation::Insert(op_a, entry_a.clone()),
+                    UtxoMutation::Insert(op_b, entry_b.clone()),
+                ],
+            )
+            .unwrap();
+
+        let loaded = storage.iter_utxos().unwrap();
+        assert_eq!(loaded.len(), 2);
+        let by_op: std::collections::BTreeMap<OutPoint, UtxoEntry> = loaded.into_iter().collect();
+        assert_eq!(by_op.get(&op_a), Some(&entry_a));
+        assert_eq!(by_op.get(&op_b), Some(&entry_b));
+
+        // Second commit removes op_a, inserts a new op_c. Verifies
+        // mutations stack correctly across atomic commits.
+        let block2 = {
+            let mut b = test_block();
+            b.header.height = 1;
+            b.header.prev_block_id = block.header.block_id();
+            b
+        };
+        let (op_c, entry_c) = sample_utxo(7);
+        storage
+            .commit_block_atomic(
+                &block2,
+                &work,
+                &[(op_a, entry_a.clone())],
+                &[
+                    UtxoMutation::Remove(op_a, entry_a.clone()),
+                    UtxoMutation::Insert(op_c, entry_c.clone()),
+                ],
+            )
+            .unwrap();
+
+        let loaded = storage.iter_utxos().unwrap();
+        assert_eq!(loaded.len(), 2);
+        let by_op: std::collections::BTreeMap<OutPoint, UtxoEntry> = loaded.into_iter().collect();
+        assert!(by_op.get(&op_a).is_none(), "op_a removed");
+        assert_eq!(by_op.get(&op_b), Some(&entry_b));
+        assert_eq!(by_op.get(&op_c), Some(&entry_c));
+    }
 }
