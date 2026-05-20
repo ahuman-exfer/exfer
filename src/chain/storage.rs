@@ -77,7 +77,26 @@ const RETAINED_FORK_HEADERS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("retained_fork_headers");
 /// Maps tx_id (32 bytes) → block_height (u64) for O(1) transaction lookup.
 const TX_INDEX_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("tx_index");
+/// Phase 3a — persisted UTXO snapshot.
+/// Key:   serialize_outpoint_key (36 bytes fixed: tx_id 32 | output_index u32 LE).
+/// Value: serialize_utxo_entry   (output_len u32 LE | output_bytes | height u64 LE | is_coinbase u8).
+const UTXOS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
+/// Phase 3b — reserved table for persisted SMT nodes (see issue #6).
+/// Registered in `ChainStorage::open` so the table exists from first boot
+/// of any 3a-aware build. Empty in 3a; 3b adds the writer + reader.
+#[allow(dead_code)]
+const SMT_NODES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("smt_nodes");
+
 const TIP_KEY: &str = "tip_block_id";
+/// Phase 3a — set to [0x01] in the same write_txn that commits the final
+/// snapshot rows. If absent or != [0x01] on boot, the snapshot is treated
+/// as stale and `replay_chain` is used as the fallback / migration path.
+#[allow(dead_code)] // writer wired in commit 6 (lazy migration).
+const UTXO_SNAPSHOT_COMPLETE_KEY: &str = "utxo_snapshot_complete";
+/// Phase 3a — 32-byte block_id at which the snapshot was finalized.
+/// Open path trusts the snapshot only if this equals the current tip.
+#[allow(dead_code)] // writer wired in commit 6 (lazy migration).
+const UTXO_SNAPSHOT_TIP_KEY: &str = "utxo_snapshot_tip";
 
 /// Serialize a list of spent UTXOs for storage.
 /// Format: count(u32 LE) || for each: tx_id(32) | output_index(u32 LE) | serialized_output | height(u64 LE) | is_coinbase(u8)
@@ -94,6 +113,72 @@ fn serialize_spent_utxos(spent: &[(OutPoint, UtxoEntry)]) -> Result<Vec<u8>, Ser
         buf.push(if entry.is_coinbase { 1 } else { 0 });
     }
     Ok(buf)
+}
+
+/// Serialize a single UTXO entry for the Phase 3a UTXOS_TABLE.
+/// Format: output_len(u32 LE) | output_bytes | height(u64 LE) | is_coinbase(u8).
+/// Hand-rolled to match the rest of the storage layer (no bincode / serde).
+#[allow(dead_code)] // writer wired in commit 3 (persist UTXO mutations).
+fn serialize_utxo_entry(entry: &UtxoEntry) -> Result<Vec<u8>, SerError> {
+    let output_bytes = entry.output.serialize()?;
+    let mut buf = Vec::with_capacity(4 + output_bytes.len() + 8 + 1);
+    buf.extend_from_slice(&(output_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&output_bytes);
+    buf.extend_from_slice(&entry.height.to_le_bytes());
+    buf.push(if entry.is_coinbase { 1 } else { 0 });
+    Ok(buf)
+}
+
+/// Deserialize a single UTXO entry from the Phase 3a UTXOS_TABLE.
+/// Returns None on any framing error (treat as corruption at the caller).
+#[allow(dead_code)] // reader wired in commit 5 (open_chain).
+fn deserialize_utxo_entry(data: &[u8]) -> Option<UtxoEntry> {
+    if data.len() < 4 {
+        return None;
+    }
+    let output_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let mut pos = 4;
+    if pos + output_len > data.len() {
+        return None;
+    }
+    let (output, consumed) = TxOutput::deserialize(&data[pos..pos + output_len]).ok()?;
+    if consumed != output_len {
+        return None;
+    }
+    pos += output_len;
+    if pos + 9 != data.len() {
+        return None; // exact-size frame; trailing bytes = corruption
+    }
+    let height = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+    let is_coinbase = data[pos + 8] != 0;
+    Some(UtxoEntry {
+        output,
+        height,
+        is_coinbase,
+    })
+}
+
+/// Serialize an OutPoint as the fixed 36-byte UTXOS_TABLE key.
+/// Layout: tx_id (32 bytes, raw) | output_index (u32 LE, 4 bytes).
+#[allow(dead_code)] // writer wired in commit 3 (persist UTXO mutations).
+fn serialize_outpoint_key(op: &OutPoint) -> [u8; 36] {
+    let mut buf = [0u8; 36];
+    buf[..32].copy_from_slice(op.tx_id.as_bytes());
+    buf[32..].copy_from_slice(&op.output_index.to_le_bytes());
+    buf
+}
+
+/// Deserialize an OutPoint from a UTXOS_TABLE key.
+/// Returns None if the slice is not exactly 36 bytes.
+#[allow(dead_code)] // reader wired in commit 5 (open_chain).
+fn deserialize_outpoint_key(data: &[u8]) -> Option<OutPoint> {
+    if data.len() != 36 {
+        return None;
+    }
+    let mut tx_id_bytes = [0u8; 32];
+    tx_id_bytes.copy_from_slice(&data[..32]);
+    let output_index = u32::from_le_bytes(data[32..].try_into().ok()?);
+    Some(OutPoint::new(Hash256(tx_id_bytes), output_index))
 }
 
 /// Deserialize a list of spent UTXOs from storage.
@@ -182,6 +267,8 @@ impl ChainStorage {
             let _ = write_txn.open_table(IDENTITY_BAN_TABLE)?;
             let _ = write_txn.open_table(RETAINED_FORK_HEADERS_TABLE)?;
             let _ = write_txn.open_table(TX_INDEX_TABLE)?;
+            let _ = write_txn.open_table(UTXOS_TABLE)?;
+            let _ = write_txn.open_table(SMT_NODES_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -480,6 +567,71 @@ impl ChainStorage {
             }
             None => Ok(None),
         }
+    }
+
+    /// Phase 3a — read every persisted UTXO into a Vec.
+    ///
+    /// Consumed by commit 5 (open_chain).
+    ///
+    /// redb's `Table::iter()` is key-ordered (per redb docs), so calling
+    /// this twice on the same datadir yields the same sequence — the
+    /// `state_root_parity_across_two_open_chain_calls` test pins that
+    /// invariant from the boot-path side.
+    ///
+    /// Returns `Err(StorageError::Corruption)` on any framing error
+    /// rather than `Ok(partial)`; the open path treats this as
+    /// "snapshot is corrupt, fall through to `replay_chain`".
+    #[allow(dead_code)] // wired in commit 5 (open_chain).
+    pub fn iter_utxos(&self) -> Result<Vec<(OutPoint, UtxoEntry)>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(UTXOS_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let op = deserialize_outpoint_key(k.value()).ok_or_else(|| {
+                StorageError::Corruption(format!(
+                    "UTXOS_TABLE key not a valid 36-byte OutPoint (len={})",
+                    k.value().len()
+                ))
+            })?;
+            let utxo = deserialize_utxo_entry(v.value()).ok_or_else(|| {
+                StorageError::Corruption(format!(
+                    "UTXOS_TABLE value for {:?} failed to deserialize",
+                    op
+                ))
+            })?;
+            out.push((op, utxo));
+        }
+        Ok(out)
+    }
+
+    /// Phase 3a — returns `Some(tip_id)` iff the snapshot was finalized:
+    /// both `UTXO_SNAPSHOT_COMPLETE_KEY == [0x01]` AND
+    /// `UTXO_SNAPSHOT_TIP_KEY` is set to a valid 32-byte block_id.
+    ///
+    /// Returns `None` in every other case (missing markers, partial
+    /// write, length mismatch). Open path interprets `None` as "no
+    /// trustworthy snapshot, run replay_chain".
+    #[allow(dead_code)] // wired in commit 5 (open_chain) and commit 6 (lazy migration).
+    pub fn get_utxo_snapshot_tip(&self) -> Result<Option<Hash256>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+        let complete = match table.get(UTXO_SNAPSHOT_COMPLETE_KEY)? {
+            Some(v) if v.value() == [0x01u8] => true,
+            _ => false,
+        };
+        if !complete {
+            return Ok(None);
+        }
+        let tip = match table.get(UTXO_SNAPSHOT_TIP_KEY)? {
+            Some(v) if v.value().len() == 32 => {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(v.value());
+                Hash256(buf)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(tip))
     }
 
     /// Evict a fork block: remove the heavy block body and fork tracking,
@@ -1400,5 +1552,66 @@ mod tests {
 
         let missing = Hash256::sha256(b"nonexistent");
         assert!(storage.get_block(&missing).unwrap().is_none());
+    }
+
+    // -------- Phase 3a schema: hand-rolled serializer roundtrips --------
+
+    #[test]
+    fn roundtrip_outpoint_key() {
+        let op = OutPoint::new(Hash256([0xab; 32]), 0x1234_5678);
+        let key = serialize_outpoint_key(&op);
+        assert_eq!(key.len(), 36);
+        // Little-endian output_index at bytes 32..36.
+        assert_eq!(&key[32..36], &0x1234_5678u32.to_le_bytes());
+        let parsed = deserialize_outpoint_key(&key).expect("roundtrip");
+        assert_eq!(parsed, op);
+    }
+
+    #[test]
+    fn deserialize_outpoint_key_rejects_wrong_length() {
+        assert!(deserialize_outpoint_key(&[0u8; 35]).is_none());
+        assert!(deserialize_outpoint_key(&[0u8; 37]).is_none());
+        assert!(deserialize_outpoint_key(&[]).is_none());
+    }
+
+    #[test]
+    fn roundtrip_utxo_entry() {
+        let entry = UtxoEntry {
+            output: TxOutput::new_p2pkh(7_777_777, &[0xcd; 32]),
+            height: 0xdead_beef_cafe,
+            is_coinbase: true,
+        };
+        let bytes = serialize_utxo_entry(&entry).unwrap();
+        let parsed = deserialize_utxo_entry(&bytes).expect("roundtrip");
+        assert_eq!(parsed.output, entry.output);
+        assert_eq!(parsed.height, entry.height);
+        assert_eq!(parsed.is_coinbase, entry.is_coinbase);
+    }
+
+    #[test]
+    fn deserialize_utxo_entry_rejects_trailing_bytes() {
+        let entry = UtxoEntry {
+            output: TxOutput::new_p2pkh(1, &[1u8; 32]),
+            height: 1,
+            is_coinbase: false,
+        };
+        let mut bytes = serialize_utxo_entry(&entry).unwrap();
+        bytes.push(0xff); // trailing junk
+        assert!(deserialize_utxo_entry(&bytes).is_none());
+    }
+
+    #[test]
+    fn iter_utxos_empty_on_fresh_db() {
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let utxos = storage.iter_utxos().unwrap();
+        assert!(utxos.is_empty());
+    }
+
+    #[test]
+    fn snapshot_tip_none_on_fresh_db() {
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        assert!(storage.get_utxo_snapshot_tip().unwrap().is_none());
     }
 }
