@@ -27,8 +27,7 @@ use exfer::chain::state::UtxoSet;
 use exfer::chain::storage::ChainStorage;
 use exfer::consensus::difficulty::expected_difficulty;
 use exfer::consensus::validation::{
-    apply_block_transactions_assume_valid, validate_and_apply_block_transactions_atomic,
-    validate_block_header_skip_pow,
+    apply_block_transactions_assume_valid, validate_block_header_skip_pow,
 };
 use exfer::genesis::genesis_block;
 use exfer::types::hash::Hash256;
@@ -152,20 +151,32 @@ fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .ok_or("b")?;
         if height > 0 {
-            // Use whichever path the production replay would take at this
-            // height: skip tx validation when av-checkpoint is proven and
-            // we're at/below it, otherwise full validation.
-            let skip_tx = av_proven && height <= ASSUME_VALID_HEIGHT;
-            let (_fees, spent) = if skip_tx {
-                apply_block_transactions_assume_valid(&block, &mut utxo_set)
-                    .map_err(|e| format!("apply-av {} failed: {:?}", height, e))?
-            } else {
-                validate_and_apply_block_transactions_atomic(&block, &mut utxo_set)
-                    .map_err(|e| format!("apply {} failed: {:?}", height, e))?
-            };
-            total_inputs_spent += spent.len() as u64;
+            // ALWAYS use the assume-valid-fast path here, regardless of
+            // whether the snapshot's tip is past ASSUME_VALID_HEIGHT.
+            //
+            // Rationale: this bench's purpose is to model "today's open
+            // cost when the production node is restarting on a chain that
+            // is past the checkpoint" — i.e. the steady-state restart cost
+            // operators see in practice. When the snapshot's tip happens
+            // to be BELOW the new checkpoint (e.g. mid-rollout right after
+            // the checkpoint bump), the production replay would fall back
+            // to full Argon2id PoW + sig validation per block, taking
+            // hours. Measuring THAT cost here would produce a misleading
+            // Exp2 number that scales with the rollout-vs-checkpoint
+            // race, not with chain shape. The assume-valid fast path is
+            // the realistic restart cost across most of the chain's
+            // lifetime, so we measure that. Mutations are discarded.
+            let _mutations = apply_block_transactions_assume_valid(&block, &mut utxo_set)
+                .map_err(|e| format!("apply-av {} failed: {:?}", height, e))?
+                .1;
+            // Note: total_inputs_spent / total_outputs_created tallies are
+            // computed from the block body (deterministic, independent of
+            // the apply path) to keep the bench's emit fields stable.
             for tx in &block.transactions {
                 total_outputs_created += tx.outputs.len() as u64;
+                if !tx.is_coinbase() {
+                    total_inputs_spent += tx.inputs.len() as u64;
+                }
             }
         }
         prev_id = block_id;
@@ -221,11 +232,34 @@ fn main() -> Result<(), String> {
     println!("exp3_root_matches_full_rebuild={}", fresh_root == final_root);
 
     // ===== Experiment 4: end-to-end A/B vs Exp2 =====
-    // Persist the in-memory UtxoSet to UTXOS_TABLE via finalize_utxo_snapshot,
-    // then drop the storage handle, re-open ChainStorage from disk, and call
-    // open_chain. The open_chain wall-time is the headline Phase 3a number to
-    // compare against Exp2 (today's replay_chain cost on the same chain).
-    eprintln!("# Exp4: finalize snapshot + time open_chain (Phase 3a A/B vs Exp2)");
+    //
+    // Naively timing open_chain on this snapshot would NOT produce a useful
+    // baseline number: this snapshot's tip is below ASSUME_VALID_HEIGHT, so
+    // `assume_valid_proven` is false, and open_chain's cheap walk falls back
+    // to validate_block_header (with full Argon2id PoW) for every block —
+    // hours per run. That's a property of the snapshot chosen for the bench,
+    // not of Phase 3a; once the production chain crosses the checkpoint, the
+    // walk uses skip_pow (Exp1 cost ≈ 12s on this hardware).
+    //
+    // To still produce a meaningful A/B number on whatever snapshot the
+    // operator has on hand, measure the open_chain components that DON'T
+    // depend on the assume-valid state and model the missing piece from
+    // Exp1:
+    //
+    //   exp4_finalize_secs              : finalize_utxo_snapshot (one-time
+    //                                     migration cost, not paid every boot)
+    //   exp4_read_side_secs             : drop storage → re-open → iter_utxos
+    //                                     → bulk-insert into fresh UtxoSet
+    //                                     (rebuilds SMT incrementally) →
+    //                                     state_root cross-check. This is
+    //                                     everything open_chain does AFTER
+    //                                     the cheap walk.
+    //   exp4_modeled_open_chain_secs    : exp1_total_secs + exp4_read_side_secs
+    //                                     — the per-boot Phase 3a steady-state
+    //                                     cost on a chain past the checkpoint.
+    //   exp4_speedup_vs_exp2_modeled    : exp2_total / modeled. The headline.
+    eprintln!("# Exp4: finalize + read-side measurement (open_chain components)");
+
     let exp4_finalize_start = Instant::now();
     storage
         .finalize_utxo_snapshot(&utxo_set, &tip_id)
@@ -233,44 +267,52 @@ fn main() -> Result<(), String> {
     let exp4_finalize_secs = exp4_finalize_start.elapsed().as_secs_f64();
     println!("exp4_finalize_secs={:.4}", exp4_finalize_secs);
 
-    // Drop the in-memory UtxoSet and the storage handle so the re-open
+    // Drop the in-memory UtxoSet AND the storage handle so the re-open
     // measurement is honest (cold redb file handle, no warm page cache from
     // the test process's prior reads).
     drop(utxo_set);
     drop(storage);
 
     let storage2 = Arc::new(ChainStorage::open(&db_path).map_err(|e| e.to_string())?);
+    let exp4_read_start = Instant::now();
+    let utxos_from_disk = storage2
+        .iter_utxos()
+        .map_err(|e| format!("iter_utxos failed: {}", e))?;
     let mut utxo_set2 = UtxoSet::new();
-    let expected_genesis_id = genesis_block().header.block_id();
-    let exp4_open_start = Instant::now();
-    let tip3a = open_chain(
-        &storage2,
-        &mut utxo_set2,
-        &expected_genesis_id,
-        true,  // assume_valid: same default as production
-        false, // auto_migrate: marker already set, must not re-run replay
-    )
-    .map_err(|e| format!("open_chain failed: {}", e))?;
-    let exp4_open_secs = exp4_open_start.elapsed().as_secs_f64();
-    println!("exp4_open_chain_secs={:.4}", exp4_open_secs);
-    println!("exp4_open_chain_tip_height={}", tip3a.height);
+    for (op, entry) in utxos_from_disk {
+        utxo_set2
+            .insert(op, entry)
+            .map_err(|e| format!("insert failed: {:?}", e))?;
+    }
+    let read_state_root = utxo_set2.state_root();
+    if read_state_root != final_root {
+        return Err(format!(
+            "exp4 read-side state_root mismatch: got {} expected {}",
+            read_state_root, final_root
+        ));
+    }
+    let exp4_read_side_secs = exp4_read_start.elapsed().as_secs_f64();
+    println!("exp4_read_side_secs={:.4}", exp4_read_side_secs);
+    println!("exp4_read_side_utxo_count={}", utxo_set2.len());
     println!(
-        "exp4_open_chain_state_root_matches_exp2={}",
-        utxo_set2.state_root() == final_root
-    );
-    println!(
-        "exp4_open_chain_utxo_count_matches_exp2={}",
-        utxo_set2.len() == fresh.len()
+        "exp4_read_side_state_root_matches_exp2={}",
+        read_state_root == final_root
     );
 
-    // Headline: replay (Exp2) vs Phase 3a open (Exp4). Speedup is reported
-    // as the ratio of wall times. The finalize cost (Exp4 finalize) is a
-    // one-time migration cost paid on the first boot after upgrade, NOT
-    // every boot.
+    // Modeled steady-state open_chain (post-checkpoint chain): cheap walk
+    // (exp1) + read side (exp4). Compare to today's replay (exp2). Suppress
+    // open_chain itself running here because it would PoW-verify every block
+    // on this below-checkpoint snapshot, see the comment block at the top
+    // of Exp4.
+    let exp4_modeled = exp1_elapsed + exp4_read_side_secs;
+    println!("exp4_modeled_open_chain_secs={:.4}", exp4_modeled);
     println!(
-        "exp4_speedup_vs_exp2={:.2}x",
-        exp2_elapsed / exp4_open_secs.max(1e-9)
+        "exp4_speedup_vs_exp2_modeled={:.2}x",
+        exp2_elapsed / exp4_modeled.max(1e-9)
     );
+
+    // Sanity: silence unused-binding warning for `tip_id`.
+    let _ = (open_chain, genesis_block, tip_id);
 
     eprintln!("# DONE");
     Ok(())
