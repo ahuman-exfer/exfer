@@ -53,10 +53,18 @@ pub const ASSUME_VALID_HASH: [u8; 32] = [
 /// Value regenerated 2026-05-19 from the canonical chain by walking retarget
 /// boundaries via RPC against TWO independent canonical nodes (S2 at
 /// 82.221.100.201 and S3 at 89.127.232.155), requiring byte-exact agreement
-/// on each of the 117 retarget-boundary targets (116 full + 1 partial
-/// terminal window), then summing
+/// on each of the 116 retarget-boundary targets (terminal partial window
+/// 496800..=500000 is implicit in the summation, not a separate fixture
+/// entry), then summing
 /// `work_from_target(difficulty_target) × window_blocks` across heights
 /// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 2,045,970,369,492.
+///
+/// **Regeneration tooling**: `tools/regen_assume_valid.py` mechanises this
+/// ceremony — pulls every retarget-boundary `difficulty_target` from BOTH
+/// reference nodes, aborts on any byte-mismatch, recomputes
+/// `Σ work × blocks`, and emits the Rust source ready to paste here.
+/// Sanity-tested by running against the previous checkpoint (`302_400`)
+/// and confirming byte-identical output to the in-tree values.
 ///
 /// **Release procedure:** regenerate alongside `ASSUME_VALID_HEIGHT` and
 /// `ASSUME_VALID_HASH` if any of them are changed. Multi-source verification

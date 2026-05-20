@@ -3,13 +3,13 @@
 Regenerate ASSUME_VALID_* constants for a new checkpoint height.
 
 Per upstream release procedure (src/types/mod.rs):
-  - ≥2 independent canonical nodes must agree byte-exact on every value.
+  - ≥2 independent reference nodes must agree byte-exact on every value.
   - ASSUME_VALID_HASH = block_id at the checkpoint height.
   - ASSUME_VALID_CUMULATIVE_WORK = Σ work_from_target(target_i) × window_blocks_i
     across all retarget windows in [0, checkpoint_height].
 
 Usage:
-    python3 regen-checkpoint.py <target_height>
+    python3 tools/regen_assume_valid.py <target_height>
 
 Emits Rust source ready to paste into src/types/mod.rs + the fixture
 file tests/assume_valid_cumulative_work_guard.rs.
@@ -97,11 +97,22 @@ def add_work_be(a_bytes, b_bytes):
 
 
 def collect_retarget_boundaries(target_height):
-    """Heights = [0, 4320, 8640, ..., last_full_window, target_height (if not on boundary)]."""
-    heights = list(range(0, target_height + 1, RETARGET_WINDOW))
-    if heights[-1] != target_height:
-        heights.append(target_height)
-    return heights
+    """Heights = [0, RETARGET_WINDOW, 2*RETARGET_WINDOW, ..., last_full_window].
+
+    Includes only the retarget-window-start heights ≤ target_height. The
+    terminal partial window (last_full_window..=target_height, when
+    target_height is not a multiple of RETARGET_WINDOW) is handled by the
+    recomputation loop's last-segment branch in
+    `tests/assume_valid_cumulative_work_guard.rs`, NOT as a separate
+    fixture entry. Appending a tuple at `target_height` here would
+    double-count the checkpoint block during cumulative-work recomputation
+    and would also fail the in-tree fixture's "last entry = floor()
+    boundary" guard.
+
+    See `fixture_height_list_matches_canonical_boundary_formula` in the
+    Rust guard for the assertion that pins this contract.
+    """
+    return list(range(0, target_height + 1, RETARGET_WINDOW))
 
 
 def fetch_target(height):
@@ -130,7 +141,7 @@ def main():
     print(f"# S3 tip: {h3}", file=sys.stderr)
     if h2 < target_height or h3 < target_height:
         raise RuntimeError(
-            f"both canonical nodes must be past target_height={target_height}; "
+            f"both reference nodes must be past target_height={target_height}; "
             f"got S2={h2}, S3={h3}"
         )
 
