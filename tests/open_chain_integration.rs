@@ -168,6 +168,47 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
 }
 
 #[test]
+fn rebuild_state_recovery_loop_clears_and_finalizes_in_one_boot() {
+    // Mirrors the `--rebuild-state` CLI flow that the operator runs after
+    // hitting the "snapshot is corrupt" error in `open_chain`:
+    //
+    //   storage.clear_utxo_snapshot()  ←  what --rebuild-state does first
+    //   open_chain(..., auto_migrate=true)  ←  forces fallback → finalize
+    //
+    // The chain data is untouched; only the derived snapshot is rebuilt.
+    let dir = TempDir::new().unwrap();
+    let storage = fresh_storage(&dir, "test.redb");
+    let genesis_id = genesis_block().header.block_id();
+    let mut utxos = UtxoSet::new();
+    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true).unwrap();
+    let expected_root = utxos.state_root();
+
+    // Operator's recovery step: clear the snapshot in place.
+    storage
+        .clear_utxo_snapshot()
+        .expect("clear_utxo_snapshot should not touch chain data");
+    assert!(storage.get_utxo_snapshot_tip().unwrap().is_none());
+
+    // Reopen with auto_migrate=true (which --rebuild-state forces).
+    // open_chain falls through to replay and finalize re-seeds the marker.
+    drop(storage);
+    let storage2 = fresh_storage(&dir, "test.redb");
+    let mut utxos2 = UtxoSet::new();
+    let _ = open_chain(&storage2, &mut utxos2, &genesis_id, false, true)
+        .expect("rebuild recovery via fallback+finalize");
+    assert_eq!(
+        storage2.get_utxo_snapshot_tip().unwrap(),
+        Some(genesis_id),
+        "fresh snapshot finalized in the same boot"
+    );
+    assert_eq!(
+        utxos2.state_root(),
+        expected_root,
+        "rebuilt UtxoSet matches the canonical state_root"
+    );
+}
+
+#[test]
 fn open_chain_rejects_when_marker_matches_but_state_root_mismatches() {
     // 1. Bootstrap genesis as usual.
     let dir = TempDir::new().unwrap();

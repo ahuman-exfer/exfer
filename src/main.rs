@@ -153,6 +153,14 @@ enum Commands {
         /// downtime windows (per issue #6 Q2 hybrid migration UX).
         #[arg(long)]
         no_auto_migrate: bool,
+        /// One-shot: delete UTXOS_TABLE + clear snapshot markers, run a full
+        /// chain replay from BLOCKS_TABLE, then finalize a fresh snapshot.
+        /// Use after the Phase 3a snapshot fails the state_root cross-check
+        /// ("snapshot is corrupt" error). The on-disk chain (`chain.redb`
+        /// blocks/headers/work/spent_utxos) is preserved — only the derived
+        /// UTXO snapshot is rebuilt. Implies `--auto-migrate`.
+        #[arg(long)]
+        rebuild_state: bool,
     },
     /// Run the miner
     Mine {
@@ -200,6 +208,11 @@ enum Commands {
         /// Disable automatic Phase 3a UTXO snapshot migration on first boot.
         #[arg(long)]
         no_auto_migrate: bool,
+        /// One-shot: rebuild the Phase 3a UTXO snapshot from a full chain
+        /// replay (see `node --rebuild-state` for details). Implies
+        /// `--auto-migrate`.
+        #[arg(long)]
+        rebuild_state: bool,
     },
     /// Wallet operations
     Wallet {
@@ -794,9 +807,10 @@ async fn main() {
             no_assume_valid,
             purge_bans,
             no_auto_migrate,
+            rebuild_state,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -815,6 +829,7 @@ async fn main() {
             no_assume_valid,
             purge_bans,
             no_auto_migrate,
+            rebuild_state,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -837,7 +852,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2841,9 +2856,12 @@ async fn run_node(
     no_assume_valid: bool,
     purge_bans: bool,
     no_auto_migrate: bool,
+    rebuild_state: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
-    let auto_migrate = !no_auto_migrate;
+    // --rebuild-state forces auto_migrate=true: after clearing the snapshot
+    // we WANT open_chain's fallback to finalize a fresh one in the same boot.
+    let auto_migrate = !no_auto_migrate || rebuild_state;
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("failed to create data directory {}: {e}", datadir.display()))?;
 
@@ -3061,6 +3079,27 @@ async fn run_node(
             .commit_genesis_atomic(&genesis, &genesis_work, &genesis_mutations)
             .map_err(|e| format!("failed to store genesis block: {e}"))?;
         info!("Stored genesis block: {}", expected_genesis_id);
+    }
+
+    // Phase 3a recovery — `--rebuild-state` clears the persisted snapshot
+    // (UTXOS_TABLE + both markers) so that the open_chain call below is
+    // forced down the fallback path. With auto_migrate=true (forced above),
+    // the post-replay finalize then writes a fresh snapshot, in the same
+    // boot. The underlying chain data (blocks/headers/work/spent_utxos) is
+    // preserved.
+    if rebuild_state {
+        let before = storage
+            .get_utxo_snapshot_tip()
+            .map_err(|e| format!("rebuild-state: failed to read snapshot marker: {e}"))?;
+        storage
+            .clear_utxo_snapshot()
+            .map_err(|e| format!("rebuild-state: failed to clear UTXO snapshot: {e}"))?;
+        info!(
+            "--rebuild-state: cleared UTXO snapshot (was {}); rebuilding via full chain replay",
+            before
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "absent".to_string())
+        );
     }
 
     // Phase 3a — fast boot path: try the persisted UTXO snapshot + cheap
