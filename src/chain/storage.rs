@@ -1250,8 +1250,13 @@ impl ChainStorage {
             // 2. Apply new chain mutations forward via the same helper that
             //    commit_block_atomic uses, in oldest-first order.
             {
+                // SPENT_UTXOS_TABLE was already opened above (line ~1155) for
+                // the new-chain write phase; redb forbids opening the same
+                // table twice in one write_txn. Reuse the outer `spent_table`
+                // handle here for the orphan-undo read phase. Pre-fix this
+                // path errored with "Table 'spent_utxos' already opened" the
+                // first time a real reorg fired during IBD.
                 let mut utxos = write_txn.open_table(UTXOS_TABLE)?;
-                let spent_table = write_txn.open_table(SPENT_UTXOS_TABLE)?;
                 for orphan in old_chain_blocks {
                     let orphan_id = orphan.header.block_id();
                     for tx in &orphan.transactions {
@@ -1284,7 +1289,6 @@ impl ChainStorage {
                     // Orphans with no spent_utxos row (e.g. coinbase-only
                     // historical blocks) are fine — nothing to restore.
                 }
-                drop(spent_table);
                 drop(utxos);
             }
             for (_blk_id, mutations) in new_chain_mutations {
@@ -2179,6 +2183,112 @@ mod tests {
             storage.get_utxo_snapshot_tip().unwrap(),
             Some(gid),
             "genesis commit must seed the snapshot marker"
+        );
+    }
+
+    #[test]
+    fn commit_reorg_atomic_does_not_double_open_spent_utxos_table() {
+        // Regression guard: pre-fix, commit_reorg_atomic opened
+        // SPENT_UTXOS_TABLE twice in one write_txn (once near the top of the
+        // function for the new-chain write phase, once again inside the
+        // orphan-undo inner block). redb rejects double-open with
+        // "Table 'spent_utxos' already opened" — and because the inner-block
+        // open runs UNCONDITIONALLY (before the orphan loop body), every
+        // single call to commit_reorg_atomic errored, even with empty
+        // old_chain_blocks. Surfaced live on `exfer-node-stack` the first
+        // time IBD streamed past a fork point after the wedge-fallback fix
+        // (PR #13) let the supervisor start IBD at all.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+
+        let trigger_block = test_block();
+        let work = [1u8; 32];
+        let new_tip_id = trigger_block.header.block_id();
+
+        storage
+            .commit_reorg_atomic(
+                &trigger_block,
+                &work,
+                /* old_chain_blocks */ &[],
+                /* new_chain_spent */ &[],
+                /* new_chain_mutations */ &[],
+                &[(trigger_block.header.height, new_tip_id)],
+                /* new_chain_blocks */ &[],
+                /* new_chain_work */ &[],
+                /* stale_height_start */ None,
+                /* stale_height_end */ None,
+                &new_tip_id,
+            )
+            .expect(
+                "commit_reorg_atomic must not double-open SPENT_UTXOS_TABLE in one write_txn",
+            );
+
+        assert_eq!(
+            storage.get_tip().unwrap(),
+            Some(new_tip_id),
+            "successful commit must advance TIP_KEY to the trigger block"
+        );
+    }
+
+    #[test]
+    fn commit_reorg_atomic_orphan_undo_reads_spent_table() {
+        // Full orphan-undo path: write an orphan block via commit_block_atomic
+        // so it has a SPENT_UTXOS_TABLE row, then trigger commit_reorg_atomic
+        // with that block in old_chain_blocks. The inner-block read of
+        // SPENT_UTXOS_TABLE must succeed and feed the orphan-undo loop —
+        // pre-fix this never got that far, because the unconditional second
+        // open of SPENT_UTXOS_TABLE inside the same write_txn errored first.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let work = [0u8; 32];
+
+        // Orphan block at height 0 with one consumed UTXO so SPENT_UTXOS_TABLE
+        // actually has data for the undo path to load.
+        let orphan = test_block();
+        let (op_consumed, entry_consumed) = sample_utxo(9);
+
+        storage
+            .commit_block_atomic(
+                &orphan,
+                &work,
+                &[(op_consumed, entry_consumed.clone())],
+                /* mutations */ &[],
+            )
+            .unwrap();
+
+        // Reorg trigger at height 1, undoing the orphan.
+        let mut trigger = test_block();
+        trigger.header.height = 1;
+        trigger.header.prev_block_id = orphan.header.prev_block_id;
+        trigger.header.nonce = 99;
+        let trigger_id = trigger.header.block_id();
+
+        storage
+            .commit_reorg_atomic(
+                &trigger,
+                &[1u8; 32],
+                /* old_chain_blocks */ std::slice::from_ref(&orphan),
+                /* new_chain_spent */ &[],
+                /* new_chain_mutations */ &[],
+                &[(trigger.header.height, trigger_id)],
+                /* new_chain_blocks */ &[],
+                /* new_chain_work */ &[],
+                /* stale_height_start */ Some(0),
+                /* stale_height_end */ Some(0),
+                &trigger_id,
+            )
+            .expect("orphan-undo path must complete without redb errors");
+
+        assert_eq!(storage.get_tip().unwrap(), Some(trigger_id));
+
+        // The orphan's consumed UTXO must be restored to UTXOS_TABLE — that
+        // is the whole point of reading SPENT_UTXOS_TABLE in the undo phase.
+        let utxos: std::collections::BTreeMap<OutPoint, UtxoEntry> =
+            storage.iter_utxos().unwrap().into_iter().collect();
+        assert_eq!(
+            utxos.get(&op_consumed),
+            Some(&entry_consumed),
+            "orphan-undo must restore the spent UTXO from SPENT_UTXOS_TABLE"
         );
     }
 }
