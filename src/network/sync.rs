@@ -7736,26 +7736,22 @@ pub async fn run_tip_forward_validation(
             //                 hdrs[0] only and ignore the extras.
             //   match       → anchor at clamped probe height (no fork below).
             //   diverge     → fall into binary search.
-            if hdrs.is_empty() {
-                return Err(TipValidationError::PeerNoForwardData(format!(
-                    "empty response to ancestor probe at clamped height {} \
-                     (our_height_start={}, claim_height={})",
-                    our_height, our_height_start, claim_height
-                )));
-            }
-            if hdrs[0].height != our_height {
-                return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                    "ancestor probe returned height {} for hdrs[0], expected {} \
-                     (response carried {} headers — first one used)",
-                    hdrs[0].height, our_height, hdrs.len()
-                )));
-            }
-            let anchor_at_clamped_probe = node
-                .storage
-                .get_block_id_by_height(our_height)
-                .ok()
-                .flatten()
-                == Some(hdrs[0].block_id());
+            let our_bid_at_clamp =
+                node.storage.get_block_id_by_height(our_height).ok().flatten();
+            let anchor_at_clamped_probe =
+                match interpret_ancestor_probe_response(&hdrs, our_height, our_bid_at_clamp) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        return Err(TipValidationError::PeerNoForwardData(format!(
+                            "empty response to ancestor probe at clamped height {} \
+                             (our_height_start={}, claim_height={})",
+                            our_height, our_height_start, claim_height
+                        )));
+                    }
+                    Err(msg) => {
+                        return Err(TipValidationError::DeliveredInvalidHeader(msg));
+                    }
+                };
             let ancestor_h = if anchor_at_clamped_probe {
                 our_height
             } else {
@@ -7774,37 +7770,42 @@ pub async fn run_tip_forward_validation(
                     }
                     let hdrs = await_header_batch(&mut subscriber).await?;
                     // v1.9.2 site 4: max_count=1 ancestor midpoint probe.
-                    // Bounds clamped above, so mid ≤ claim_height; empty here
-                    // is unambiguously rate-limited / no-data.
-                    //   empty   → PeerNoForwardData (bail no-strike).
-                    //   len > 1 → DeliveredInvalidHeader (strike).
-                    //   wrong h → DeliveredInvalidHeader (strike).
-                    //   match   → lo = mid (continue search up).
-                    //   diverge → hi = mid - 1 (continue search down, no strike).
-                    if hdrs.is_empty() {
-                        return Err(TipValidationError::PeerNoForwardData(format!(
-                            "empty response to ancestor midpoint probe at height {}",
-                            mid
-                        )));
-                    }
-                    if hdrs.len() != 1 {
-                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                            "ancestor midpoint probe at height {} returned {} headers, expected 1",
-                            mid,
-                            hdrs.len()
-                        )));
-                    }
-                    if hdrs[0].height != mid {
-                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                            "ancestor midpoint probe returned height {}, expected {}",
-                            hdrs[0].height, mid
-                        )));
-                    }
-                    let peer_bid = hdrs[0].block_id();
-                    let our_bid = node.storage.get_block_id_by_height(mid).ok().flatten();
-                    match our_bid {
-                        Some(o) if o == peer_bid => lo = mid,
-                        _ => hi = mid.saturating_sub(1),
+                    // Delegates to `interpret_ancestor_probe_response` so this
+                    // probe gets the same over-delivery tolerance as the
+                    // initial-probe + IBD-side sites (review of PR#11 caught
+                    // that this midpoint inlined its own `len != 1` reject
+                    // and was the missing third site in the same wedge
+                    // class). Mapping:
+                    //   helper Ok(None)        — peer empty or our storage
+                    //                            missing (unreachable here,
+                    //                            since `mid` is within
+                    //                            [lo, hi] of validated chain;
+                    //                            still bail no-strike if it
+                    //                            happens).
+                    //   helper Ok(Some(true))  — match: continue search up
+                    //                            (`lo = mid`).
+                    //   helper Ok(Some(false)) — diverge: continue search
+                    //                            down (`hi = mid - 1`), no
+                    //                            strike.
+                    //   helper Err(msg)        — `hdrs[0].height` wrong, the
+                    //                            real protocol violation;
+                    //                            map to
+                    //                            `DeliveredInvalidHeader`.
+                    let our_bid =
+                        node.storage.get_block_id_by_height(mid).ok().flatten();
+                    match interpret_ancestor_probe_response(&hdrs, mid, our_bid) {
+                        Ok(Some(true)) => lo = mid,
+                        Ok(Some(false)) => hi = mid.saturating_sub(1),
+                        Ok(None) => {
+                            return Err(TipValidationError::PeerNoForwardData(format!(
+                                "empty / no-data response to ancestor midpoint \
+                                 probe at height {}",
+                                mid
+                            )));
+                        }
+                        Err(msg) => {
+                            return Err(TipValidationError::DeliveredInvalidHeader(msg));
+                        }
                     }
                 }
                 lo
@@ -8213,6 +8214,101 @@ mod ancestor_probe_tests {
         let h = header_at(605_656, 1);
         let res = interpret_ancestor_probe_response(&[h], 605_656, None);
         assert!(matches!(res, Ok(None)));
+    }
+
+    // ── Per-call-site shape tests ───────────────────────────────────────
+    //
+    // `interpret_ancestor_probe_response` is shared by three call sites in
+    // sync.rs (v1.11.1 — review of #11 identified that the midpoint probe
+    // had been inlining its own copy of the now-fixed strict reject):
+    //
+    //   1. `Node::check_shared_block_via_events`     — IBD ancestor probe
+    //      (sync.rs:4648)
+    //   2. `run_tip_forward_validation` initial probe — tip-validation
+    //      path 2a at the clamped probe height (sync.rs:7707)
+    //   3. `run_tip_forward_validation` midpoint loop — tip-validation
+    //      path 2a binary search per iteration (sync.rs:7775)
+    //
+    // The midpoint specifically maps the helper's outcomes to lo/hi
+    // updates on the binary search bounds. The tests below assert each
+    // helper-result variant maps the way the midpoint code path expects.
+    // A full integration-shape test (Node + mock peer driving the search
+    // loop end-to-end) is intentionally not added in this PR — there's
+    // no sync-loop test harness in tree, building one is non-trivial,
+    // and the helper-shared-by-all-three-sites refactor means a unit
+    // test against the helper is now a real coverage signal for every
+    // call site. Adding the harness is tracked as a follow-up.
+
+    #[test]
+    fn midpoint_match_advances_lo_via_helper() {
+        // Midpoint expects: helper Ok(Some(true)) → lo = mid
+        // (chain agrees up to this height, search continues UP).
+        let mid = 250_000;
+        let h = header_at(mid, 1);
+        let our_bid = Some(h.block_id());
+        let res = interpret_ancestor_probe_response(&[h], mid, our_bid);
+        assert!(
+            matches!(res, Ok(Some(true))),
+            "midpoint match-with-len-1 must return Ok(Some(true)) so the \
+             site can advance lo = mid; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_diverge_retreats_hi_via_helper() {
+        // Midpoint expects: helper Ok(Some(false)) → hi = mid - 1
+        // (chains diverge at this height, search continues DOWN).
+        let mid = 250_000;
+        let h_ours = header_at(mid, 1);
+        let h_peer = header_at(mid, 2);
+        assert_ne!(h_ours.block_id(), h_peer.block_id());
+        let res = interpret_ancestor_probe_response(&[h_peer], mid, Some(h_ours.block_id()));
+        assert!(
+            matches!(res, Ok(Some(false))),
+            "midpoint diverge-with-len-1 must return Ok(Some(false)) so the \
+             site can retreat hi = mid - 1; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_overdelivery_with_match_still_advances_lo() {
+        // The bug the v1.11.1 follow-up addresses: pre-fix, the midpoint
+        // inlined `headers.len() != 1` → DeliveredInvalidHeader (strike).
+        // Post-fix it delegates to this helper. The helper must report
+        // match (Ok(Some(true))) so the site can advance lo and the
+        // binary search converges, NOT a strike that disconnects the peer.
+        let mid = 250_000;
+        let h0 = header_at(mid, 42);
+        let our_bid = Some(h0.block_id());
+        let mut batch = vec![h0];
+        for i in 1..64 {
+            batch.push(header_at(mid + i, 100 + i));
+        }
+        let res = interpret_ancestor_probe_response(&batch, mid, our_bid);
+        assert!(
+            matches!(res, Ok(Some(true))),
+            "midpoint over-delivery with matching hdrs[0] must return \
+             Ok(Some(true)) — pre-fix this returned the strike-class \
+             Err({:?}) which is what wedged sync at h=605,656",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_overdelivery_with_diverge_still_retreats_hi() {
+        // Same shape as above but the peer's hdrs[0] diverges. Must still
+        // return Ok(Some(false)) so the midpoint's hi retreats; the
+        // extras don't promote a fork to a protocol violation.
+        let mid = 250_000;
+        let h_ours = header_at(mid, 1);
+        let mut batch = vec![header_at(mid, 2)];
+        for i in 1..16 {
+            batch.push(header_at(mid + i, 100 + i));
+        }
+        let res = interpret_ancestor_probe_response(&batch, mid, Some(h_ours.block_id()));
+        assert!(matches!(res, Ok(Some(false))));
     }
 }
 
