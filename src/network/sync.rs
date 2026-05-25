@@ -6778,7 +6778,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         }
 
         // Derive all state from registry.by_identity
-        let (_best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
+        let (best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
             let peers = node.peers.lock().await;
             let our_tip = node.tip.read().await.clone();
             let now = std::time::Instant::now();
@@ -6862,7 +6862,29 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         // is observable. Without this, a stuck supervisor looks identical
         // to "node working fine, just no peer ahead" — and the wedges we
         // hit on fly.io were invisible until we read source code paths.
-        if should_ibd.is_none() && connected_count > 0 {
+        //
+        // The third clause (`peer_claims_ahead`) is load-bearing, NOT
+        // redundant: `should_ibd == None` is also the NORMAL state of a
+        // healthy node sitting at the network tip — `is_better_chain`
+        // returns false for every peer because we ARE the tip. Without the
+        // clause, an at-tip node with N connected same-height peers would
+        // log the breakdown every NO_IBD_DIAG_PERIOD_SECS forever, turning
+        // a wedge-only diagnostic into perpetual steady-state noise. We gate
+        // on `best_known_tip` (the highest tip ANY connected peer claims,
+        // confirmed or not) rather than `best_confirmed_work` so the
+        // diagnostic fires for both wedge subtypes: the confirmed-peer-ahead
+        // wedge AND the unconfirmed-claim wedge where no peer has been
+        // promoted to confirmed yet. A peer spamming a bogus high claim is
+        // itself useful signal — the breakdown rows show which peer it is.
+        let peer_claims_ahead = should_ibd.is_none()
+            && connected_count > 0
+            && {
+                let our_work = node.tip.read().await.cumulative_work;
+                best_known_tip
+                    .as_ref()
+                    .is_some_and(|t| t.cumulative_work > our_work)
+            };
+        if peer_claims_ahead {
             let now_inst = Instant::now();
             let emit = match last_no_ibd_diag {
                 Some(t) => now_inst.duration_since(t).as_secs() >= NO_IBD_DIAG_PERIOD_SECS,
