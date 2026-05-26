@@ -97,6 +97,16 @@ const UTXO_SNAPSHOT_COMPLETE_KEY: &str = "utxo_snapshot_complete";
 /// Open path trusts the snapshot only if this equals the current tip.
 #[allow(dead_code)] // writer wired in commit 6 (lazy migration).
 const UTXO_SNAPSHOT_TIP_KEY: &str = "utxo_snapshot_tip";
+/// Track 1 (issue #6) — 32-byte block_id through which the cheap structural
+/// per-block walk has been proven (header linkage, full-block structural
+/// checks, cumulative-work derivation). Advanced in lockstep with `TIP_KEY`
+/// by every atomic commit, so a healthy node that has not fallen behind can
+/// skip the genesis→tip walk on boot. Unlike the UTXO snapshot marker there
+/// is no separate "complete" flag: a block only reaches the commit path after
+/// full validation, so a present 32-byte value at the current tip is itself
+/// the proof. Absent → full walk (legacy datadir / post-rebuild / post
+/// --full-verify); stale ancestor → partial walk of the suffix only.
+const WALK_VERIFIED_TIP_KEY: &str = "walk_verified_tip";
 
 /// Serialize a list of spent UTXOs for storage.
 /// Format: count(u32 LE) || for each: tx_id(32) | output_index(u32 LE) | serialized_output | height(u64 LE) | is_coinbase(u8)
@@ -260,6 +270,29 @@ fn initialize_snapshot_marker_in_txn(
 ) -> Result<(), StorageError> {
     meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
     meta.insert(UTXO_SNAPSHOT_COMPLETE_KEY, &[0x01u8][..])?;
+    Ok(())
+}
+
+/// Track 1 (issue #6) — advance the walk-verified marker to `tip_id` in the
+/// caller's write transaction. Called from every atomic commit
+/// (`commit_genesis_atomic`, `commit_block_atomic`, `commit_reorg_atomic`)
+/// alongside the snapshot-marker write, so the marker always equals the tip
+/// after a successful commit. A crash before `write_txn.commit()` rolls the
+/// whole transaction back, so the marker can never point at a block that did
+/// not become canonical.
+///
+/// Unlike `advance_snapshot_marker_in_txn` there is **no `COMPLETE` gate**:
+/// the marker records "the canonical chain through this tip is structurally
+/// sound", and a block only reaches this commit path after full validation,
+/// so stamping the tip is always truthful — even on a legacy datadir whose
+/// historical blocks predate Track 1 (they were validated when first
+/// received). `open_chain` re-stamps after its own walk to bootstrap the
+/// marker on first boot of a 3a datadir.
+fn advance_walk_marker_in_txn(
+    meta: &mut redb::Table<&'static str, &'static [u8]>,
+    tip_id: &Hash256,
+) -> Result<(), StorageError> {
+    meta.insert(WALK_VERIFIED_TIP_KEY, tip_id.as_bytes().as_ref())?;
     Ok(())
 }
 
@@ -723,6 +756,11 @@ impl ChainStorage {
             let mut meta = write_txn.open_table(META_TABLE)?;
             meta.insert(UTXO_SNAPSHOT_COMPLETE_KEY, &[0x01u8][..])?;
             meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
+            // Track 1 — finalize is only reached after a full `replay_chain`,
+            // which validates every block (a strict superset of the structural
+            // walk). Stamp the walk marker too so the post-migration boot takes
+            // the fast path.
+            meta.insert(WALK_VERIFIED_TIP_KEY, tip_id.as_bytes().as_ref())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -750,6 +788,43 @@ impl ChainStorage {
             let mut meta = write_txn.open_table(META_TABLE)?;
             meta.remove(UTXO_SNAPSHOT_COMPLETE_KEY)?;
             meta.remove(UTXO_SNAPSHOT_TIP_KEY)?;
+            // Track 1 — drop the walk marker too so `--rebuild-state` forces a
+            // fresh full walk/replay that re-establishes it from scratch.
+            meta.remove(WALK_VERIFIED_TIP_KEY)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Track 1 (issue #6) — read the walk-verified tip marker. Returns
+    /// `Some(block_id)` iff a 32-byte value is present (no separate complete
+    /// flag — see `advance_walk_marker_in_txn`). `open_chain` compares this
+    /// against the current tip to decide skip / partial-walk / full-walk.
+    pub fn get_walk_verified_tip(&self) -> Result<Option<Hash256>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+        let tip = match table.get(WALK_VERIFIED_TIP_KEY)? {
+            Some(v) if v.value().len() == 32 => {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(v.value());
+                Hash256(buf)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(tip))
+    }
+
+    /// Track 1 (issue #6) — stamp the walk-verified marker at `tip_id` in a
+    /// standalone write_txn. Called by `open_chain` after a successful full or
+    /// partial structural walk (once the state_root cross-check has passed), so
+    /// that the next boot of a freshly-migrated / caught-up datadir skips the
+    /// walk. Steady-state advancement happens inside the atomic commits via
+    /// `advance_walk_marker_in_txn`.
+    pub fn set_walk_verified_tip(&self, tip_id: &Hash256) -> Result<(), StorageError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            meta.insert(WALK_VERIFIED_TIP_KEY, tip_id.as_bytes().as_ref())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -992,6 +1067,8 @@ impl ChainStorage {
             // marker keys; subsequent commit_block_atomic / commit_reorg_atomic
             // calls then advance just the tip pointer.
             initialize_snapshot_marker_in_txn(&mut meta, &block_id)?;
+            // Track 1: genesis is walk-trivially-verified.
+            advance_walk_marker_in_txn(&mut meta, &block_id)?;
 
             // Index genesis transaction IDs
             let mut tx_idx = write_txn.open_table(TX_INDEX_TABLE)?;
@@ -1054,6 +1131,10 @@ impl ChainStorage {
             // the open_chain fast path. apply_utxo_mutations below keeps
             // UTXOS_TABLE in lockstep with the in-memory UtxoSet.
             advance_snapshot_marker_in_txn(&mut meta, &block_id)?;
+            // Track 1 — advance the walk-verified marker in the same txn; this
+            // block was fully validated before reaching here, so the structural
+            // walk through the new tip is proven.
+            advance_walk_marker_in_txn(&mut meta, &block_id)?;
 
             // Block is now canonical — remove from fork tracker
             let mut fork_tbl = write_txn.open_table(FORK_BLOCKS_TABLE)?;
@@ -1215,6 +1296,11 @@ impl ChainStorage {
             // set in the two passes below (undo orphans + forward-apply new
             // chain), all inside this same write_txn.
             advance_snapshot_marker_in_txn(&mut meta, new_tip_id)?;
+            // Track 1 — point the walk-verified marker straight at the new tip
+            // in this same txn. The reorg's new-chain blocks were validated
+            // before this commit, and a crash before commit() rolls back to
+            // the prior tip, so the marker never references an orphaned hash.
+            advance_walk_marker_in_txn(&mut meta, new_tip_id)?;
 
             // Promoted blocks are now canonical — remove from fork tracker
             let mut fork_tbl = write_txn.open_table(FORK_BLOCKS_TABLE)?;
@@ -2289,6 +2375,150 @@ mod tests {
             utxos.get(&op_consumed),
             Some(&entry_consumed),
             "orphan-undo must restore the spent UTXO from SPENT_UTXOS_TABLE"
+        );
+    }
+
+    // ----- Track 1 (issue #6): WALK_VERIFIED_TIP marker lifecycle -----
+
+    #[test]
+    fn commit_genesis_atomic_sets_walk_marker_to_genesis() {
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let genesis = crate::genesis::genesis_block();
+        let gid = genesis.header.block_id();
+        let mut set = crate::chain::state::UtxoSet::new();
+        let mut muts: Vec<UtxoMutation> = Vec::new();
+        for tx in &genesis.transactions {
+            muts.extend(set.apply_transaction(tx, 0).unwrap());
+        }
+        storage
+            .commit_genesis_atomic(&genesis, &[0u8; 32], &muts)
+            .unwrap();
+        assert_eq!(
+            storage.get_walk_verified_tip().unwrap(),
+            Some(gid),
+            "genesis commit must seed the walk-verified marker"
+        );
+    }
+
+    #[test]
+    fn commit_block_atomic_advances_walk_marker_without_complete_gate() {
+        // Track 1: unlike the snapshot marker, the walk marker has NO COMPLETE
+        // precondition. Every committed block was fully validated on arrival,
+        // so the structural walk through the new tip is proven even on a legacy
+        // / unmigrated datadir where the snapshot marker is deliberately absent.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let work = [0u8; 32];
+
+        let block = test_block(); // height 0, no genesis snapshot initialization
+        let block_id = block.header.block_id();
+        let (op_a, entry_a) = sample_utxo(1);
+        storage
+            .commit_block_atomic(
+                &block,
+                &work,
+                &[],
+                &[UtxoMutation::Insert(op_a, entry_a)],
+            )
+            .unwrap();
+
+        assert!(
+            storage.get_utxo_snapshot_tip().unwrap().is_none(),
+            "snapshot marker stays absent (COMPLETE gate) on an unmigrated datadir"
+        );
+        assert_eq!(
+            storage.get_walk_verified_tip().unwrap(),
+            Some(block_id),
+            "walk marker advances regardless of the snapshot COMPLETE gate"
+        );
+
+        // Persists across reopen → open_chain would skip the walk.
+        drop(storage);
+        let storage2 = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        assert_eq!(
+            storage2.get_walk_verified_tip().unwrap(),
+            Some(block_id),
+            "walk marker persists across reopen"
+        );
+    }
+
+    #[test]
+    fn commit_reorg_atomic_advances_walk_marker_to_new_tip() {
+        // Track 1: a reorg points the walk marker straight at the new tip in
+        // the same write_txn that advances TIP_KEY. A crash before commit()
+        // rolls back, so the marker never references an orphaned hash.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+
+        let trigger_block = test_block();
+        let work = [1u8; 32];
+        let new_tip_id = trigger_block.header.block_id();
+
+        storage
+            .commit_reorg_atomic(
+                &trigger_block,
+                &work,
+                /* old_chain_blocks */ &[],
+                /* new_chain_spent */ &[],
+                /* new_chain_mutations */ &[],
+                &[(trigger_block.header.height, new_tip_id)],
+                /* new_chain_blocks */ &[],
+                /* new_chain_work */ &[],
+                /* stale_height_start */ None,
+                /* stale_height_end */ None,
+                &new_tip_id,
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_walk_verified_tip().unwrap(),
+            Some(new_tip_id),
+            "commit_reorg_atomic points the walk marker at the new tip"
+        );
+    }
+
+    #[test]
+    fn clear_utxo_snapshot_also_clears_walk_marker() {
+        // --rebuild-state path: clearing the snapshot must also drop the walk
+        // marker so the next boot does a fresh full walk/replay.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let genesis = crate::genesis::genesis_block();
+        let mut set = crate::chain::state::UtxoSet::new();
+        let mut muts: Vec<UtxoMutation> = Vec::new();
+        for tx in &genesis.transactions {
+            muts.extend(set.apply_transaction(tx, 0).unwrap());
+        }
+        storage
+            .commit_genesis_atomic(&genesis, &[0u8; 32], &muts)
+            .unwrap();
+        assert!(storage.get_walk_verified_tip().unwrap().is_some());
+
+        storage.clear_utxo_snapshot().unwrap();
+        assert!(
+            storage.get_walk_verified_tip().unwrap().is_none(),
+            "clear_utxo_snapshot (--rebuild-state) drops the walk marker too"
+        );
+    }
+
+    #[test]
+    fn finalize_utxo_snapshot_sets_walk_marker() {
+        // Post-replay finalize validated every block (a superset of the walk),
+        // so it stamps the walk marker for a fast next boot.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let genesis = crate::genesis::genesis_block();
+        let gid = genesis.header.block_id();
+        let mut set = crate::chain::state::UtxoSet::new();
+        for tx in &genesis.transactions {
+            set.apply_transaction(tx, 0).unwrap();
+        }
+        storage.finalize_utxo_snapshot(&set, &gid).unwrap();
+        assert_eq!(
+            storage.get_walk_verified_tip().unwrap(),
+            Some(gid),
+            "finalize_utxo_snapshot stamps the walk marker (replay ⊇ walk)"
         );
     }
 }
