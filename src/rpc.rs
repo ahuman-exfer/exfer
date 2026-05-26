@@ -533,8 +533,13 @@ async fn paged_utxos_for_script(
     limit: Option<usize>,
 ) -> Result<UtxoPage, RpcResponse> {
     let page = resolve_page_limit(limit);
-    // Snapshot tip height + id together so the expiry check and the height used
-    // for maturity come from the same read.
+    // Take the UTXO read lock FIRST, then read tip under it: process_block
+    // holds utxo_set.write() while advancing tip (src/network/sync.rs:2429,
+    // 2965-2970), so holding utxo_set.read() pins both the UTXO state AND
+    // the tip we're about to snapshot. Reading tip first and acquiring
+    // utxo_set later would let a block land between the two reads — the
+    // cursor would pin a stale tip while the walk saw post-block state.
+    let utxo_set = node.utxo_set.read().await;
     let (tip_height, tip_id) = {
         let tip = node.tip.read().await;
         (tip.height, tip.block_id)
@@ -559,10 +564,8 @@ async fn paged_utxos_for_script(
 
     let current_height = tip_height.saturating_add(1);
     // Probe page+1: the extra item (if any) proves a next page exists.
-    let mut matched = {
-        let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script_paged(script, current_height, after, page + 1)
-    };
+    let mut matched = utxo_set.utxos_for_script_paged(script, current_height, after, page + 1);
+    drop(utxo_set);
     let truncated = matched.len() > page;
     matched.truncate(page);
     let next_cursor = if truncated {
