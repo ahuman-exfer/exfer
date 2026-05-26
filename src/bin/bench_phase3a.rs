@@ -311,8 +311,54 @@ fn main() -> Result<(), String> {
         exp2_elapsed / exp4_modeled.max(1e-9)
     );
 
-    // Sanity: silence unused-binding warning for `tip_id`.
-    let _ = (open_chain, genesis_block, tip_id);
+    // ===== Experiment 5 (Track 1, issue #6): walk-checkpoint A/B =====
+    //
+    // Exp4 finalized the snapshot, which also stamps WALK_VERIFIED_TIP at the
+    // tip. So open_chain with trust_walk_marker=true takes the skip path (no
+    // structural walk, cumulative work read O(1) from WORK_TABLE), while
+    // trust_walk_marker=false (--full-verify) forces the full genesis→tip walk
+    // — the effective per-boot cost before Track 1. Headline:
+    //   exp5_forced_walk_open_secs  : --full-verify / pre-Track-1 boot walk cost
+    //   exp5_skip_open_secs         : Track 1 steady-state boot (walk skipped)
+    //   exp5_walk_eliminated_secs   : the part Track 1 removes every boot
+    // NOTE: on a chain BELOW ASSUME_VALID_HEIGHT the forced walk PoW-verifies
+    // every block (slow but correct); on a real chain past the checkpoint it
+    // uses skip_pow, matching Exp1.
+    eprintln!("# Exp5: walk-checkpoint A/B (forced walk vs skip)");
+
+    let storage_fv = Arc::new(ChainStorage::open(&db_path).map_err(|e| e.to_string())?);
+    let mut uset_fv = UtxoSet::new();
+    let exp5_walk_start = Instant::now();
+    let fv_tip = open_chain(&storage_fv, &mut uset_fv, &genesis_id, true, false, false)
+        .map_err(|e| format!("open_chain(--full-verify) failed: {}", e))?;
+    let exp5_forced_walk_secs = exp5_walk_start.elapsed().as_secs_f64();
+    println!("exp5_forced_walk_open_secs={:.4}", exp5_forced_walk_secs);
+    drop(uset_fv);
+    drop(storage_fv);
+
+    let storage_skip = Arc::new(ChainStorage::open(&db_path).map_err(|e| e.to_string())?);
+    let mut uset_skip = UtxoSet::new();
+    let exp5_skip_start = Instant::now();
+    let skip_tip = open_chain(&storage_skip, &mut uset_skip, &genesis_id, true, false, true)
+        .map_err(|e| format!("open_chain(skip) failed: {}", e))?;
+    let exp5_skip_secs = exp5_skip_start.elapsed().as_secs_f64();
+    println!("exp5_skip_open_secs={:.4}", exp5_skip_secs);
+    println!(
+        "exp5_walk_eliminated_secs={:.4}",
+        (exp5_forced_walk_secs - exp5_skip_secs).max(0.0)
+    );
+    println!(
+        "exp5_speedup={:.2}x",
+        exp5_forced_walk_secs / exp5_skip_secs.max(1e-9)
+    );
+    println!(
+        "exp5_tips_match={}",
+        fv_tip.block_id == skip_tip.block_id && skip_tip.block_id == tip_id
+    );
+    println!(
+        "exp5_cumulative_work_match={}",
+        fv_tip.cumulative_work == skip_tip.cumulative_work
+    );
 
     eprintln!("# DONE");
     Ok(())
