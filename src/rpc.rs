@@ -83,6 +83,10 @@ type TxRateLimiter =
 const MAX_RPC_TX_PER_MIN: u32 = 60;
 /// Per-IP rate limit for UTXO scan endpoints (get_balance, get_address_utxos, get_script_utxos).
 const MAX_RPC_SCAN_PER_MIN: u32 = 30;
+/// Maximum addresses accepted per batch read (get_balances / get_address_utxos_batch).
+/// One batch call consumes one scan-rate slot + one UTXO read lock, so this
+/// bounds the work a single rate-limited request can request.
+const MAX_BATCH_ADDRESSES: usize = 100;
 /// Maximum concurrent RPC connections.
 const MAX_RPC_CONNECTIONS: usize = 32;
 /// Per-connection read timeout (seconds).
@@ -285,6 +289,31 @@ async fn handle_connection(
 // Method dispatch
 // ---------------------------------------------------------------------------
 
+/// Enforce the per-IP scan rate limit (`MAX_RPC_SCAN_PER_MIN`) for the
+/// UTXO/address read endpoints. Returns `Some(error response)` if the caller is
+/// over budget, else `None`. Shared by the scan group and `get_address_mempool`.
+fn check_scan_rate_limit(
+    scan_limiter: &TxRateLimiter,
+    peer_ip: std::net::IpAddr,
+    id: &serde_json::Value,
+) -> Option<RpcResponse> {
+    let mut limiter = scan_limiter.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let entry = limiter.entry(peer_ip).or_insert((now, 0));
+    if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    if entry.1 > MAX_RPC_SCAN_PER_MIN {
+        return Some(RpcResponse::err(
+            id.clone(),
+            INTERNAL_ERROR,
+            "Rate limit exceeded: max 30 balance/utxo queries per minute".to_string(),
+        ));
+    }
+    None
+}
+
 async fn dispatch(
     req: RpcRequest,
     node: &Arc<Node>,
@@ -296,23 +325,14 @@ async fn dispatch(
     let id = req.id.clone();
     match req.method.as_str() {
         "get_block_height" => handle_get_block_height(id, node).await,
-        "get_balance" | "get_address_utxos" | "get_script_utxos" => {
+        "get_balance"
+        | "get_address_utxos"
+        | "get_script_utxos"
+        | "get_balances"
+        | "get_address_utxos_batch" => {
             // Rate limit UTXO scan endpoints: 30/min/IP
-            {
-                let mut limiter = scan_limiter.lock().unwrap_or_else(|e| e.into_inner());
-                let now = std::time::Instant::now();
-                let entry = limiter.entry(peer_ip).or_insert((now, 0));
-                if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
-                    *entry = (now, 0);
-                }
-                entry.1 += 1;
-                if entry.1 > MAX_RPC_SCAN_PER_MIN {
-                    return RpcResponse::err(
-                        id,
-                        INTERNAL_ERROR,
-                        "Rate limit exceeded: max 30 balance/utxo queries per minute".to_string(),
-                    );
-                }
+            if let Some(resp) = check_scan_rate_limit(scan_limiter, peer_ip, &id) {
+                return resp;
             }
             // Serialize: at most 1 scan holds the read lock at a time
             let _permit = utxo_scan_sem.acquire().await;
@@ -320,8 +340,21 @@ async fn dispatch(
                 "get_balance" => handle_get_balance(id, req.params, node).await,
                 "get_address_utxos" => handle_get_address_utxos(id, req.params, node).await,
                 "get_script_utxos" => handle_get_script_utxos(id, req.params, node).await,
+                "get_balances" => handle_get_balances(id, req.params, node).await,
+                "get_address_utxos_batch" => {
+                    handle_get_address_utxos_batch(id, req.params, node).await
+                }
                 _ => unreachable!(),
             }
+        }
+        "get_address_mempool" => {
+            // Scan-rate-limited (counts toward the 30/min budget) but NOT held
+            // under utxo_scan_sem: this endpoint only touches the mempool lock
+            // briefly, not the UTXO read lock the semaphore exists to protect.
+            if let Some(resp) = check_scan_rate_limit(scan_limiter, peer_ip, &id) {
+                return resp;
+            }
+            handle_get_address_mempool(id, req.params, node).await
         }
         "get_block" => handle_get_block(id, req.params, node).await,
         "get_transaction" => handle_get_transaction(id, req.params, node).await,
@@ -558,6 +591,242 @@ async fn handle_get_script_utxos(
             "script_hex": parsed.script_hex,
             "utxos": utxos,
             "truncated": truncated,
+            "tip_height": tip_height,
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// get_address_mempool
+// ---------------------------------------------------------------------------
+
+async fn handle_get_address_mempool(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: GetBalanceParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+
+    let addr_bytes = match hex::decode(&parsed.address) {
+        Ok(b) => b,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+    };
+    if addr_bytes.len() != 32 {
+        return RpcResponse::err(
+            id,
+            INVALID_PARAMS,
+            format!(
+                "Address must be 32 bytes (64 hex chars), got {}",
+                addr_bytes.len()
+            ),
+        );
+    }
+
+    let tip_height = node.tip.read().await.height;
+    // Brief mempool lock: collect the address-scoped view, format JSON after.
+    let txs = {
+        let mempool = node.mempool.lock().await;
+        mempool.address_mempool(&addr_bytes)
+    };
+
+    let mempool_json: Vec<serde_json::Value> = txs
+        .iter()
+        .map(|t| {
+            let received: Vec<serde_json::Value> = t
+                .received
+                .iter()
+                .map(|(idx, val)| serde_json::json!({ "output_index": idx, "value": val }))
+                .collect();
+            let spent: Vec<serde_json::Value> = t
+                .spent
+                .iter()
+                .map(|(op, val)| {
+                    serde_json::json!({
+                        "tx_id": hex::encode(op.tx_id.as_bytes()),
+                        "output_index": op.output_index,
+                        "value": val,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "tx_id": hex::encode(t.tx_id.as_bytes()),
+                "received": received,
+                "spent": spent,
+            })
+        })
+        .collect();
+
+    RpcResponse::ok(
+        id,
+        serde_json::json!({
+            "address": parsed.address,
+            "tip_height": tip_height,
+            "mempool": mempool_json,
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// get_balances / get_address_utxos_batch (batch reads)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BatchAddressParams {
+    addresses: Vec<String>,
+}
+
+/// Validate + hex-decode a batch address list into 32-byte scripts, paired with
+/// the original hex string for echoing back. Returns an error response on the
+/// first malformed or out-of-bounds input.
+fn decode_batch_addresses(
+    id: &serde_json::Value,
+    addresses: &[String],
+) -> Result<Vec<(String, Vec<u8>)>, RpcResponse> {
+    if addresses.is_empty() {
+        return Err(RpcResponse::err(
+            id.clone(),
+            INVALID_PARAMS,
+            "addresses must not be empty".to_string(),
+        ));
+    }
+    if addresses.len() > MAX_BATCH_ADDRESSES {
+        return Err(RpcResponse::err(
+            id.clone(),
+            INVALID_PARAMS,
+            format!(
+                "too many addresses (got {}, max {})",
+                addresses.len(),
+                MAX_BATCH_ADDRESSES
+            ),
+        ));
+    }
+    let mut decoded = Vec::with_capacity(addresses.len());
+    for addr in addresses {
+        let bytes = match hex::decode(addr) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(RpcResponse::err(
+                    id.clone(),
+                    INVALID_PARAMS,
+                    format!("Invalid hex in '{}': {}", addr, e),
+                ))
+            }
+        };
+        if bytes.len() != 32 {
+            return Err(RpcResponse::err(
+                id.clone(),
+                INVALID_PARAMS,
+                format!(
+                    "Address '{}' must be 32 bytes (64 hex chars), got {}",
+                    addr,
+                    bytes.len()
+                ),
+            ));
+        }
+        decoded.push((addr.clone(), bytes));
+    }
+    Ok(decoded)
+}
+
+async fn handle_get_balances(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: BatchAddressParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+    let decoded = match decode_batch_addresses(&id, &parsed.addresses) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    let current_height = node.tip.read().await.height.saturating_add(1);
+    // One read lock for the whole batch; collect raw, format after release.
+    let collected: Vec<(String, u64)> = {
+        let utxo_set = node.utxo_set.read().await;
+        decoded
+            .into_iter()
+            .map(|(addr, script)| {
+                let bal = utxo_set.balance_for_script(&script, current_height);
+                (addr, bal)
+            })
+            .collect()
+    };
+
+    let balances: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|(addr, bal)| serde_json::json!({ "address": addr, "balance": bal }))
+        .collect();
+
+    RpcResponse::ok(id, serde_json::json!({ "balances": balances }))
+}
+
+async fn handle_get_address_utxos_batch(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: BatchAddressParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+    let decoded = match decode_batch_addresses(&id, &parsed.addresses) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    let tip_height = node.tip.read().await.height;
+    let current_height = tip_height.saturating_add(1);
+    const MAX_UTXO_RESULTS: usize = 1000;
+
+    // One read lock for the whole batch; collect raw, format after release.
+    #[allow(clippy::type_complexity)]
+    let collected: Vec<(String, Vec<(OutPoint, u64, u64, bool)>, bool)> = {
+        let utxo_set = node.utxo_set.read().await;
+        decoded
+            .into_iter()
+            .map(|(addr, script)| {
+                let mut matched =
+                    utxo_set.utxos_for_script(&script, current_height, MAX_UTXO_RESULTS + 1);
+                let truncated = matched.len() > MAX_UTXO_RESULTS;
+                matched.truncate(MAX_UTXO_RESULTS);
+                (addr, matched, truncated)
+            })
+            .collect()
+    };
+
+    let addresses: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|(addr, matched, truncated)| {
+            let utxos: Vec<serde_json::Value> = matched
+                .iter()
+                .map(|(outpoint, val, h, cb)| {
+                    serde_json::json!({
+                        "tx_id": hex::encode(outpoint.tx_id.as_bytes()),
+                        "output_index": outpoint.output_index,
+                        "value": val,
+                        "height": h,
+                        "is_coinbase": cb,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "address": addr,
+                "utxos": utxos,
+                "truncated": truncated,
+            })
+        })
+        .collect();
+
+    RpcResponse::ok(
+        id,
+        serde_json::json!({
+            "addresses": addresses,
             "tip_height": tip_height,
         }),
     )
@@ -846,7 +1115,14 @@ async fn handle_send_raw_transaction(
             }
 
             let tx_for_relay = tx.clone();
-            match mempool.add_validated(tx, fee, script_cost, script_validation_cost, height) {
+            match mempool.add_validated(
+                tx,
+                fee,
+                script_cost,
+                script_validation_cost,
+                height,
+                &utxo_snapshot,
+            ) {
                 Ok(added_tx_id) => {
                     drop(mempool);
                     // Broadcast to peers
