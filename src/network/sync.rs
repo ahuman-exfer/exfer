@@ -3023,7 +3023,11 @@ impl Node {
                 } // utxo read lock released before validation
 
                 // Validate each orphaned tx against its snapshot (no lock held).
-                let mut validated_orphans: Vec<(Transaction, u64, u128, u128)> = Vec::new();
+                // Carry the per-tx snapshot alongside so the mempool can resolve
+                // the spent-input scripts for its by_script index — without it,
+                // every reorg would silently drop index rows for reintroduced txs.
+                let mut validated_orphans: Vec<(Transaction, u64, u128, u128, &UtxoSet)> =
+                    Vec::new();
                 for (tx, snap) in orphaned_txs.iter().zip(tx_snapshots.iter()) {
                     match crate::consensus::validation::validate_transaction(
                         tx,
@@ -3036,6 +3040,7 @@ impl Node {
                                 fee,
                                 script_cost,
                                 script_validation_cost,
+                                snap,
                             ));
                         }
                         Err(_) => {
@@ -3048,13 +3053,14 @@ impl Node {
                 if !validated_orphans.is_empty() {
                     let mut mempool = self.mempool.lock().await;
                     let mut reintroduced = 0u32;
-                    for (tx, fee, script_cost, script_validation_cost) in validated_orphans {
+                    for (tx, fee, script_cost, script_validation_cost, snap) in validated_orphans {
                         let _ = mempool.add_validated(
                             tx,
                             fee,
                             script_cost,
                             script_validation_cost,
                             reintro_height,
+                            snap,
                         );
                         reintroduced += 1;
                     }
@@ -4047,6 +4053,7 @@ impl Node {
                                 script_cost,
                                 script_validation_cost,
                                 height,
+                                &utxo_snapshot,
                             ) {
                                 Ok(tx_id) => {
                                     tracing::debug!("Added tx {} from {}", tx_id, meta.addr);

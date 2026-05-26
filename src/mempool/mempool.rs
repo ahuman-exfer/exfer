@@ -4,10 +4,25 @@ use crate::consensus::validation::{validate_transaction, ValidationError};
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use crate::types::{COINBASE_MATURITY, MEMPOOL_CAPACITY};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Maximum total serialized bytes allowed in the mempool (256 MiB).
 const MAX_MEMPOOL_BYTES: usize = 256 * 1024 * 1024;
+
+/// A resolved spent input: the outpoint a mempool tx consumes plus the script
+/// (32-byte address) and value of the UTXO it spent.
+///
+/// Captured at admission from the validation UTXO snapshot (which is already in
+/// hand at every `add_validated` call site) and consumed at removal so the
+/// spend-side `by_script` rows can be de-indexed without re-resolving against a
+/// UTXO set that has since changed. The `value` also feeds the outgoing amounts
+/// reported by `address_mempool`.
+#[derive(Clone, Debug)]
+struct SpentInput {
+    outpoint: OutPoint,
+    script: Vec<u8>,
+    value: u64,
+}
 
 /// A transaction in the mempool, with cached metadata.
 #[derive(Clone, Debug)]
@@ -19,6 +34,24 @@ struct MempoolEntry {
     _tx_cost: u64,
     /// Fee density = fee / tx_cost (scaled by 1_000_000 for integer precision).
     fee_density: u64,
+    /// Resolved UTXOs this tx spends — kept so the spend-side `by_script` index
+    /// can be maintained at removal without re-resolving inputs.
+    spent_inputs: Vec<SpentInput>,
+}
+
+/// Address-scoped view of one unconfirmed transaction, returned by
+/// `Mempool::address_mempool`. Carries the outputs paying the queried address
+/// (`received`) and the outpoints this tx spent that were locked to the queried
+/// address (`spent`), each with amounts — enough for a wallet to render a
+/// receiver-side pending delta without a follow-up per-tx lookup.
+#[derive(Clone, Debug)]
+pub struct MempoolAddressTx {
+    pub tx_id: Hash256,
+    /// (output_index, value) for outputs of this tx paying the queried address.
+    pub received: Vec<(u32, u64)>,
+    /// (spent_outpoint, value) for inputs of this tx that consumed a UTXO
+    /// locked to the queried address.
+    pub spent: Vec<(OutPoint, u64)>,
 }
 
 /// Transaction memory pool.
@@ -34,6 +67,11 @@ pub struct Mempool {
     by_fee_density: BTreeMap<(u64, Hash256), Hash256>,
     /// Track which outpoints are spent by mempool transactions.
     spent_outpoints: HashSet<OutPoint>,
+    /// Secondary index: script bytes (32-byte address) → the set of mempool
+    /// tx_ids touching that script, either by paying an output to it OR by
+    /// spending a UTXO locked to it. Mirrors `UtxoSet::by_script`. Bounded by
+    /// the mempool cap, so always tiny. `BTreeSet` for deterministic iteration.
+    by_script: BTreeMap<Vec<u8>, BTreeSet<Hash256>>,
     /// Total serialized bytes of all transactions currently in the mempool.
     total_bytes: usize,
 }
@@ -44,6 +82,7 @@ impl Mempool {
             entries: HashMap::new(),
             by_fee_density: BTreeMap::new(),
             spent_outpoints: HashSet::new(),
+            by_script: BTreeMap::new(),
             total_bytes: 0,
         }
     }
@@ -57,6 +96,65 @@ impl Mempool {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Resolve a tx's inputs against a UTXO snapshot into `SpentInput`s.
+    ///
+    /// Callers already hold a snapshot covering exactly these outpoints (the
+    /// validation snapshot built via `UtxoSet::snapshot_for_outpoints`). Inputs
+    /// not present in the snapshot are skipped — for a tx that passed validation
+    /// against this snapshot that cannot happen, but skipping keeps the index
+    /// maintenance total rather than panicking on an unexpected gap.
+    fn resolve_spent_inputs(tx: &Transaction, resolved: &UtxoSet) -> Vec<SpentInput> {
+        let mut spent = Vec::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            let outpoint = OutPoint::new(input.prev_tx_id, input.output_index);
+            if let Some(utxo) = resolved.get(&outpoint) {
+                spent.push(SpentInput {
+                    outpoint,
+                    script: utxo.output.script.clone(),
+                    value: utxo.output.value,
+                });
+            }
+        }
+        spent
+    }
+
+    /// Add this entry's tx_id to the `by_script` index under every script it
+    /// touches — output scripts (incoming) and resolved spent-input scripts
+    /// (outgoing).
+    fn index_entry(&mut self, entry: &MempoolEntry) {
+        for output in &entry.tx.outputs {
+            self.by_script
+                .entry(output.script.clone())
+                .or_default()
+                .insert(entry.tx_id);
+        }
+        for spent in &entry.spent_inputs {
+            self.by_script
+                .entry(spent.script.clone())
+                .or_default()
+                .insert(entry.tx_id);
+        }
+    }
+
+    /// Remove this entry's tx_id from the `by_script` index, pruning any script
+    /// whose set becomes empty (mirrors `UtxoSet::remove`).
+    fn deindex_entry(&mut self, entry: &MempoolEntry) {
+        let scripts = entry
+            .tx
+            .outputs
+            .iter()
+            .map(|o| &o.script)
+            .chain(entry.spent_inputs.iter().map(|s| &s.script));
+        for script in scripts {
+            if let Some(set) = self.by_script.get_mut(script) {
+                set.remove(&entry.tx_id);
+                if set.is_empty() {
+                    self.by_script.remove(script);
+                }
+            }
+        }
     }
 
     /// Cheap pre-screen: returns Err if tx is already known or conflicts with
@@ -137,6 +235,7 @@ impl Mempool {
             fee,
             _tx_cost: tx_cost,
             fee_density,
+            spent_inputs: Self::resolve_spent_inputs(&tx, utxo_set),
         };
 
         let tx_bytes = tx.serialized_size().unwrap_or(0);
@@ -167,6 +266,7 @@ impl Mempool {
 
         self.by_fee_density.insert((fee_density, tx_id), tx_id);
         self.total_bytes += tx_bytes;
+        self.index_entry(&entry);
         self.entries.insert(tx_id, entry);
 
         Ok(tx_id)
@@ -184,6 +284,7 @@ impl Mempool {
         script_cost: u128,
         script_validation_cost: u128,
         _current_height: u64,
+        resolved_inputs: &UtxoSet,
     ) -> Result<Hash256, MempoolError> {
         let tx_id = tx
             .tx_id()
@@ -218,6 +319,7 @@ impl Mempool {
             fee,
             _tx_cost: tx_cost_val,
             fee_density,
+            spent_inputs: Self::resolve_spent_inputs(&tx, resolved_inputs),
         };
 
         let tx_bytes = tx.serialized_size().unwrap_or(0);
@@ -246,6 +348,7 @@ impl Mempool {
 
         self.by_fee_density.insert((fee_density, tx_id), tx_id);
         self.total_bytes += tx_bytes;
+        self.index_entry(&entry);
         self.entries.insert(tx_id, entry);
 
         Ok(tx_id)
@@ -256,6 +359,7 @@ impl Mempool {
         if let Some(entry) = self.entries.remove(tx_id) {
             self.by_fee_density
                 .remove(&(entry.fee_density, entry.tx_id));
+            self.deindex_entry(&entry);
             for input in &entry.tx.inputs {
                 let outpoint = OutPoint::new(input.prev_tx_id, input.output_index);
                 self.spent_outpoints.remove(&outpoint);
@@ -274,6 +378,7 @@ impl Mempool {
         if let Some((&key, &tx_id)) = self.by_fee_density.first_key_value() {
             self.by_fee_density.remove(&key);
             if let Some(entry) = self.entries.remove(&tx_id) {
+                self.deindex_entry(&entry);
                 for input in &entry.tx.inputs {
                     let outpoint = OutPoint::new(input.prev_tx_id, input.output_index);
                     self.spent_outpoints.remove(&outpoint);
@@ -420,6 +525,49 @@ impl Mempool {
     pub fn is_spent(&self, outpoint: &OutPoint) -> bool {
         self.spent_outpoints.contains(outpoint)
     }
+
+    /// Return the unconfirmed transactions touching `script` (a 32-byte
+    /// address), with the per-tx amounts a wallet needs to render a pending
+    /// receiver-side balance. O(k) via the `by_script` index, where k = txs
+    /// touching the script.
+    ///
+    /// For each touching tx: `received` lists the outputs paying `script`
+    /// (index + value), and `spent` lists the outpoints this tx consumed that
+    /// were locked to `script` (outpoint + value). A tx that both pays and
+    /// spends `script` appears once with both populated.
+    pub fn address_mempool(&self, script: &[u8]) -> Vec<MempoolAddressTx> {
+        let tx_ids = match self.by_script.get(script) {
+            Some(set) => set,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(tx_ids.len());
+        for tx_id in tx_ids {
+            let entry = match self.entries.get(tx_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            let received: Vec<(u32, u64)> = entry
+                .tx
+                .outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.script.as_slice() == script)
+                .map(|(idx, o)| (idx as u32, o.value))
+                .collect();
+            let spent: Vec<(OutPoint, u64)> = entry
+                .spent_inputs
+                .iter()
+                .filter(|s| s.script.as_slice() == script)
+                .map(|s| (s.outpoint, s.value))
+                .collect();
+            out.push(MempoolAddressTx {
+                tx_id: *tx_id,
+                received,
+                spent,
+            });
+        }
+        out
+    }
 }
 
 impl Default for Mempool {
@@ -554,5 +702,202 @@ mod tests {
         let removed = mempool.remove(&tx_id).unwrap();
         assert_eq!(removed, tx);
         assert_eq!(mempool.len(), 0);
+    }
+
+    // ── by_script index (issue #15 Tier 1) ──
+
+    fn script_of(pubkey: &[u8; 32]) -> Vec<u8> {
+        TxOutput::pubkey_hash_from_key(pubkey).0.to_vec()
+    }
+
+    /// Build (utxo_set, signed tx, sender_script, recipient_script): the tx
+    /// spends a fresh 1 EXFER UTXO locked to a random key and pays `recipient`.
+    /// Distinct `seed` ⇒ distinct outpoint/txid.
+    fn signed_spend(recipient: &[u8; 32], seed: &[u8]) -> (UtxoSet, Transaction, Vec<u8>, Vec<u8>) {
+        let mut utxo_set = UtxoSet::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let prev_tx_id = Hash256::sha256(seed);
+        let outpoint = OutPoint::new(prev_tx_id, 0);
+        utxo_set
+            .insert(
+                outpoint,
+                UtxoEntry {
+                    output: TxOutput::new_p2pkh(1_000_000_000, &pubkey),
+                    height: 0,
+                    is_coinbase: false,
+                },
+            )
+            .expect("insert test UTXO");
+        let mut tx = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id,
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(900_000_000, recipient)],
+            witnesses: vec![TxWitness {
+                witness: vec![0u8; 96],
+                redeemer: None,
+            }],
+        };
+        let sig_msg = tx.sig_message().unwrap();
+        let signature = signing_key.sign(&sig_msg);
+        let mut wd = Vec::with_capacity(96);
+        wd.extend_from_slice(&pubkey);
+        wd.extend_from_slice(&signature.to_bytes());
+        tx.witnesses[0].witness = wd;
+        (utxo_set, tx, script_of(&pubkey), script_of(recipient))
+    }
+
+    /// Admit via the production `add_validated` path: build the resolving
+    /// snapshot the real call sites pass, validate for the costs, then admit.
+    fn add_validated_with_snapshot(
+        mempool: &mut Mempool,
+        utxo_set: &UtxoSet,
+        tx: Transaction,
+        height: u64,
+    ) -> Hash256 {
+        let outpoints: Vec<OutPoint> = tx
+            .inputs
+            .iter()
+            .map(|i| OutPoint::new(i.prev_tx_id, i.output_index))
+            .collect();
+        let snap = utxo_set.snapshot_for_outpoints(&outpoints);
+        let (fee, sc, svc) = validate_transaction(&tx, utxo_set, height).expect("valid tx");
+        mempool
+            .add_validated(tx, fee, sc, svc, height, &snap)
+            .expect("admit")
+    }
+
+    #[test]
+    fn add_validated_indexes_incoming_and_outgoing() {
+        let recipient = [7u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"A");
+        let mut mempool = Mempool::new();
+        let tx_id = add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+        assert!(
+            mempool
+                .by_script
+                .get(&recipient_script)
+                .unwrap()
+                .contains(&tx_id),
+            "output (incoming) script must be indexed"
+        );
+        assert!(
+            mempool
+                .by_script
+                .get(&sender_script)
+                .unwrap()
+                .contains(&tx_id),
+            "spent-input (outgoing) script must be indexed"
+        );
+    }
+
+    #[test]
+    fn remove_deindexes_both_sides() {
+        let recipient = [8u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"B");
+        let mut mempool = Mempool::new();
+        let tx_id = add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+        mempool.remove(&tx_id).unwrap();
+        assert!(mempool.by_script.get(&recipient_script).is_none());
+        assert!(mempool.by_script.get(&sender_script).is_none());
+        assert!(mempool.by_script.is_empty(), "empty sets must be pruned");
+    }
+
+    #[test]
+    fn evict_lowest_deindexes() {
+        let recipient = [9u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"C");
+        let mut mempool = Mempool::new();
+        add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+        mempool.evict_lowest();
+        assert!(mempool.by_script.get(&recipient_script).is_none());
+        assert!(mempool.by_script.get(&sender_script).is_none());
+    }
+
+    #[test]
+    fn two_txs_same_recipient_coexist() {
+        let recipient = [11u8; 32];
+        let (us1, tx1, _s1, recipient_script) = signed_spend(&recipient, b"D1");
+        let (us2, tx2, _s2, _r2) = signed_spend(&recipient, b"D2");
+        let mut mempool = Mempool::new();
+        let id1 = add_validated_with_snapshot(&mut mempool, &us1, tx1, 100);
+        let id2 = add_validated_with_snapshot(&mut mempool, &us2, tx2, 100);
+        let set = mempool.by_script.get(&recipient_script).unwrap();
+        assert!(set.contains(&id1) && set.contains(&id2));
+        mempool.remove(&id1).unwrap();
+        let set = mempool.by_script.get(&recipient_script).unwrap();
+        assert!(
+            !set.contains(&id1) && set.contains(&id2),
+            "removing one leaves the other indexed"
+        );
+    }
+
+    #[test]
+    fn address_mempool_reports_amounts() {
+        let recipient = [12u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"E");
+        let mut mempool = Mempool::new();
+        let tx_id = add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+
+        // Recipient side: one received output of 900_000_000, nothing spent.
+        let recv = mempool.address_mempool(&recipient_script);
+        assert_eq!(recv.len(), 1);
+        assert_eq!(recv[0].tx_id, tx_id);
+        assert_eq!(recv[0].received, vec![(0u32, 900_000_000)]);
+        assert!(recv[0].spent.is_empty());
+
+        // Sender side: one spent input of 1_000_000_000, nothing received.
+        let sent = mempool.address_mempool(&sender_script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tx_id, tx_id);
+        assert!(sent[0].received.is_empty());
+        assert_eq!(sent[0].spent.len(), 1);
+        assert_eq!(sent[0].spent[0].1, 1_000_000_000);
+    }
+
+    #[test]
+    fn remove_confirmed_clears_by_script() {
+        // Confirm path: a tx touching X in mempool, then its block confirms it.
+        let recipient = [13u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"F");
+        let mut mempool = Mempool::new();
+        add_validated_with_snapshot(&mut mempool, &utxo_set, tx.clone(), 100);
+        assert!(mempool.by_script.contains_key(&recipient_script));
+        mempool.remove_confirmed(&[tx]);
+        assert!(mempool.by_script.get(&recipient_script).is_none());
+        assert!(mempool.by_script.get(&sender_script).is_none());
+        assert!(mempool.by_script.is_empty());
+    }
+
+    #[test]
+    fn reorg_reintroduction_repopulates_by_script() {
+        // Correction A (inverse): a tx in mempool is confirmed away, then a
+        // reorg reintroduces it via add_validated — index rows must come back.
+        let recipient = [14u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"G");
+        let mut mempool = Mempool::new();
+        let id1 = add_validated_with_snapshot(&mut mempool, &utxo_set, tx.clone(), 100);
+        mempool.remove_confirmed(&[tx.clone()]);
+        assert!(mempool.by_script.is_empty(), "confirmed away");
+        // Reorg orphans that block; the tx is re-validated against its snapshot
+        // and re-admitted (the sync.rs:3052 reintroduction path).
+        let id2 = add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+        assert_eq!(id1, id2, "same tx ⇒ same id");
+        assert!(
+            mempool
+                .by_script
+                .get(&recipient_script)
+                .unwrap()
+                .contains(&id2)
+        );
+        assert!(
+            mempool
+                .by_script
+                .get(&sender_script)
+                .unwrap()
+                .contains(&id2)
+        );
     }
 }
