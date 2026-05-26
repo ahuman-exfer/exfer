@@ -161,6 +161,13 @@ enum Commands {
         /// UTXO snapshot is rebuilt. Implies `--auto-migrate`.
         #[arg(long)]
         rebuild_state: bool,
+        /// One-shot: force a full genesis→tip structural walk on this boot,
+        /// ignoring the Track 1 walk checkpoint (issue #6). The marker is
+        /// re-stamped afterward, so subsequent restarts return to the fast
+        /// path. Use for defense-in-depth re-verification of canonical block
+        /// integrity (header linkage, block bodies, tx-roots, coinbase shape).
+        #[arg(long)]
+        full_verify: bool,
     },
     /// Run the miner
     Mine {
@@ -213,6 +220,10 @@ enum Commands {
         /// `--auto-migrate`.
         #[arg(long)]
         rebuild_state: bool,
+        /// One-shot: force a full genesis→tip structural walk on this boot,
+        /// ignoring the Track 1 walk checkpoint (see `node --full-verify`).
+        #[arg(long)]
+        full_verify: bool,
     },
     /// Wallet operations
     Wallet {
@@ -808,9 +819,10 @@ async fn main() {
             purge_bans,
             no_auto_migrate,
             rebuild_state,
+            full_verify,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -830,6 +842,7 @@ async fn main() {
             purge_bans,
             no_auto_migrate,
             rebuild_state,
+            full_verify,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -852,7 +865,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2857,8 +2870,12 @@ async fn run_node(
     purge_bans: bool,
     no_auto_migrate: bool,
     rebuild_state: bool,
+    full_verify: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
+    // Track 1 (issue #6): --full-verify forces open_chain's full structural
+    // walk by withholding trust in the WALK_VERIFIED_TIP marker for this boot.
+    let trust_walk_marker = !full_verify;
     // --rebuild-state forces auto_migrate=true: after clearing the snapshot
     // we WANT open_chain's fallback to finalize a fresh one in the same boot.
     let auto_migrate = !no_auto_migrate || rebuild_state;
@@ -3114,6 +3131,7 @@ async fn run_node(
         &expected_genesis_id,
         assume_valid,
         auto_migrate,
+        trust_walk_marker,
     )
     .map_err(|e| {
         format!(
