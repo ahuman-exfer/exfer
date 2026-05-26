@@ -365,6 +365,53 @@ impl UtxoSet {
         }
         results
     }
+
+    /// Cursor-paginated variant of `utxos_for_script`. Returns at most `limit`
+    /// mature UTXOs whose `OutPoint` sorts strictly after `after` (when given),
+    /// in ascending `OutPoint` order — the order of the underlying `by_script`
+    /// BTreeSet. Pass `None` for the first page; pass the last returned
+    /// `OutPoint` to fetch the next page. O(scanned) per page.
+    ///
+    /// Unlike `utxos_for_script`, this lets a caller walk an address with more
+    /// than `limit` UTXOs to completion instead of silently dropping the rest.
+    pub fn utxos_for_script_paged(
+        &self,
+        script: &[u8],
+        current_height: u64,
+        after: Option<OutPoint>,
+        limit: usize,
+    ) -> Vec<(OutPoint, u64, u64, bool)> {
+        let outpoints = match self.by_script.get(script) {
+            Some(set) => set,
+            None => return Vec::new(),
+        };
+        let mut results = Vec::new();
+        // Iterate the set strictly after the cursor outpoint (or from the start).
+        let iter: Box<dyn Iterator<Item = &OutPoint>> = match after {
+            Some(cursor) => Box::new(outpoints.range((
+                std::ops::Bound::Excluded(cursor),
+                std::ops::Bound::Unbounded,
+            ))),
+            None => Box::new(outpoints.iter()),
+        };
+        for op in iter {
+            if let Some(entry) = self.utxos.get(op) {
+                let mature = if entry.is_coinbase {
+                    current_height.saturating_sub(entry.height)
+                        >= super::super::types::COINBASE_MATURITY
+                } else {
+                    true
+                };
+                if mature {
+                    results.push((*op, entry.output.value, entry.height, entry.is_coinbase));
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        results
+    }
 }
 
 impl Default for UtxoSet {
@@ -506,5 +553,62 @@ mod tests {
             .undo_transaction(&spend_tx, &[(outpoint, prev_entry)])
             .unwrap();
         assert_eq!(utxo_set.state_root(), root_before);
+    }
+
+    #[test]
+    fn utxos_for_script_paged_walks_full_set_without_dropping() {
+        // Five mature UTXOs locked to one script. Paging with limit=2 must
+        // surface all five across pages (the old single-shot cap would drop
+        // anything past the limit), in ascending OutPoint order, no overlap.
+        let pubkey = [9u8; 32];
+        let script = TxOutput::pubkey_hash_from_key(&pubkey).0.to_vec();
+        let mut utxo_set = UtxoSet::new();
+        for i in 0u32..5 {
+            let outpoint = OutPoint::new(Hash256::sha256(&[i as u8]), 0);
+            utxo_set
+                .insert(
+                    outpoint,
+                    UtxoEntry {
+                        output: TxOutput::new_p2pkh(100 + i as u64, &pubkey),
+                        height: 0,
+                        is_coinbase: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut after: Option<OutPoint> = None;
+        loop {
+            let page = utxo_set.utxos_for_script_paged(&script, 10, after, 2);
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 2);
+            for (op, _, _, _) in &page {
+                seen.push(*op);
+            }
+            // Stop once a partial page proves the set is exhausted.
+            if page.len() < 2 {
+                break;
+            }
+            after = Some(page.last().unwrap().0);
+        }
+
+        assert_eq!(seen.len(), 5, "all five UTXOs must be reachable via paging");
+        // Strictly ascending — no duplicates, correct order.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "no duplicates across pages");
+        assert_eq!(seen, sorted, "pages must be in ascending OutPoint order");
+    }
+
+    #[test]
+    fn utxos_for_script_paged_empty_for_unknown_script() {
+        let utxo_set = UtxoSet::new();
+        assert!(utxo_set
+            .utxos_for_script_paged(&[0u8; 32], 10, None, 100)
+            .is_empty());
     }
 }

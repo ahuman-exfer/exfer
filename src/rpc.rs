@@ -448,15 +448,62 @@ async fn handle_get_balance(
 }
 
 // ---------------------------------------------------------------------------
+// UTXO scan pagination
+// ---------------------------------------------------------------------------
+
+/// Max UTXOs returned in one page of get_address_utxos / get_script_utxos.
+/// Also the default page size when the caller omits `limit`.
+const UTXO_PAGE_LIMIT: usize = 1000;
+
+/// Encode a UTXO-set cursor as `"<tx_id_hex>:<output_index>"`. Returned as
+/// `next_cursor` and passed back as `cursor` to fetch the next page.
+fn encode_utxo_cursor(op: &OutPoint) -> String {
+    format!("{}:{}", hex::encode(op.tx_id.as_bytes()), op.output_index)
+}
+
+/// Parse a `"<tx_id_hex>:<output_index>"` cursor into an `OutPoint`.
+fn parse_utxo_cursor(s: &str) -> Result<OutPoint, String> {
+    let (tx_hex, idx_str) = s
+        .split_once(':')
+        .ok_or_else(|| "cursor must be '<tx_id_hex>:<output_index>'".to_string())?;
+    let bytes = hex::decode(tx_hex).map_err(|e| format!("invalid cursor tx_id hex: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!("cursor tx_id must be 32 bytes, got {}", bytes.len()));
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&bytes);
+    let output_index: u32 = idx_str
+        .parse()
+        .map_err(|e| format!("invalid cursor output_index: {}", e))?;
+    Ok(OutPoint::new(Hash256(h), output_index))
+}
+
+/// Resolve the requested page size into the clamped `[1, UTXO_PAGE_LIMIT]` range.
+fn resolve_page_limit(requested: Option<usize>) -> usize {
+    requested.unwrap_or(UTXO_PAGE_LIMIT).clamp(1, UTXO_PAGE_LIMIT)
+}
+
+// ---------------------------------------------------------------------------
 // get_address_utxos
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GetAddressUtxosParams {
+    address: String,
+    /// Opaque cursor from a prior response's `next_cursor`; omit for page 1.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Page size, clamped to `[1, UTXO_PAGE_LIMIT]`; defaults to the max.
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 async fn handle_get_address_utxos(
     id: serde_json::Value,
     params: serde_json::Value,
     node: &Arc<Node>,
 ) -> RpcResponse {
-    let parsed: GetBalanceParams = match serde_json::from_value(params) {
+    let parsed: GetAddressUtxosParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
     };
@@ -476,19 +523,31 @@ async fn handle_get_address_utxos(
         );
     }
 
+    let after = match &parsed.cursor {
+        Some(c) => match parse_utxo_cursor(c) {
+            Ok(op) => Some(op),
+            Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid cursor: {}", e)),
+        },
+        None => None,
+    };
+    let page = resolve_page_limit(parsed.limit);
+
     // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
     let tip_height = node.tip.read().await.height;
     let current_height = tip_height.saturating_add(1);
 
-    // Probe for limit+1 so we can flag truncation; clients have no other way
-    // to distinguish a complete set from "first 1000 only".
-    const MAX_UTXO_RESULTS: usize = 1000;
-    let mut matched = {
+    let matched = {
         let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script(&addr_bytes, current_height, MAX_UTXO_RESULTS + 1)
+        utxo_set.utxos_for_script_paged(&addr_bytes, current_height, after, page)
     };
-    let truncated = matched.len() > MAX_UTXO_RESULTS;
-    matched.truncate(MAX_UTXO_RESULTS);
+    // A full page means there may be more; hand back a cursor to continue.
+    // No more silent truncation — callers can walk an address to completion.
+    let next_cursor = if matched.len() == page {
+        matched.last().map(|t| encode_utxo_cursor(&t.0))
+    } else {
+        None
+    };
+    let truncated = next_cursor.is_some();
     // Lock released — format JSON without holding any chainstate locks.
     let utxos: Vec<serde_json::Value> = matched
         .iter()
@@ -509,6 +568,7 @@ async fn handle_get_address_utxos(
             "address": parsed.address,
             "utxos": utxos,
             "truncated": truncated,
+            "next_cursor": next_cursor,
             "tip_height": tip_height,
         }),
     )
@@ -521,6 +581,12 @@ async fn handle_get_address_utxos(
 #[derive(Deserialize)]
 struct GetScriptUtxosParams {
     script_hex: String,
+    /// Opaque cursor from a prior response's `next_cursor`; omit for page 1.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Page size, clamped to `[1, UTXO_PAGE_LIMIT]`; defaults to the max.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn handle_get_script_utxos(
@@ -556,19 +622,30 @@ async fn handle_get_script_utxos(
         );
     }
 
+    let after = match &parsed.cursor {
+        Some(c) => match parse_utxo_cursor(c) {
+            Ok(op) => Some(op),
+            Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid cursor: {}", e)),
+        },
+        None => None,
+    };
+    let page = resolve_page_limit(parsed.limit);
+
     // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
     let tip_height = node.tip.read().await.height;
     let current_height = tip_height.saturating_add(1);
 
-    // Probe for limit+1 so we can flag truncation; clients have no other way
-    // to distinguish a complete set from "first 1000 only".
-    const MAX_UTXO_RESULTS: usize = 1000;
-    let mut matched = {
+    let matched = {
         let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script(&script_bytes, current_height, MAX_UTXO_RESULTS + 1)
+        utxo_set.utxos_for_script_paged(&script_bytes, current_height, after, page)
     };
-    let truncated = matched.len() > MAX_UTXO_RESULTS;
-    matched.truncate(MAX_UTXO_RESULTS);
+    // A full page means there may be more; hand back a cursor to continue.
+    let next_cursor = if matched.len() == page {
+        matched.last().map(|t| encode_utxo_cursor(&t.0))
+    } else {
+        None
+    };
+    let truncated = next_cursor.is_some();
     // Lock released — format JSON without holding any chainstate locks.
     let script_len = script_bytes.len();
     let utxos: Vec<serde_json::Value> = matched
@@ -591,6 +668,7 @@ async fn handle_get_script_utxos(
             "script_hex": parsed.script_hex,
             "utxos": utxos,
             "truncated": truncated,
+            "next_cursor": next_cursor,
             "tip_height": tip_height,
         }),
     )
