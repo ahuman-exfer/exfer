@@ -69,6 +69,7 @@ fn insert_inbound(reg: &mut PeerRegistry, identity: PeerId, session: PeerSession
             tip: None,
             ibd_cooldown_until: None,
             last_useful_message_at: None,
+            ever_confirmed_for_ibd: false,
         },
     );
 }
