@@ -90,7 +90,8 @@ pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
 // ── v1.5.0 Fix 2 — tip-validation constants ──
 
 /// Maximum concurrent tip-validation attempts in the steady-state regime
-/// (our local tip > ASSUME_VALID_HEIGHT). The bootstrap regime uses 1.
+/// (any node with a real local chain — `our_tip_height > 0`). Bootstrap
+/// regime (fresh node, `tip == 0`) uses `MAX_CONCURRENT_TIP_VALIDATIONS_BOOTSTRAP`.
 pub const MAX_CONCURRENT_TIP_VALIDATIONS: usize = 4;
 /// Bootstrap-regime concurrency: up to 4 simultaneous bootstrap coordinator
 /// instances, each validating a **distinct** `TargetTip`. Lifted from 1 in

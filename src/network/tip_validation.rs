@@ -113,38 +113,50 @@ impl From<DifficultyError> for TipValidationError {
 /// start from the node's local tip height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationRegime {
-    /// Our local tip ≤ ASSUME_VALID_HEIGHT (under assume_valid), or our tip is
-    /// genesis (under --verify-all). Concurrency 1, rate `num_cpus × 10`/sec.
+    /// Our local tip is genesis (fresh node, no chain to anchor on).
+    /// Concurrency 1, rate `num_cpus × 10`/sec, 300 s deadline.
     Bootstrap,
-    /// Our local tip > ASSUME_VALID_HEIGHT. Concurrency 4, rate 20/sec global.
+    /// Our local tip is past genesis — we have a real chain to anchor on.
+    /// Concurrency 4, rate 20/sec global, 7200 s deadline (scales with work).
     SteadyState,
 }
 
 impl ValidationRegime {
     /// Select the regime for a new validation attempt.
     ///
-    /// Bootstrap regime applies when the node has no local chain to anchor on:
-    /// either `our_tip_height == 0` (fresh node), or `assume_valid` is enabled
-    /// and we haven't reached the checkpoint yet. In both cases the anchor must
-    /// come from somewhere other than storage (path 2b fetches the checkpoint
-    /// header; `--verify-all` on a fresh node has no options and must fall
-    /// through to legacy).
+    /// **Bootstrap iff the node has no local chain at all** (`our_tip_height == 0`).
+    /// In that one case path 2b fetches the checkpoint header from peers and
+    /// uses the hardcoded `ASSUME_VALID_HASH` as the only available anchor;
+    /// `--verify-all` on a fresh node falls through to the legacy single-header
+    /// path because no trusted anchor exists.
     ///
-    /// Otherwise (the node has a real local chain), SteadyState applies — path
-    /// 2a binary-searches for a common ancestor in our storage. This covers
-    /// both default (assume_valid) nodes past the checkpoint AND `--verify-all`
-    /// nodes that have built any local chain past genesis.
-    pub fn select(our_tip_height: u64, assume_valid: bool) -> Self {
+    /// **SteadyState whenever we have a real local chain** (`our_tip_height > 0`),
+    /// regardless of `assume_valid` or how the local tip relates to
+    /// `ASSUME_VALID_HEIGHT`. Path 2a binary-searches for a common ancestor in
+    /// our storage against the peer's claim; this works for any local tip we've
+    /// already validated end-to-end.
+    ///
+    /// `assume_valid` is unused — kept for API stability and to mirror the
+    /// `compute_deadline` signature; the regime depends only on whether we
+    /// have a chain to anchor on.
+    ///
+    /// **Why not the older "below ASSUME_VALID_HEIGHT → Bootstrap" rule:** that
+    /// rule trapped operators upgrading across an `ASSUME_VALID_HEIGHT` bump.
+    /// Example: a node whose local tip was validated to 463k under
+    /// `ASSUME_VALID_HEIGHT = 302,400` becomes "below the new checkpoint" when
+    /// the release bumps the constant to 500,000. The old rule then forced
+    /// path 2b (fetch checkpoint) with the 300 s Bootstrap deadline, which
+    /// can't fit the 146 k-header walk needed to reach a peer's tip at 610 k.
+    /// Path 2a anchored at the local 463k tip handles this in SteadyState with
+    /// its 7200 s deadline that scales with work — and the local 463k tip is
+    /// fully trustworthy because we validated it ourselves under the older
+    /// (lower) checkpoint.
+    pub fn select(our_tip_height: u64, _assume_valid: bool) -> Self {
         if our_tip_height == 0 {
-            // No local chain at all — bootstrap regime, needs path 2b or legacy fallback.
-            ValidationRegime::Bootstrap
-        } else if assume_valid && our_tip_height < ASSUME_VALID_HEIGHT {
-            // assume_valid is on but we haven't reached the checkpoint — bootstrap
-            // regime can use path 2b (fetch checkpoint) if cumulative-work constant
-            // is trusted.
+            // No local chain — path 2b fetches checkpoint header, or legacy.
             ValidationRegime::Bootstrap
         } else {
-            // We have a real local chain we can anchor on via path 2a.
+            // Real local chain — path 2a anchors against our own tip.
             ValidationRegime::SteadyState
         }
     }
@@ -791,7 +803,8 @@ mod tests {
 
     #[test]
     fn validation_regime_selection() {
-        // Fresh node with no local chain: Bootstrap in both modes.
+        // Fresh node with no local chain: Bootstrap in both modes (path 2b
+        // fetches the checkpoint header, or legacy fallback under --verify-all).
         assert_eq!(
             ValidationRegime::select(0, true),
             ValidationRegime::Bootstrap
@@ -800,12 +813,19 @@ mod tests {
             ValidationRegime::select(0, false),
             ValidationRegime::Bootstrap
         );
-        // assume_valid=true, below checkpoint: Bootstrap (path 2b territory).
+        // ANY local chain past genesis: SteadyState. The decision no longer
+        // depends on assume_valid or the relationship between local tip and
+        // ASSUME_VALID_HEIGHT — a real local chain is always anchorable via
+        // path 2a regardless of whether the operator's tip happens to sit
+        // below the new release's hardcoded checkpoint.
+        assert_eq!(
+            ValidationRegime::select(1, true),
+            ValidationRegime::SteadyState
+        );
         assert_eq!(
             ValidationRegime::select(ASSUME_VALID_HEIGHT - 1, true),
-            ValidationRegime::Bootstrap
+            ValidationRegime::SteadyState
         );
-        // assume_valid=true, at/past checkpoint: SteadyState (path 2a).
         assert_eq!(
             ValidationRegime::select(ASSUME_VALID_HEIGHT, true),
             ValidationRegime::SteadyState
@@ -814,9 +834,8 @@ mod tests {
             ValidationRegime::select(ASSUME_VALID_HEIGHT + 100, true),
             ValidationRegime::SteadyState
         );
-        // --verify-all (assume_valid=false) with ANY local chain past genesis:
-        // SteadyState (path 2a against local storage). This is the P1 fix —
-        // previously --verify-all was stuck in Bootstrap forever.
+        // Same shape with --verify-all (assume_valid=false): real local chain
+        // always means SteadyState.
         assert_eq!(
             ValidationRegime::select(1, false),
             ValidationRegime::SteadyState
@@ -828,6 +847,41 @@ mod tests {
         assert_eq!(
             ValidationRegime::select(ASSUME_VALID_HEIGHT + 100, false),
             ValidationRegime::SteadyState
+        );
+    }
+
+    #[test]
+    fn validation_regime_unstuck_after_assume_valid_height_bump() {
+        // Regression for the post-v1.11.0 stuck-IBD scenario.
+        //
+        // Setup: operator's local chain was validated up to height H_local
+        // under an older release whose `ASSUME_VALID_HEIGHT = H_old`. A new
+        // release bumps the constant to `H_new > H_local`. On restart the
+        // local tip is still trustworthy (we built it ourselves under the
+        // older — looser — checkpoint), but the new constant suddenly
+        // classifies it as "below checkpoint".
+        //
+        // Under the previous regime rule (`below ASSUME_VALID_HEIGHT →
+        // Bootstrap`), every tip-validation attempt against a peer at the
+        // current mainnet tip used the 300 s Bootstrap deadline. The walk
+        // needed to cover (peer_tip - H_local) headers; at the SteadyState
+        // rate of 20/sec the expected work is many thousands of seconds,
+        // so every peer's TipResponse timed out with `deadline exceeded`
+        // and IBD never advanced. Live observation on fly.io (May 2026):
+        // local tip stuck at 463,702 against a mainnet tip of 610,087 for
+        // 9+ hours after the v1.10.1 → v1.11.0 bump.
+        //
+        // Post-fix: any tip past genesis selects SteadyState directly, so
+        // path 2a anchors at the local tip and runs under the 7200 s floor
+        // (scaled with expected work).
+        let h_local = ASSUME_VALID_HEIGHT.saturating_sub(50_000);
+        assert!(h_local > 0, "ASSUME_VALID_HEIGHT too small to model the bump");
+        assert_eq!(
+            ValidationRegime::select(h_local, true),
+            ValidationRegime::SteadyState,
+            "operator whose local tip is below the new ASSUME_VALID_HEIGHT \
+             must run under the SteadyState deadline so path 2a can anchor \
+             at their local tip"
         );
     }
 
