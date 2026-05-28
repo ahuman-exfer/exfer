@@ -6577,6 +6577,57 @@ fn is_eligible_ibd_candidate(
     confirmation_ok && cooldown_ok && cw_better
 }
 
+/// Pure two-bucket IBD candidate selection.
+///
+/// The strict bucket always wins when non-empty. The relaxed (wedge-fallback)
+/// bucket is consulted ONLY when the strict bucket is empty AND the fallback
+/// is armed AND no peer has been observed confirmed in the current scan. The
+/// `any_confirmed_this_scan` clause suppresses the relaxed bucket one scan
+/// ahead of any persistent state update — so the instant any peer crosses
+/// `tip.confirmed=true`, that scan's selection already deferred to strict-only
+/// (which is empty here, hence `None`) rather than picking from relaxed.
+fn select_ibd_candidate<T>(
+    strict_best: Option<T>,
+    relaxed_best: Option<T>,
+    wedge_fallback_eligible: bool,
+    any_confirmed_this_scan: bool,
+) -> (Option<T>, bool) {
+    match strict_best {
+        Some(c) => (Some(c), false),
+        None if wedge_fallback_eligible && !any_confirmed_this_scan => {
+            let fired = relaxed_best.is_some();
+            (relaxed_best, fired)
+        }
+        None => (None, false),
+    }
+}
+
+/// Pure transition for the re-armable wedge-fallback timer.
+///
+/// `strict_absent_since` tracks the wall-clock instant at which the strict
+/// candidate bucket became empty. The fallback arms only after the bucket
+/// has been continuously empty AND no peer has been observed confirmed for
+/// at least `IBD_NO_CONFIRMED_FALLBACK_SECS`. The timer resets to `None`
+/// whenever a strict candidate appears or any peer confirms in the current
+/// scan, and starts at `Some(now)` the first scan after a reset where neither
+/// holds. The result: the fallback is *re-armable* — if the only confirmed
+/// peer is later evicted from `by_identity` and the strict bucket re-empties
+/// for ≥ `IBD_NO_CONFIRMED_FALLBACK_SECS`, the fallback can fire again
+/// without a process restart. This replaces the v1.11.6 disarm-only
+/// process-lifetime latch flagged in PR #13 review round 2.
+fn next_strict_absent_since(
+    prev: Option<Instant>,
+    now: Instant,
+    strict_present: bool,
+    any_confirmed_this_scan: bool,
+) -> Option<Instant> {
+    if strict_present || any_confirmed_this_scan {
+        None
+    } else {
+        Some(prev.unwrap_or(now))
+    }
+}
+
 /// The central sync manager task. Processes all block events, drives IBD,
 /// manages sync state. Runs as a single node-wide task.
 ///
@@ -6613,14 +6664,21 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     // background tip-validation can't complete (live on `exfer-node-stack`
     // post-v1.11.1: a 24 k-header gap, 20/sec global Argon2 cap → ~1200 s of
     // expected work but a 7200 s deadline that kept timing out on the network
-    // leg, so no peer ever crossed into `confirmed=true`). When that happens AND
-    // no peer has EVER been observed confirmed in this process AND we've been
-    // running for at least `IBD_NO_CONFIRMED_FALLBACK_SECS`, we relax the gate
-    // to allow IBD against the highest-`cumulative_work` peer claim. Safe
-    // because `run_ibd` PoW-verifies every block at full Argon2id rate. Latches
-    // off the moment any peer is confirmed; re-arms only after a process
-    // restart. See `is_eligible_ibd_candidate`.
-    let mut last_any_peer_confirmed: Option<Instant> = None;
+    // leg, so no peer ever crossed into `confirmed=true`). When the strict
+    // bucket has been empty AND no peer has been observed confirmed for at
+    // least `IBD_NO_CONFIRMED_FALLBACK_SECS`, we relax the gate to allow IBD
+    // against the highest-`cumulative_work` peer claim. Safe because `run_ibd`
+    // PoW-verifies every block at full Argon2id rate. The timer is *re-armable*
+    // (PR #13 review round 2): if the only confirmed peer is later evicted
+    // from `by_identity` and the strict bucket re-empties for ≥
+    // `IBD_NO_CONFIRMED_FALLBACK_SECS`, the fallback can fire again without
+    // a process restart. The previous design — a process-lifetime disarm-only
+    // latch — left the node permanently re-wedged in that churn case.
+    // Initialized to `Some(start_time)` so the existing boot grace works
+    // identically (strict bucket is empty by definition before any peer
+    // connects). See `is_eligible_ibd_candidate`, `select_ibd_candidate`,
+    // and `next_strict_absent_since`.
+    let mut strict_absent_since: Option<Instant> = Some(start_time);
     const IBD_NO_CONFIRMED_FALLBACK_SECS: u64 = 600;
 
     node.sync_state
@@ -6833,13 +6891,16 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             }
         }
 
-        // Wedge-fallback gate (the *arming* condition only): no peer has EVER
-        // been confirmed in this process AND we've been running at least
-        // IBD_NO_CONFIRMED_FALLBACK_SECS. Whether the relaxed result is
-        // actually used is decided in the two-bucket selection below — armed
-        // is necessary but not sufficient.
-        let wedge_fallback_eligible = last_any_peer_confirmed.is_none()
-            && start_time.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS);
+        // Wedge-fallback gate (the *arming* condition only): the strict
+        // bucket has been continuously empty AND no peer has been observed
+        // confirmed for at least IBD_NO_CONFIRMED_FALLBACK_SECS. Whether the
+        // relaxed result is actually used is decided in the two-bucket
+        // selection below — armed is necessary but not sufficient. The
+        // `strict_absent_since` timer is updated at end-of-scan via
+        // `next_strict_absent_since`, so it correctly re-arms after a
+        // confirmed peer is evicted and the strict bucket re-empties.
+        let wedge_fallback_eligible = strict_absent_since
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS));
 
         // Derive all state from registry.by_identity
         let (
@@ -6849,6 +6910,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             should_ibd,
             any_confirmed_this_scan,
             wedge_fallback_fired,
+            strict_present,
         ) = {
             let peers = node.peers.lock().await;
             let our_tip = node.tip.read().await.clone();
@@ -6957,16 +7019,16 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             // Strict candidate always wins. The relaxed bucket is consulted
             // ONLY when (a) the strict pass found nothing, (b) the wedge gate is
             // armed, AND (c) no peer is confirmed in this very scan. (c) closes
-            // the P2 timing hole: the instant validation starts completing for
-            // any peer we stop relaxing, before the lifetime latch flips below.
-            let (chosen, wedge_fallback_fired) = match best_ibd_strict {
-                Some(s) => (Some(s), false),
-                None if wedge_fallback_eligible && !any_confirmed_this_scan => {
-                    let fired = best_ibd_relaxed.is_some();
-                    (best_ibd_relaxed, fired)
-                }
-                None => (None, false),
-            };
+            // the in-scan timing hole: the instant validation starts completing
+            // for any peer we must stop relaxing — one scan ahead of the
+            // `strict_absent_since` timer reset that happens at end-of-scan.
+            let strict_present = best_ibd_strict.is_some();
+            let (chosen, wedge_fallback_fired) = select_ibd_candidate(
+                best_ibd_strict,
+                best_ibd_relaxed,
+                wedge_fallback_eligible,
+                any_confirmed_this_scan,
+            );
 
             (
                 best_tip,
@@ -6975,17 +7037,36 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 chosen.map(|(id, sid, _)| (id, sid)),
                 any_confirmed_this_scan,
                 wedge_fallback_fired,
+                strict_present,
             )
         };
 
-        // Latch: once ANY peer is confirmed, disarm the wedge fallback for the
-        // rest of this process lifetime — `ever_confirmed_for_ibd` then carries
-        // candidacy forward via the strict path. Re-arms only on restart.
-        if any_confirmed_this_scan && last_any_peer_confirmed.is_none() {
-            last_any_peer_confirmed = Some(Instant::now());
+        // Re-armable wedge-fallback timer. Resets whenever the strict bucket
+        // has a candidate OR any peer is confirmed in this scan; otherwise
+        // starts (or continues) counting. The fallback is armed once the
+        // accumulated absence reaches `IBD_NO_CONFIRMED_FALLBACK_SECS`. Unlike
+        // the v1.11.6 disarm-only lifetime latch this replaces, eviction of
+        // the only confirmed peer cleanly re-enters the wedge-fallback path
+        // after another `IBD_NO_CONFIRMED_FALLBACK_SECS` of strict absence.
+        let was_armed = wedge_fallback_eligible;
+        strict_absent_since = next_strict_absent_since(
+            strict_absent_since,
+            Instant::now(),
+            strict_present,
+            any_confirmed_this_scan,
+        );
+        let now_armed = strict_absent_since
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS));
+        if was_armed && !now_armed {
             info!(
-                "Sync manager: first confirmed peer observed — wedge-fallback path \
-                 disarmed for this process lifetime"
+                "Sync manager: wedge-fallback path disarmed \
+                 (strict candidate observed or peer confirmed)"
+            );
+        } else if !was_armed && now_armed {
+            info!(
+                "Sync manager: wedge-fallback path ARMED \
+                 (no strict IBD candidate for ≥{}s)",
+                IBD_NO_CONFIRMED_FALLBACK_SECS
             );
         }
 
@@ -7090,7 +7171,14 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     "Sync manager: no IBD candidate among {} connected peer(s) \
                      [wedge_fallback={}] — eligibility breakdown:",
                     connected_count,
-                    if wedge_fallback_eligible {
+                    // Match the *effective* relaxed-bucket condition used by
+                    // `select_ibd_candidate`: armed AND no peer confirmed this
+                    // scan. On the scan where the first peer confirms,
+                    // `wedge_fallback_eligible` is still true but the relaxed
+                    // bucket is suppressed by `any_confirmed_this_scan`, so the
+                    // diagnostic must report `off` to stay consistent with
+                    // control flow.
+                    if wedge_fallback_eligible && !any_confirmed_this_scan {
                         "ARMED (relaxed gate active)"
                     } else {
                         "off"
@@ -9614,5 +9702,159 @@ mod ibd_eligibility_tests {
         assert!(!is_eligible_ibd_candidate(
             false, false, true, /* cw_better */ false, true,
         ));
+    }
+
+    // ── Two-bucket selection: strict ALWAYS beats relaxed ──────────────
+
+    use super::{next_strict_absent_since, select_ibd_candidate};
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn select_returns_strict_when_present_and_does_not_set_fallback_fired() {
+        // Strict always wins. The wedge-fallback flag and the
+        // any-confirmed-this-scan signal are irrelevant when the strict
+        // bucket has a candidate.
+        let (chosen, fired) = select_ibd_candidate(
+            Some(42_u32),
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, Some(42));
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_falls_back_to_relaxed_only_when_strict_empty_and_armed_and_no_confirm() {
+        // The relaxed bucket is consulted only in this specific gap state.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, Some(7));
+        assert!(fired);
+    }
+
+    #[test]
+    fn select_suppresses_relaxed_when_any_peer_confirmed_this_scan() {
+        // The P2 timing fix: on the scan where any peer first crosses
+        // confirmed=true, even though `wedge_fallback_eligible` is still
+        // true from the start-of-scan compute, the relaxed bucket MUST be
+        // suppressed. Otherwise a higher-work unconfirmed peer could win
+        // selection one tick before the persistent re-arm state catches up.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ true,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_returns_none_when_strict_empty_and_fallback_not_armed() {
+        // Steady-state of a healthy node: strict bucket is the only
+        // source, the relaxed bucket isn't consulted at all.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ false,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_returns_none_with_both_buckets_empty_under_armed_fallback() {
+        // Fallback armed but no relaxed candidate either — supervisor
+        // simply has no peer to IBD from this scan.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            None,
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    // ── Re-armable strict-absent timer ─────────────────────────────────
+
+    #[test]
+    fn timer_resets_to_none_when_strict_candidate_present() {
+        // Any scan with a strict candidate clears the timer — the
+        // supervisor is not in a wedge, even if it was earlier.
+        let now = Instant::now();
+        let prev = Some(now - Duration::from_secs(900));
+        let next = next_strict_absent_since(
+            prev,
+            now,
+            /* strict_present */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn timer_resets_to_none_when_any_peer_confirmed_even_with_strict_empty() {
+        // Confirmed peers carry candidacy forward via the sticky
+        // `ever_confirmed_for_ibd` flag, so any confirmation observation
+        // disarms the wedge fallback — even when strict happens to be
+        // empty this exact scan (e.g. confirmed peer in cooldown).
+        let now = Instant::now();
+        let prev = Some(now - Duration::from_secs(900));
+        let next = next_strict_absent_since(
+            prev,
+            now,
+            /* strict_present */ false,
+            /* any_confirmed_this_scan */ true,
+        );
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn timer_starts_at_now_when_previously_none_and_no_strict_or_confirmation() {
+        // After a disarm, the first scan that re-enters the wedge state
+        // starts a fresh timer. Subsequent scans must not bump it forward;
+        // we assert that separately below.
+        let now = Instant::now();
+        let next = next_strict_absent_since(None, now, false, false);
+        assert_eq!(next, Some(now));
+    }
+
+    #[test]
+    fn timer_keeps_original_start_across_consecutive_wedge_scans() {
+        // Re-arm semantics: while the wedge persists, the timer must
+        // count from when the wedge BEGAN, not from each scan. If we
+        // bumped it forward each scan the fallback would never arm.
+        let original = Instant::now() - Duration::from_secs(450);
+        let next = next_strict_absent_since(Some(original), Instant::now(), false, false);
+        assert_eq!(next, Some(original));
+    }
+
+    #[test]
+    fn timer_re_arms_after_disarm_then_strict_re_empties() {
+        // The headline P2 scenario, in three steps.
+        //   1. Wedge: strict empty, no confirms → timer arms at t0.
+        //   2. Sole confirmed peer arrives at t1 → timer disarms to None.
+        //   3. That peer is evicted at t2; strict empties again with no
+        //      confirms → timer re-arms at t2.
+        // After another IBD_NO_CONFIRMED_FALLBACK_SECS the wedge-fallback
+        // path can fire again — no process restart needed.
+        let t0 = Instant::now() - Duration::from_secs(1200);
+        let armed = next_strict_absent_since(None, t0, false, false);
+        assert_eq!(armed, Some(t0));
+
+        let t1 = t0 + Duration::from_secs(300);
+        let disarmed = next_strict_absent_since(armed, t1, false, true);
+        assert!(disarmed.is_none());
+
+        let t2 = t1 + Duration::from_secs(100);
+        let re_armed = next_strict_absent_since(disarmed, t2, false, false);
+        assert_eq!(re_armed, Some(t2));
     }
 }
