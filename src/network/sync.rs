@@ -6696,12 +6696,15 @@ fn has_liveness_proof(
 ///    go Live forever, since `peer_confirmed_ahead` is always false in the
 ///    no-confirmed-peer wedge.
 /// 2. **Staleness revert** — once Live, revert to CatchingUp when our tip has
-///    stalled (`!recent_progress`) AND a peer is ahead — confirmed
-///    (`peer_confirmed_ahead`) OR merely claiming (`peer_claims_ahead`). The
-///    claims-ahead arm is the backstop: after a delivery-floor go-live, if the
-///    chain advances past our delivered tip and we stop progressing, stop
-///    mining on the stale tip and re-enter IBD rather than mining indefinitely
-///    (pre-PR the node stayed idle in this case).
+///    stalled (`!recent_progress`) AND a peer is ahead. A confirmed peer ahead
+///    (`peer_confirmed_ahead`) always reverts. An unconfirmed claim
+///    (`peer_claims_ahead`) reverts ONLY when liveness rests on a delivery-only
+///    floor (`!has_confirmed_peer`) — the round-5 backstop: after a
+///    delivery-floor go-live, if the chain advances past our delivered tip and
+///    we stop progressing, stop mining on the stale tip and re-enter IBD rather
+///    than mining indefinitely (pre-PR the node stayed idle in this case). When
+///    a confirmed peer IS present the claims arm is suppressed, so a bogus
+///    unconfirmed claim cannot demote (and flap) a healthy confirmed-tip node.
 fn next_is_live(
     currently_live: bool,
     has_proof: bool,
@@ -6712,7 +6715,16 @@ fn next_is_live(
     bootstrap_eligible: bool,
 ) -> bool {
     if currently_live {
-        let behind = peer_confirmed_ahead || peer_claims_ahead;
+        // The `peer_claims_ahead` backstop is gated to the delivery-only floor
+        // (`!has_confirmed_peer`). When a confirmed peer is present,
+        // `peer_confirmed_ahead` already governs the revert and an unconfirmed
+        // claim must NOT demote us: otherwise a single peer advertising a bogus
+        // higher tip it never confirms would flap a healthy confirmed-tip node
+        // Live<->CatchingUp every scan (revert clears the floor and cancels
+        // mining; next scan `has_confirmed_peer` re-grants Live; repeat),
+        // thrashing `mining_cancel`. The thrash itself keeps `recent_progress`
+        // false, so one bogus claimer could sustain it indefinitely.
+        let behind = peer_confirmed_ahead || (peer_claims_ahead && !has_confirmed_peer);
         // Stay Live unless stalled while a peer is ahead.
         !(behind && !recent_progress)
     } else {
@@ -10180,6 +10192,35 @@ mod ibd_eligibility_tests {
         assert!(!next_is_live(true, true, true, true, true, false, false));
         // Confirmed peer ahead but we're still making progress — stay Live.
         assert!(next_is_live(true, true, true, true, true, true, false));
+    }
+
+    #[test]
+    fn confirmed_peer_at_tip_not_demoted_by_unconfirmed_claim() {
+        // Round-5 regression. A healthy node with a confirmed peer AT its own
+        // tip (peer_confirmed_ahead=false, has_confirmed_peer=true) goes one
+        // quiet window without advancing (normal between blocks). A single peer
+        // advertises a higher tip it never confirms (peer_claims_ahead=true).
+        //
+        // The unconfirmed claim must NOT demote us — when a confirmed peer is
+        // present, peer_confirmed_ahead governs the revert. Otherwise the node
+        // would flap Live<->CatchingUp every scan, thrashing mining_cancel.
+        //
+        // Scan 1: stalled, confirmed peer at tip, bogus higher claim — stay Live.
+        let live = next_is_live(
+            /* currently_live */ true,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ true,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ false,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(live, "confirmed peer at tip must not be demoted by an unconfirmed claim");
+
+        // Scan 2: identical inputs (the claim persists, still no progress) —
+        // stays Live. No flap: the state is stable across repeated scans.
+        let live = next_is_live(true, true, true, false, true, false, false);
+        assert!(live, "must stay Live across scans — no Live<->CatchingUp flap");
     }
 
     #[test]
