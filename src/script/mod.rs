@@ -9,6 +9,10 @@
 //! - `compute_cost`: compute the static cost of a program
 //! - `serialize_program` / `deserialize_program`: binary encoding
 //! - `merkle_hash`: compute the Merkle commitment of a program
+//! - `structural_merkle_hash`: variant that blinds `Const(...)` value
+//!   bytes so identical-structure programs hash to the same root
+//!   (useful for template / contract-type identification — not a
+//!   spending commitment)
 
 #[allow(unused)]
 pub mod ast;
@@ -34,7 +38,9 @@ pub use eval::{evaluate, evaluate_with_context, Budget, EvalError};
 #[allow(unused_imports)]
 pub use jets::context::ScriptContext;
 #[allow(unused_imports)]
-pub use serialize::{deserialize_program, merkle_hash, serialize_program, SerializeError};
+pub use serialize::{
+    deserialize_program, merkle_hash, serialize_program, structural_merkle_hash, SerializeError,
+};
 #[allow(unused_imports)]
 pub use typecheck::{typecheck, types_compatible, TypeError, TypedNode};
 pub use types::Type;

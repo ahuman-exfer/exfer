@@ -361,6 +361,62 @@ pub fn merkle_hash(program: &Program) -> Hash256 {
     hashes[program.root as usize]
 }
 
+/// Compute the **structural** Merkle hash of a program — the same
+/// recursion as [`merkle_hash`], except every `Combinator::Const(v)`
+/// is hashed without its value bytes. Two programs with identical
+/// combinator structure but different embedded constants produce the
+/// same structural hash.
+///
+/// Use this when you need to identify a *template* — e.g. "this is
+/// an HTLC produced by `covenants::htlc::htlc(...)`" — independently
+/// of which specific sender/receiver/hashlock/timeout were baked in.
+/// Two `htlc(...)` instances differ in their `merkle_hash` (because
+/// every parameter is a different `Const(...)`) but share their
+/// `structural_merkle_hash` (because the combinator tree around the
+/// constants is identical).
+///
+/// ### When NOT to use this
+///
+/// `structural_merkle_hash` is **not** a script commitment. It does
+/// not bind the constants and therefore cannot be used by consensus
+/// to authorise spending — the chain's existing per-output script
+/// commitment continues to use the raw script bytes (`Hash256::
+/// sha256(&output.script)`); `merkle_hash` continues to commit to
+/// the full program including its constants.
+///
+/// This is a downstream / application-layer utility — for indexers,
+/// block explorers, attestation graphs, and anyone else who needs to
+/// answer "what *kind* of contract is this?" without caring about
+/// the specific parameter values.
+pub fn structural_merkle_hash(program: &Program) -> Hash256 {
+    let n = program.nodes.len();
+    let mut hashes: Vec<Hash256> = vec![Hash256::ZERO; n];
+
+    // Bottom-up: highest index first
+    for i in (0..n).rev() {
+        hashes[i] = node_structural_merkle_hash(&program.nodes[i], &hashes);
+    }
+
+    hashes[program.root as usize]
+}
+
+/// Structural variant of [`node_merkle_hash`]. Every node hashes the
+/// same way except `Const(v)`: the value bytes are dropped so the
+/// resulting hash depends only on the combinator tree, not on the
+/// specific constants embedded in it.
+fn node_structural_merkle_hash(node: &Combinator, hashes: &[Hash256]) -> Hash256 {
+    if let Combinator::Const(_) = node {
+        // Tag only — no value bytes. Two `Const(v1)` / `Const(v2)`
+        // with different `v` produce the same hash.
+        return Hash256::domain_hash(SCRIPT_DOMAIN, &[TAG_CONST]);
+    }
+    // Every other node category is structurally identical to
+    // `node_merkle_hash`: combinator children are referenced by their
+    // *structural* child hashes, which the bottom-up walk already
+    // computed.
+    node_merkle_hash(node, hashes)
+}
+
 /// Compute Merkle hash for a single node, given child hashes.
 fn node_merkle_hash(node: &Combinator, hashes: &[Hash256]) -> Hash256 {
     let mut buf = Vec::new();
@@ -434,4 +490,72 @@ fn node_merkle_hash(node: &Combinator, hashes: &[Hash256]) -> Hash256 {
     }
 
     Hash256::domain_hash(SCRIPT_DOMAIN, &buf)
+}
+
+#[cfg(test)]
+mod structural_merkle_hash_tests {
+    use super::*;
+    use crate::covenants::builder::ScriptBuilder;
+    use crate::covenants::htlc::htlc;
+    use crate::types::hash::Hash256;
+
+    #[test]
+    fn same_template_different_constants_yield_same_structural_hash() {
+        // HTLC built with two completely different parameter sets.
+        // Their `merkle_hash` must differ (Const values are baked in),
+        // but `structural_merkle_hash` must agree (same combinator
+        // skeleton).
+        let prog_a = htlc(&[0u8; 32], &[1u8; 32], &Hash256([2u8; 32]), 100);
+        let prog_b = htlc(&[9u8; 32], &[8u8; 32], &Hash256([7u8; 32]), 999_999);
+
+        assert_ne!(
+            merkle_hash(&prog_a),
+            merkle_hash(&prog_b),
+            "merkle_hash must distinguish param-different instances"
+        );
+        assert_eq!(
+            structural_merkle_hash(&prog_a),
+            structural_merkle_hash(&prog_b),
+            "structural_merkle_hash must collapse Const differences"
+        );
+    }
+
+    #[test]
+    fn different_structures_yield_different_structural_hashes() {
+        // HTLC vs. a trivially different (sig-only) script — their
+        // structural hashes must not collide.
+        let prog_htlc = htlc(&[0u8; 32], &[0u8; 32], &Hash256([0u8; 32]), 0);
+
+        let prog_sig = {
+            let mut b = ScriptBuilder::new();
+            let _ = b.sig_check(&[0u8; 32]);
+            b.build()
+        };
+
+        assert_ne!(
+            structural_merkle_hash(&prog_htlc),
+            structural_merkle_hash(&prog_sig),
+            "structurally different programs must hash differently"
+        );
+    }
+
+    #[test]
+    fn const_free_program_matches_merkle_hash() {
+        // For a program with no `Const` nodes, structural and regular
+        // Merkle hashes must agree by construction.
+        let prog = {
+            let mut b = ScriptBuilder::new();
+            let _ = b.witness();
+            b.build()
+        };
+        assert_eq!(structural_merkle_hash(&prog), merkle_hash(&prog));
+    }
+
+    #[test]
+    fn structural_hash_is_deterministic() {
+        // Same inputs across two calls must produce byte-identical
+        // output.
+        let prog = htlc(&[0xAAu8; 32], &[0xBBu8; 32], &Hash256([0xCCu8; 32]), 42);
+        assert_eq!(structural_merkle_hash(&prog), structural_merkle_hash(&prog));
+    }
 }
