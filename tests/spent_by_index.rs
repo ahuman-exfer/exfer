@@ -250,3 +250,127 @@ fn get_output_spent_by_returns_none_for_unknown() {
     let made_up = Hash256([0x99u8; 32]);
     assert!(storage.get_output_spent_by(&made_up, 7).unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Reorg path — revert orphan spends, apply new-canonical spends, all inside
+// one commit_reorg_atomic write txn. The inline double-open guard runs empty
+// chains, so multiple apply_spent_by_for_block calls in one txn were
+// previously untested.
+// ---------------------------------------------------------------------------
+
+/// A coinbase with two spendable outputs, so one reorg can exercise both an
+/// outpoint that the new canonical chain re-spends and one it leaves unspent.
+fn coinbase_tx_2out(seed: u8) -> Transaction {
+    Transaction {
+        inputs: vec![TxInput {
+            prev_tx_id: Hash256::ZERO,
+            output_index: 0xFFFF_FFFF,
+        }],
+        outputs: vec![
+            TxOutput {
+                value: 1_000,
+                script: vec![seed; 32],
+                datum: None,
+                datum_hash: None,
+            },
+            TxOutput {
+                value: 1_000,
+                script: vec![seed.wrapping_add(1); 32],
+                datum: None,
+                datum_hash: None,
+            },
+        ],
+        witnesses: vec![TxWitness {
+            witness: vec![seed],
+            redeemer: None,
+        }],
+    }
+}
+
+#[test]
+fn commit_reorg_atomic_reverts_orphan_spends_and_applies_new_canonical() {
+    let (storage, _dir) = open_storage();
+
+    // Genesis: one coinbase with two outputs (cb0,0) and (cb0,1).
+    let cb0 = coinbase_tx_2out(0x01);
+    let cb0_tx_id = cb0.tx_id().unwrap();
+    let genesis = block_with(0, Hash256::ZERO, vec![cb0.clone()]);
+    let mut utxos = UtxoSet::new();
+    let g_muts = utxos.apply_transaction(&cb0, 0).unwrap();
+    storage
+        .commit_genesis_atomic(&genesis, &[0u8; 32], &g_muts)
+        .unwrap();
+
+    // Orphan-fork block 1: spends BOTH genesis outputs.
+    let cb1_a = coinbase_tx(0x02);
+    let spend_a0 = spend_tx(cb0_tx_id, 0, vec![0xA0; 32]);
+    let spend_a1 = spend_tx(cb0_tx_id, 1, vec![0xA1; 32]);
+    let spend_a0_tx_id = spend_a0.tx_id().unwrap();
+    let mut a_muts = Vec::new();
+    a_muts.extend(utxos.apply_transaction(&cb1_a, 1).unwrap());
+    a_muts.extend(utxos.apply_transaction(&spend_a0, 1).unwrap());
+    a_muts.extend(utxos.apply_transaction(&spend_a1, 1).unwrap());
+    let a_spent: Vec<_> = UtxoMutation::collect_spent_utxos(&a_muts);
+    let b1_old = block_with(
+        1,
+        genesis.header.block_id(),
+        vec![cb1_a, spend_a0, spend_a1],
+    );
+    storage
+        .commit_block_atomic(&b1_old, &[1u8; 32], &a_spent, &a_muts)
+        .unwrap();
+
+    // Both outputs read back as spent on the orphan fork.
+    let pre0 = storage.get_output_spent_by(&cb0_tx_id, 0).unwrap().unwrap();
+    assert_eq!(pre0.spending_tx_id, spend_a0_tx_id);
+    assert!(storage.get_output_spent_by(&cb0_tx_id, 1).unwrap().is_some());
+
+    // New canonical block 1 (the reorg trigger): re-spends (cb0,0) with a
+    // DIFFERENT tx, and does not touch (cb0,1). Distinct nonce so its
+    // block_id differs from the orphan's.
+    let cb1_b = coinbase_tx(0x03);
+    let spend_b0 = spend_tx(cb0_tx_id, 0, vec![0xB0; 32]);
+    let spend_b0_tx_id = spend_b0.tx_id().unwrap();
+    let mut b1_new = block_with(1, genesis.header.block_id(), vec![cb1_b, spend_b0]);
+    b1_new.header.nonce = 99;
+    let b1_new_id = b1_new.header.block_id();
+    assert_ne!(b1_new_id, b1_old.header.block_id(), "fork blocks must differ");
+
+    storage
+        .commit_reorg_atomic(
+            &b1_new,
+            &[2u8; 32],
+            /* old_chain_blocks  */ &[b1_old],
+            /* new_chain_spent   */ &[],
+            /* new_chain_mutations */ &[],
+            /* new_chain_heights */ &[(1, b1_new_id)],
+            /* new_chain_blocks  */ &[],
+            /* new_chain_work    */ &[],
+            /* stale_height_start */ None,
+            /* stale_height_end   */ None,
+            &b1_new_id,
+        )
+        .unwrap();
+
+    // (cb0,0): orphan spend reverted, new-canonical spend applied → reads
+    // back as the NEW spender, not spend_a0.
+    let post0 = storage
+        .get_output_spent_by(&cb0_tx_id, 0)
+        .unwrap()
+        .expect("(cb0,0) is re-spent on the new canonical chain");
+    assert_eq!(
+        post0.spending_tx_id, spend_b0_tx_id,
+        "must read back as the new canonical spender"
+    );
+    assert_ne!(
+        post0.spending_tx_id, spend_a0_tx_id,
+        "orphan spender must not survive the reorg"
+    );
+    assert_eq!(post0.block_height, 1);
+
+    // (cb0,1): spent only on the orphan, never re-spent → reverted to unspent.
+    assert!(
+        storage.get_output_spent_by(&cb0_tx_id, 1).unwrap().is_none(),
+        "an orphan-only spend must read back as unspent after the reorg"
+    );
+}

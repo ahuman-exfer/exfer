@@ -96,8 +96,8 @@ const SMT_NODES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("smt
 /// JSON-RPC method and lets indexers / wallets / explorers answer "who
 /// spent this output?" in O(1) instead of walking from the tip backwards.
 ///
-/// Key layout (44 bytes): `tx_id (32) || output_index (u32 LE) || _pad (8)` —
-/// reuses `serialize_outpoint_key` (36 bytes) with no padding; see
+/// Key layout (36 bytes): `tx_id (32) || output_index (u32 LE)` — the same
+/// `serialize_outpoint_key` encoding `UTXOS_TABLE` uses, no padding; see
 /// `serialize_spent_by_key`.
 ///
 /// Value layout (44 bytes): `spending_tx_id (32) || input_index (u32 LE) ||
@@ -238,9 +238,9 @@ fn deserialize_spent_by_value(data: &[u8]) -> Option<SpentBy> {
     })
 }
 
-/// Write spent-by entries for every input in `block`. Coinbase inputs
-/// (whose `prev_tx_id` is `Hash256::ZERO`) are skipped — they don't
-/// reference a real prior output.
+/// Write spent-by entries for every non-coinbase transaction in `block`.
+/// Coinbase transactions (`tx.is_coinbase()`) are skipped wholesale — their
+/// sole input references no real prior output.
 ///
 /// Idempotent on replay: re-inserting the same (key, value) pair is a
 /// no-op as far as the table contents are concerned, so a crash-and-
@@ -1605,40 +1605,47 @@ impl ChainStorage {
     pub fn build_spent_by_index_from_genesis(
         &self,
     ) -> Result<(u64, u64), StorageError> {
-        let read_txn = self.db.begin_read()?;
-        let height_idx = read_txn.open_table(HEIGHT_INDEX)?;
-        let blocks_tbl = read_txn.open_table(BLOCKS_TABLE)?;
-
-        // Iterate height_idx in ascending order. There may be gaps if
-        // the chain hit a reorg that left a stale tail of height
-        // entries (those are removed by commit_reorg_atomic, but
-        // defensively tolerate any None reads).
-        let mut block_data: Vec<Vec<u8>> = Vec::new();
-        let iter = height_idx.iter()?;
-        for entry in iter {
-            let (_height_g, block_id_g) = entry?;
-            let block_id_bytes = block_id_g.value().to_vec();
-            if let Some(block_blob) = blocks_tbl.get(block_id_bytes.as_slice())? {
-                block_data.push(block_blob.value().to_vec());
+        // Collect just the canonical block ids in ascending height order.
+        // These are 32 bytes each (~tens of MB even on a tip-deep chain),
+        // not the block bodies — the previous version materialised every
+        // block body into a `Vec<Vec<u8>>` up front, which on the very chains
+        // this index exists for was multi-GB resident before the first write.
+        // Block bodies are now read lazily, one chunk's worth per write txn,
+        // so peak body memory is a single block. There may be gaps if a reorg
+        // left a stale tail of height entries (removed by commit_reorg_atomic,
+        // but tolerate any None reads defensively).
+        let block_ids: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let height_idx = read_txn.open_table(HEIGHT_INDEX)?;
+            let mut ids = Vec::new();
+            for entry in height_idx.iter()? {
+                let (_height_g, block_id_g) = entry?;
+                ids.push(block_id_g.value().to_vec());
             }
-        }
-        drop(blocks_tbl);
-        drop(height_idx);
-        drop(read_txn);
+            ids
+        };
 
         let mut blocks_processed: u64 = 0;
         let mut inputs_indexed: u64 = 0;
 
-        // Apply in chunks so a long backfill doesn't hold a single
-        // multi-GB write transaction. 1024 blocks per txn keeps each
-        // commit bounded while limiting per-block overhead.
+        // Apply in chunks so a long backfill never holds a single multi-GB
+        // write transaction. 1024 blocks per txn keeps each commit bounded
+        // while limiting per-block overhead. A fresh read txn per chunk reads
+        // the block bodies lazily — redb permits a reader concurrent with the
+        // chunk's writer, and a backfill runs single-threaded at startup so
+        // every chunk sees the same consistent snapshot.
         const CHUNK: usize = 1024;
-        for chunk in block_data.chunks(CHUNK) {
+        for chunk in block_ids.chunks(CHUNK) {
+            let read_txn = self.db.begin_read()?;
+            let blocks_tbl = read_txn.open_table(BLOCKS_TABLE)?;
             let write_txn = self.db.begin_write()?;
             {
                 let mut table = write_txn.open_table(SPENT_BY_TABLE)?;
-                for bytes in chunk {
-                    let (block, _) = Block::deserialize(bytes).map_err(|e| {
+                for block_id in chunk {
+                    let Some(block_blob) = blocks_tbl.get(block_id.as_slice())? else {
+                        continue;
+                    };
+                    let (block, _) = Block::deserialize(block_blob.value()).map_err(|e| {
                         StorageError::Corruption(format!(
                             "build_spent_by_index_from_genesis: block decode: {e:?}"
                         ))
