@@ -503,7 +503,11 @@ mod tests {
 
     #[test]
     fn htlc_claim_record_round_trips_arbitrary_preimage_lengths() {
-        for len in [1usize, 5, 29, 32, 33, 100, 256] {
+        // Includes 0: an empty preimage is theoretically valid — SHA-256
+        // of the empty byte string is a well-defined digest, and any
+        // producer that emits one must still round-trip through this
+        // shape.
+        for len in [0usize, 1, 5, 29, 32, 33, 100, 256] {
             let preimage: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
             let record = HtlcClaimRecord {
                 tx_id: [0xCC; 32],
