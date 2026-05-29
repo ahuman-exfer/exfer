@@ -358,6 +358,7 @@ async fn dispatch(
         }
         "get_block" => handle_get_block(id, req.params, node).await,
         "get_transaction" => handle_get_transaction(id, req.params, node).await,
+        "get_output_spent_by" => handle_get_output_spent_by(id, req.params, node).await,
         "send_raw_transaction" => {
             // Rate limit: 60 send_raw_transaction per minute per IP
             {
@@ -1151,6 +1152,73 @@ async fn handle_get_transaction(
     }
 
     RpcResponse::err(id, INVALID_PARAMS, "Transaction not found".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// get_output_spent_by
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GetOutputSpentByParams {
+    tx_id: String,
+    output_index: u32,
+}
+
+/// Look up which transaction (if any) consumed a given outpoint.
+///
+/// Returns one of two shapes:
+///
+/// ```json
+/// { "spent": true,  "spending_tx_id": "<hex32>",
+///   "input_index": <u32>, "block_height": <u64> }
+///
+/// { "spent": false }
+/// ```
+///
+/// O(1) — a single SPENT_BY_TABLE lookup. Populated incrementally as
+/// canonical blocks arrive; pre-existing chaindata can be backfilled
+/// in one shot via the `--build-spent-by-index` CLI flag (see
+/// `exfer node --help`). Nodes without the backfill report `spent:
+/// false` for historical outpoints they haven't indexed yet, which is
+/// indistinguishable on the wire from "still unspent" — operators
+/// who need the historical answer should run the migration once.
+async fn handle_get_output_spent_by(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: GetOutputSpentByParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+
+    let bytes = match hex::decode(&parsed.tx_id) {
+        Ok(b) => b,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+    };
+    if bytes.len() != 32 {
+        return RpcResponse::err(id, INVALID_PARAMS, "tx_id must be 32 bytes".to_string());
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&bytes);
+    let prev_tx_id = Hash256(h);
+
+    match node
+        .storage
+        .get_output_spent_by(&prev_tx_id, parsed.output_index)
+    {
+        Ok(Some(rec)) => RpcResponse::ok(
+            id,
+            serde_json::json!({
+                "spent": true,
+                "spending_tx_id": hex::encode(rec.spending_tx_id.as_bytes()),
+                "input_index":    rec.input_index,
+                "block_height":   rec.block_height,
+            }),
+        ),
+        Ok(None) => RpcResponse::ok(id, serde_json::json!({ "spent": false })),
+        Err(e) => RpcResponse::err(id, INTERNAL_ERROR, format!("Storage error: {}", e)),
+    }
 }
 
 // ---------------------------------------------------------------------------

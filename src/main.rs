@@ -168,6 +168,15 @@ enum Commands {
         /// integrity (header linkage, block bodies, tx-roots, coinbase shape).
         #[arg(long)]
         full_verify: bool,
+        /// One-shot: backfill the SPENT_BY_TABLE index from genesis to
+        /// tip, then continue normal operation. New chaindata (genesis-
+        /// synced from this binary onward) is indexed incrementally as
+        /// blocks commit, so this flag is only needed against pre-
+        /// existing datadirs that didn't have the index when their
+        /// blocks were first applied. Typical runtime: ~10-15 minutes
+        /// on a chain at the current mainnet height. Safe to re-run.
+        #[arg(long)]
+        build_spent_by_index: bool,
     },
     /// Run the miner
     Mine {
@@ -224,6 +233,10 @@ enum Commands {
         /// ignoring the Track 1 walk checkpoint (see `node --full-verify`).
         #[arg(long)]
         full_verify: bool,
+        /// One-shot: backfill SPENT_BY_TABLE from genesis (see
+        /// `node --build-spent-by-index`).
+        #[arg(long)]
+        build_spent_by_index: bool,
     },
     /// Wallet operations
     Wallet {
@@ -820,9 +833,10 @@ async fn main() {
             no_auto_migrate,
             rebuild_state,
             full_verify,
+            build_spent_by_index,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -843,6 +857,7 @@ async fn main() {
             no_auto_migrate,
             rebuild_state,
             full_verify,
+            build_spent_by_index,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -865,7 +880,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2858,6 +2873,7 @@ fn sign_tx_with_wallet(
 }
 
 
+#[allow(clippy::too_many_arguments)]
 async fn run_node(
     bind: SocketAddr,
     peers: Vec<SocketAddr>,
@@ -2871,6 +2887,7 @@ async fn run_node(
     no_auto_migrate: bool,
     rebuild_state: bool,
     full_verify: bool,
+    build_spent_by_index: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
@@ -3116,6 +3133,36 @@ async fn run_node(
             before
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "absent".to_string())
+        );
+    }
+
+    // Reverse-spend index — one-shot opt-in backfill. The index is
+    // populated incrementally inside every atomic commit, so a node
+    // genesis-synced from this binary onward has it from the start.
+    // Operators with pre-existing chaindata that predates this index
+    // pass `--build-spent-by-index` once to backfill from genesis to
+    // tip. Safe to re-run; subsequent boots skip the walk because
+    // `spent_by_table_is_empty` returns false.
+    if build_spent_by_index {
+        let already_present = !storage
+            .spent_by_table_is_empty()
+            .map_err(|e| format!("failed to probe spent_by index: {e}"))?;
+        if already_present {
+            info!(
+                "--build-spent-by-index: index already populated; \
+                 re-running the backfill anyway (idempotent — \
+                 existing rows are overwritten with identical values)."
+            );
+        }
+        let started = std::time::Instant::now();
+        let (blocks, inputs) = storage
+            .build_spent_by_index_from_genesis()
+            .map_err(|e| format!("failed to build spent_by index: {e}"))?;
+        info!(
+            "--build-spent-by-index: indexed {} non-coinbase inputs across {} blocks in {:?}",
+            inputs,
+            blocks,
+            started.elapsed()
         );
     }
 

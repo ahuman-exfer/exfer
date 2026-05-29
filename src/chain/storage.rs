@@ -86,6 +86,23 @@ const UTXOS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos")
 /// of any 3a-aware build. Empty in 3a; 3b adds the writer + reader.
 #[allow(dead_code)]
 const SMT_NODES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("smt_nodes");
+/// Reverse-spend index: `(prev_tx_id, output_index)` of any UTXO that has
+/// been consumed by a canonical block → details of the transaction that
+/// consumed it (`spending_tx_id`, `input_index`, `block_height`).
+///
+/// Populated incrementally inside every atomic commit so new chaindata is
+/// always covered. Pre-existing chaindata can be backfilled in one shot
+/// via the `--build-spent-by-index` flag. Backs the `get_output_spent_by`
+/// JSON-RPC method and lets indexers / wallets / explorers answer "who
+/// spent this output?" in O(1) instead of walking from the tip backwards.
+///
+/// Key layout (36 bytes): `tx_id (32) || output_index (u32 LE)` — the same
+/// `serialize_outpoint_key` encoding `UTXOS_TABLE` uses, no padding; see
+/// `serialize_spent_by_key`.
+///
+/// Value layout (44 bytes): `spending_tx_id (32) || input_index (u32 LE) ||
+/// block_height (u64 LE)`.
+const SPENT_BY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("spent_by");
 
 const TIP_KEY: &str = "tip_block_id";
 /// Phase 3a — set to [0x01] in the same write_txn that commits the final
@@ -174,6 +191,102 @@ fn serialize_outpoint_key(op: &OutPoint) -> [u8; 36] {
     buf[..32].copy_from_slice(op.tx_id.as_bytes());
     buf[32..].copy_from_slice(&op.output_index.to_le_bytes());
     buf
+}
+
+/// Key encoding for SPENT_BY_TABLE — same 36-byte outpoint encoding as
+/// UTXOS_TABLE, by design. The two tables answer mirror-image questions
+/// over the same primary key.
+fn serialize_spent_by_key(prev_tx_id: &Hash256, output_index: u32) -> [u8; 36] {
+    let op = OutPoint::new(*prev_tx_id, output_index);
+    serialize_outpoint_key(&op)
+}
+
+/// Value encoding for SPENT_BY_TABLE (44 bytes):
+/// `spending_tx_id (32) || input_index (u32 LE) || block_height (u64 LE)`.
+fn serialize_spent_by_value(
+    spending_tx_id: &Hash256,
+    input_index: u32,
+    block_height: u64,
+) -> [u8; 44] {
+    let mut buf = [0u8; 44];
+    buf[..32].copy_from_slice(spending_tx_id.as_bytes());
+    buf[32..36].copy_from_slice(&input_index.to_le_bytes());
+    buf[36..].copy_from_slice(&block_height.to_le_bytes());
+    buf
+}
+
+/// Public record returned by [`ChainStorage::get_output_spent_by`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpentBy {
+    pub spending_tx_id: Hash256,
+    pub input_index: u32,
+    pub block_height: u64,
+}
+
+fn deserialize_spent_by_value(data: &[u8]) -> Option<SpentBy> {
+    if data.len() != 44 {
+        return None;
+    }
+    let mut tid = [0u8; 32];
+    tid.copy_from_slice(&data[..32]);
+    let input_index = u32::from_le_bytes(data[32..36].try_into().ok()?);
+    let block_height = u64::from_le_bytes(data[36..44].try_into().ok()?);
+    Some(SpentBy {
+        spending_tx_id: Hash256(tid),
+        input_index,
+        block_height,
+    })
+}
+
+/// Write spent-by entries for every non-coinbase transaction in `block`.
+/// Coinbase transactions (`tx.is_coinbase()`) are skipped wholesale — their
+/// sole input references no real prior output.
+///
+/// Idempotent on replay: re-inserting the same (key, value) pair is a
+/// no-op as far as the table contents are concerned, so a crash-and-
+/// resume mid-commit or a backfill that overlaps a freshly-committed
+/// block both end up with the same final state.
+fn apply_spent_by_for_block(
+    write_txn: &redb::WriteTransaction,
+    block: &Block,
+) -> Result<(), StorageError> {
+    let height = block.header.height;
+    let mut table = write_txn.open_table(SPENT_BY_TABLE)?;
+    for tx in &block.transactions {
+        if tx.is_coinbase() {
+            continue;
+        }
+        let spending_tx_id = tx.tx_id()?;
+        for (input_index, input) in tx.inputs.iter().enumerate() {
+            let key = serialize_spent_by_key(&input.prev_tx_id, input.output_index);
+            let value = serialize_spent_by_value(
+                &spending_tx_id,
+                input_index as u32,
+                height,
+            );
+            table.insert(key.as_slice(), value.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove spent-by entries previously written for `block`. Used by
+/// reorg / undo paths so the table reflects the canonical chain.
+fn revert_spent_by_for_block(
+    write_txn: &redb::WriteTransaction,
+    block: &Block,
+) -> Result<(), StorageError> {
+    let mut table = write_txn.open_table(SPENT_BY_TABLE)?;
+    for tx in &block.transactions {
+        if tx.is_coinbase() {
+            continue;
+        }
+        for input in &tx.inputs {
+            let key = serialize_spent_by_key(&input.prev_tx_id, input.output_index);
+            let _ = table.remove(key.as_slice())?;
+        }
+    }
+    Ok(())
 }
 
 /// Deserialize an OutPoint from a UTXOS_TABLE key.
@@ -384,6 +497,7 @@ impl ChainStorage {
             let _ = write_txn.open_table(TX_INDEX_TABLE)?;
             let _ = write_txn.open_table(UTXOS_TABLE)?;
             let _ = write_txn.open_table(SMT_NODES_TABLE)?;
+            let _ = write_txn.open_table(SPENT_BY_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -1080,6 +1194,13 @@ impl ChainStorage {
 
             // Phase 3a — seed UTXOS_TABLE from the genesis mutation log.
             apply_utxo_mutations(&write_txn, utxo_mutations)?;
+
+            // Spent-by index: genesis only contains a coinbase tx (no
+            // real inputs), so this is a no-op today. Called anyway for
+            // symmetry with commit_block_atomic — a future genesis
+            // template with non-coinbase txs would index correctly
+            // without revisiting this site.
+            apply_spent_by_for_block(&write_txn, block)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -1150,6 +1271,12 @@ impl ChainStorage {
 
             // Phase 3a — keep UTXOS_TABLE in lockstep with the in-memory set.
             apply_utxo_mutations(&write_txn, utxo_mutations)?;
+
+            // Spent-by index: record `(prev_outpoint) → (this tx, this
+            // input, this height)` for every non-coinbase input in
+            // this block. Same write_txn as UTXOS_TABLE so a crash
+            // can never leave the two out of sync.
+            apply_spent_by_for_block(&write_txn, block)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -1377,8 +1504,23 @@ impl ChainStorage {
                 }
                 drop(utxos);
             }
+            // Spent-by index — revert orphan entries. Each orphan's
+            // non-coinbase inputs added rows; remove them so the
+            // index reflects only canonical chain spends.
+            for orphan in old_chain_blocks {
+                revert_spent_by_for_block(&write_txn, orphan)?;
+            }
             for (_blk_id, mutations) in new_chain_mutations {
                 apply_utxo_mutations(&write_txn, mutations)?;
+            }
+            // Spent-by index — apply rows for every new-canonical
+            // block. The trigger block + every promoted ancestor in
+            // new_chain_blocks contribute. apply_spent_by_for_block
+            // is idempotent on replay, so overlap with already-applied
+            // rows is safe.
+            apply_spent_by_for_block(&write_txn, trigger_block)?;
+            for blk in new_chain_blocks {
+                apply_spent_by_for_block(&write_txn, blk)?;
             }
         }
         write_txn.commit()?;
@@ -1409,6 +1551,138 @@ impl ChainStorage {
         }
 
         Ok(timestamps)
+    }
+
+    /// Look up the transaction that spent a given outpoint.
+    ///
+    /// Returns `None` if no canonical block has consumed the output
+    /// yet (still unspent, or the outpoint was never created in the
+    /// first place — callers can disambiguate via UTXOS_TABLE or
+    /// `get_transaction`). Returns `Some` with the spending tx_id,
+    /// the input index within that tx, and the block height in
+    /// which the spend was confirmed.
+    ///
+    /// Read-only and lock-free (redb MVCC). The query is O(1) — a
+    /// single direct lookup against SPENT_BY_TABLE.
+    pub fn get_output_spent_by(
+        &self,
+        prev_tx_id: &Hash256,
+        output_index: u32,
+    ) -> Result<Option<SpentBy>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SPENT_BY_TABLE)?;
+        let key = serialize_spent_by_key(prev_tx_id, output_index);
+        match table.get(key.as_slice())? {
+            Some(blob) => {
+                let bytes = blob.value();
+                deserialize_spent_by_value(bytes).map(Some).ok_or_else(|| {
+                    StorageError::Corruption(format!(
+                        "spent_by value for {prev_tx_id}/{output_index} has wrong length ({} bytes)",
+                        bytes.len()
+                    ))
+                })
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Empty-table check used by the migration path to decide whether
+    /// to run a genesis→tip backfill. Cheap — just probes for any key.
+    pub fn spent_by_table_is_empty(&self) -> Result<bool, redb::Error> {
+        use redb::ReadableTableMetadata;
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SPENT_BY_TABLE)?;
+        Ok(table.len()? == 0)
+    }
+
+    /// Backfill SPENT_BY_TABLE by walking every canonical block from
+    /// genesis to tip and recording every non-coinbase input. Intended
+    /// to be called once on startup when an operator passes
+    /// `--build-spent-by-index` against pre-existing chaindata. Safe to
+    /// re-run (idempotent on identical inputs).
+    ///
+    /// Returns `(blocks_processed, inputs_indexed)` for logging.
+    pub fn build_spent_by_index_from_genesis(
+        &self,
+    ) -> Result<(u64, u64), StorageError> {
+        // Collect just the canonical block ids in ascending height order.
+        // These are 32 bytes each (~tens of MB even on a tip-deep chain),
+        // not the block bodies — the previous version materialised every
+        // block body into a `Vec<Vec<u8>>` up front, which on the very chains
+        // this index exists for was multi-GB resident before the first write.
+        // Block bodies are now read lazily, one chunk's worth per write txn,
+        // so peak body memory is a single block.
+        let block_ids: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let height_idx = read_txn.open_table(HEIGHT_INDEX)?;
+            let mut ids = Vec::new();
+            for entry in height_idx.iter()? {
+                let (_height_g, block_id_g) = entry?;
+                ids.push(block_id_g.value().to_vec());
+            }
+            ids
+        };
+
+        let mut blocks_processed: u64 = 0;
+        let mut inputs_indexed: u64 = 0;
+
+        // Apply in chunks so a long backfill never holds a single multi-GB
+        // write transaction. 1024 blocks per txn keeps each commit bounded
+        // while limiting per-block overhead. A fresh read txn per chunk reads
+        // the block bodies lazily — redb permits a reader concurrent with the
+        // chunk's writer, and a backfill runs single-threaded at startup so
+        // every chunk sees the same consistent snapshot.
+        const CHUNK: usize = 1024;
+        for chunk in block_ids.chunks(CHUNK) {
+            let read_txn = self.db.begin_read()?;
+            let blocks_tbl = read_txn.open_table(BLOCKS_TABLE)?;
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(SPENT_BY_TABLE)?;
+                for block_id in chunk {
+                    // A HEIGHT_INDEX entry whose body is missing is corruption,
+                    // not a reorg artifact: commit_reorg_atomic always re-inserts
+                    // promoted bodies and removes stale height entries inside one
+                    // txn, and this backfill is single-threaded at startup. Treat
+                    // it the same as a body that fails to deserialize (abort), so
+                    // we never report success on a partial index that would make
+                    // get_output_spent_by return spent:false for real spends.
+                    let block_blob = blocks_tbl.get(block_id.as_slice())?.ok_or_else(|| {
+                        StorageError::Corruption(format!(
+                            "build_spent_by_index_from_genesis: HEIGHT_INDEX references \
+                             block {} with no body",
+                            hex::encode(block_id)
+                        ))
+                    })?;
+                    let (block, _) = Block::deserialize(block_blob.value()).map_err(|e| {
+                        StorageError::Corruption(format!(
+                            "build_spent_by_index_from_genesis: block decode: {e:?}"
+                        ))
+                    })?;
+                    let height = block.header.height;
+                    for tx in &block.transactions {
+                        if tx.is_coinbase() {
+                            continue;
+                        }
+                        let spending_tx_id = tx.tx_id()?;
+                        for (input_index, input) in tx.inputs.iter().enumerate() {
+                            let key =
+                                serialize_spent_by_key(&input.prev_tx_id, input.output_index);
+                            let value = serialize_spent_by_value(
+                                &spending_tx_id,
+                                input_index as u32,
+                                height,
+                            );
+                            table.insert(key.as_slice(), value.as_slice())?;
+                            inputs_indexed += 1;
+                        }
+                    }
+                    blocks_processed += 1;
+                }
+            }
+            write_txn.commit()?;
+        }
+        Ok((blocks_processed, inputs_indexed))
     }
 
     /// Load fork block entries (block_id, cumulative_work) from the
