@@ -41,6 +41,53 @@ pub fn htlc(
     b.build()
 }
 
+// ---------------------------------------------------------------------------
+// Shared HTLC observability types.
+//
+// Canonical wire shapes for any tooling that exposes HTLC lifecycle data
+// over JSON-RPC — wallet daemons, indexers, block explorers, audit pipelines.
+// Living in the upstream crate is what lets independent observers agree on
+// a single schema by construction; schema drift between them is impossible
+// if they all import these names.
+//
+// Binary `[u8; 32]` fields serialize as lowercase hex strings to match the
+// convention used elsewhere in the JSON-RPC surface (see `src/rpc.rs`).
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of an on-chain HTLC, observable to any indexer that
+/// follows the chain.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HtlcState {
+    /// Outpoint is still in the UTXO set and `current_height <= timeout_height`.
+    Locked,
+    /// Outpoint is still in the UTXO set but `current_height > timeout_height`.
+    /// The sender may now reclaim; the receiver can still claim until that
+    /// happens.
+    LockedExpired,
+    /// Outpoint was spent via the hash (claim) arm.
+    Claimed,
+    /// Outpoint was spent via the timeout (reclaim) arm.
+    Reclaimed,
+    /// Observer has heard of this `lock_tx_id` but has not yet classified
+    /// the outpoint (e.g. follower is still catching up). Transient.
+    Unknown,
+}
+
+/// Relationship of the observing party to an HTLC.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HtlcRole {
+    /// Observer owns the sender key only.
+    Sender,
+    /// Observer owns the receiver key only.
+    Receiver,
+    /// Observer owns both keys (rare but valid — e.g. self-locked timelocks).
+    Both,
+    /// Multi-tenant indexers: neither key is owned by the observer.
+    Observer,
+}
+
 /// The four parameters that uniquely identify an HTLC template instance —
 /// the return shape of [`try_parse_htlc`], the inverse of [`htlc`].
 ///
@@ -56,6 +103,55 @@ pub struct HtlcParams {
     #[serde(with = "hex_bytes32_serde")]
     pub hash_lock: [u8; 32],
     pub timeout_height: u64,
+}
+
+/// Detail of a claim (hash path) spend.
+///
+/// `preimage` is variable-length: the hash arm of [`htlc`] reads
+/// `Value::Bytes(preimage)` from the witness and SHA-256s it, with no
+/// length constraint on the input — a preimage is any byte string whose
+/// hash equals the lock. Recording it as raw `Vec<u8>` (rendered as
+/// lowercase hex on the JSON wire) is the only shape that can faithfully
+/// round-trip every valid claim.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HtlcClaimRecord {
+    #[serde(with = "hex_bytes32_serde")]
+    pub tx_id: [u8; 32],
+    #[serde(with = "hex_bytes_serde")]
+    pub preimage: Vec<u8>,
+    pub block_height: u64,
+    pub input_index: u32,
+}
+
+/// Detail of a reclaim (timeout path) spend.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HtlcReclaimRecord {
+    #[serde(with = "hex_bytes32_serde")]
+    pub tx_id: [u8; 32],
+    pub block_height: u64,
+    pub input_index: u32,
+}
+
+/// A single HTLC's observable record. The shape any indexer or wallet
+/// daemon exposes via JSON-RPC for one outpoint identified by
+/// `(lock_tx_id, output_index)`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HtlcRecord {
+    #[serde(with = "hex_bytes32_serde")]
+    pub lock_tx_id: [u8; 32],
+    pub output_index: u32,
+    pub params: HtlcParams,
+    pub amount: u64,
+    /// Block height that confirmed the lock. `None` if the lock is still
+    /// in the mempool (optimistic-record case in wallet daemons).
+    pub lock_block_height: Option<u64>,
+    pub state: HtlcState,
+    pub claim: Option<HtlcClaimRecord>,
+    pub reclaim: Option<HtlcReclaimRecord>,
+    pub role: HtlcRole,
+    /// Tip height seen by the observer when this record was last written.
+    /// Lets a consumer detect staleness without trusting wall-clock time.
+    pub last_indexed_height: u64,
 }
 
 /// Attempts to decode an output script as an HTLC produced by [`htlc`].
@@ -178,6 +274,21 @@ mod hex_bytes32_serde {
         let mut out = [0u8; 32];
         out.copy_from_slice(&v);
         Ok(out)
+    }
+}
+
+/// Variable-length companion to [`hex_bytes32_serde`], used by
+/// [`HtlcClaimRecord::preimage`] which is not bound to a fixed width.
+mod hex_bytes_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -309,5 +420,131 @@ mod tests {
             "timeout_height": 100
         }"#;
         assert!(serde_json::from_str::<HtlcParams>(bad_json).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Observer-DTO serde tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn htlc_state_serde_uses_snake_case() {
+        for (state, expected) in [
+            (HtlcState::Locked, "\"locked\""),
+            (HtlcState::LockedExpired, "\"locked_expired\""),
+            (HtlcState::Claimed, "\"claimed\""),
+            (HtlcState::Reclaimed, "\"reclaimed\""),
+            (HtlcState::Unknown, "\"unknown\""),
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, expected);
+            let parsed: HtlcState = serde_json::from_str(expected).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    #[test]
+    fn htlc_role_serde_uses_snake_case() {
+        for (role, expected) in [
+            (HtlcRole::Sender, "\"sender\""),
+            (HtlcRole::Receiver, "\"receiver\""),
+            (HtlcRole::Both, "\"both\""),
+            (HtlcRole::Observer, "\"observer\""),
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, expected);
+            let parsed: HtlcRole = serde_json::from_str(expected).unwrap();
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn htlc_record_round_trips_through_json() {
+        let record = HtlcRecord {
+            lock_tx_id: fixed_pubkey(0xAA),
+            output_index: 7,
+            params: HtlcParams {
+                sender: fixed_pubkey(1),
+                receiver: fixed_pubkey(2),
+                hash_lock: fixed_hash(3).0,
+                timeout_height: 9_999,
+            },
+            amount: 1_000_000,
+            lock_block_height: Some(42),
+            state: HtlcState::Claimed,
+            claim: Some(HtlcClaimRecord {
+                tx_id: fixed_pubkey(0xBB),
+                preimage: b"exfer htlc test preimage 2026".to_vec(),
+                block_height: 44,
+                input_index: 0,
+            }),
+            reclaim: None,
+            role: HtlcRole::Receiver,
+            last_indexed_height: 50,
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        let back: HtlcRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
+
+        // Spot-check that bytes serialise as lowercase hex strings (the
+        // wire convention used by the rest of the JSON-RPC surface).
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let lock_hex = v["lock_tx_id"].as_str().unwrap();
+        assert_eq!(lock_hex.len(), 64);
+        assert!(lock_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(lock_hex, lock_hex.to_lowercase());
+
+        // The variable-length preimage was 29 bytes — confirm it
+        // serialised as a 58-char hex string (not padded, not truncated).
+        let pre_hex = v["claim"]["preimage"].as_str().unwrap();
+        assert_eq!(pre_hex.len(), 58);
+        assert_eq!(pre_hex, hex::encode(b"exfer htlc test preimage 2026"),);
+    }
+
+    #[test]
+    fn htlc_claim_record_round_trips_arbitrary_preimage_lengths() {
+        for len in [1usize, 5, 29, 32, 33, 100, 256] {
+            let preimage: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let record = HtlcClaimRecord {
+                tx_id: [0xCC; 32],
+                preimage: preimage.clone(),
+                block_height: 1,
+                input_index: 0,
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            let back: HtlcClaimRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, record, "round trip must work for length {len}");
+            assert_eq!(back.preimage, preimage);
+        }
+    }
+
+    #[test]
+    fn htlc_claim_record_serialises_preimage_as_lowercase_hex() {
+        let record = HtlcClaimRecord {
+            tx_id: [0u8; 32],
+            preimage: b"exfer htlc test preimage 2026".to_vec(),
+            block_height: 0,
+            input_index: 0,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        let hex_str = v["preimage"].as_str().unwrap();
+        assert_eq!(
+            hex_str,
+            "65786665722068746c63207465737420707265696d6167652032303236"
+        );
+        assert!(hex_str.chars().all(|c| !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn htlc_reclaim_record_round_trips_through_json() {
+        let record = HtlcReclaimRecord {
+            tx_id: fixed_pubkey(0xDD),
+            block_height: 7,
+            input_index: 0,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: HtlcReclaimRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
     }
 }
