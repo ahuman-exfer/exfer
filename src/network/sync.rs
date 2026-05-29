@@ -6543,6 +6543,199 @@ pub async fn run_outbound_manager(node: Arc<Node>) {
     }
 }
 
+/// Pure eligibility predicate for `should_ibd` peer selection.
+///
+/// Normal path: a peer is an IBD candidate if it has been confirmed
+/// (either currently via `tip.confirmed`, or via the sticky
+/// `ever_confirmed_for_ibd` flag from a prior successful proof path), is past
+/// its IBD cooldown, AND claims a chain with more cumulative work than ours.
+///
+/// Wedge fallback (`wedge_fallback_eligible == true`): when no peer has EVER
+/// been observed confirmed in this process and the supervisor has been running
+/// for at least `IBD_NO_CONFIRMED_FALLBACK_SECS`, the confirmation requirement
+/// is relaxed — a peer whose claimed chain is `cw_better` qualifies even
+/// without confirmation. Diagnosed live on fly.io post-v1.11.1: a 24 k-header
+/// gap with background tip-validation deadline-exceeding for every peer →
+/// `should_ibd == None` indefinitely despite 8 connected peers all reporting
+/// `ahead=true`. Safe to relax because every block inside `run_ibd` is
+/// PoW-validated at full Argon2id rate; a peer lying about cumulative_work gets
+/// cooldown'd the moment its headers fail expected-difficulty.
+///
+/// Cooldown and chain-better gates apply on both paths. The caller is
+/// responsible for only consulting the relaxed result as a *fallback* — see
+/// the two-bucket selection in `run_sync_manager`, which never lets the relaxed
+/// bucket win while any peer is confirmed in the current scan.
+fn is_eligible_ibd_candidate(
+    tip_confirmed: bool,
+    ever_confirmed_for_ibd: bool,
+    cooldown_ok: bool,
+    cw_better: bool,
+    wedge_fallback_eligible: bool,
+) -> bool {
+    let confirmation_ok =
+        tip_confirmed || ever_confirmed_for_ibd || (wedge_fallback_eligible && cw_better);
+    confirmation_ok && cooldown_ok && cw_better
+}
+
+/// Pure two-bucket IBD candidate selection.
+///
+/// The strict bucket always wins when non-empty. The relaxed (wedge-fallback)
+/// bucket is consulted ONLY when the strict bucket is empty AND the fallback
+/// is armed AND no peer has been observed confirmed in the current scan. The
+/// `any_confirmed_this_scan` clause suppresses the relaxed bucket one scan
+/// ahead of any persistent state update — so the instant any peer crosses
+/// `tip.confirmed=true`, that scan's selection already deferred to strict-only
+/// (which is empty here, hence `None`) rather than picking from relaxed.
+fn select_ibd_candidate<T>(
+    strict_best: Option<T>,
+    relaxed_best: Option<T>,
+    wedge_fallback_eligible: bool,
+    any_confirmed_this_scan: bool,
+) -> (Option<T>, bool) {
+    match strict_best {
+        Some(c) => (Some(c), false),
+        None if wedge_fallback_eligible && !any_confirmed_this_scan => {
+            let fired = relaxed_best.is_some();
+            (relaxed_best, fired)
+        }
+        None => (None, false),
+    }
+}
+
+/// Pure transition for the re-armable wedge-fallback timer.
+///
+/// `strict_absent_since` tracks the wall-clock instant at which the strict
+/// candidate bucket became empty. The fallback arms only after the bucket
+/// has been continuously empty AND no peer has been observed confirmed for
+/// at least `IBD_NO_CONFIRMED_FALLBACK_SECS`. The timer resets to `None`
+/// whenever a strict candidate appears or any peer confirms in the current
+/// scan, and starts at `Some(now)` the first scan after a reset where neither
+/// holds. The result: the fallback is *re-armable* — if the only confirmed
+/// peer is later evicted from `by_identity` and the strict bucket re-empties
+/// for ≥ `IBD_NO_CONFIRMED_FALLBACK_SECS`, the fallback can fire again
+/// without a process restart. This replaces the v1.11.6 disarm-only
+/// process-lifetime latch flagged in PR #13 review round 2.
+fn next_strict_absent_since(
+    prev: Option<Instant>,
+    now: Instant,
+    strict_present: bool,
+    any_confirmed_this_scan: bool,
+) -> Option<Instant> {
+    if strict_present || any_confirmed_this_scan {
+        None
+    } else {
+        Some(prev.unwrap_or(now))
+    }
+}
+
+/// Whether a peer observation counts as "a usable peer is confirmed this
+/// scan" for the wedge-fallback re-arm timer (`next_strict_absent_since`) and
+/// the relaxed-bucket suppression (`select_ibd_candidate`'s
+/// `any_confirmed_this_scan`). Requires the peer to be both confirmed AND
+/// ahead (`is_better_chain` → `cw_better`).
+///
+/// Gating on `cw_better` is the PR #13 review round-3 P2 fix: a confirmed peer
+/// at or behind our tip is not a strict IBD candidate, so letting it reset the
+/// timer kept the fallback permanently disarmed whenever the only *ahead*
+/// peers were unconfirmed — re-forming the exact wedge this path exists to
+/// break. Cooldown is deliberately NOT a factor here: a confirmed, ahead peer
+/// merely waiting out its cooldown is still a real candidate and must keep the
+/// relaxed path suppressed (the strict bucket picks it up once cooldown
+/// expires).
+fn confirmed_peer_blocks_fallback(tip_confirmed: bool, cw_better: bool) -> bool {
+    tip_confirmed && cw_better
+}
+
+/// Liveness `has_confirmed_peer` input. True when some peer currently carries
+/// `tip.confirmed` (`best_confirmed_work != 0`) OR we hold proof-by-delivery:
+/// a completed `run_ibd` PoW-validated a chain whose cumulative work our own
+/// tip has reached (`our_work >= proven_work`).
+///
+/// The delivery clause is the PR #13 review round-3 P1 fix. Liveness keys off
+/// `best_confirmed_work`, which counts only peers flagged `tip.confirmed=true`.
+/// The wedge-fallback path IBDs from an *unconfirmed* peer; if its post-IBD
+/// GetTip handshake times out or it is evicted before confirming, no peer is
+/// confirmed, `has_confirmed_peer` stays false, `is_live` never flips and
+/// `mining_cancel` stays set — the node reads as wedged despite holding a
+/// fully validated chain. A completed `run_ibd` is strictly stronger evidence
+/// than the GetTip block-id-at-height check (every header and block was
+/// streamed to our tip and PoW-validated), so it must feed the liveness gate,
+/// not just the IBD-candidate gate.
+///
+/// It never makes us think a peer is *ahead*: `peer_ahead` keys off
+/// `best_confirmed_work` alone, so a stale delivery floor cannot suppress a
+/// later genuine Live → CatchingUp revert.
+fn has_liveness_proof(
+    best_confirmed_work: [u8; 32],
+    proven_by_delivery: Option<[u8; 32]>,
+    our_work: [u8; 32],
+) -> bool {
+    best_confirmed_work != [0u8; 32] || proven_by_delivery.is_some_and(|w| our_work >= w)
+}
+
+/// Live/CatchingUp transition decision. Returns the next `is_live`.
+///
+/// Inputs:
+/// - `currently_live` — current state.
+/// - `has_proof` — [`has_liveness_proof`]: a confirmed peer OR a delivery floor.
+/// - `has_confirmed_peer` — `best_confirmed_work != 0` (a peer flagged
+///   `tip.confirmed`). Distinguishes a *real* confirmation from a
+///   delivery-only floor.
+/// - `peer_confirmed_ahead` — `best_confirmed_work > our_work` (a confirmed
+///   peer outweighs us).
+/// - `peer_claims_ahead` — any connected peer's tip (confirmed or not)
+///   `is_better_chain` than ours, i.e. the chain has moved past us.
+/// - `recent_progress` — our tip advanced within `RECENT_PROGRESS_SECS`.
+/// - `bootstrap_eligible` — no peers ever seen and past the boot grace.
+///
+/// The PR #13 round-4 P1 fix lives in two clauses:
+///
+/// 1. **Go-live gate** — a *delivery-only* floor (no confirmed peer) grants
+///    Live only with `recent_progress`. Without this a wedged node that
+///    delivered once would treat `proven_by_delivery` as a permanent floor and
+///    go Live forever, since `peer_confirmed_ahead` is always false in the
+///    no-confirmed-peer wedge.
+/// 2. **Staleness revert** — once Live, revert to CatchingUp when our tip has
+///    stalled (`!recent_progress`) AND a peer is ahead. A confirmed peer ahead
+///    (`peer_confirmed_ahead`) always reverts. An unconfirmed claim
+///    (`peer_claims_ahead`) reverts ONLY when liveness rests on a delivery-only
+///    floor (`!has_confirmed_peer`) — the round-5 backstop: after a
+///    delivery-floor go-live, if the chain advances past our delivered tip and
+///    we stop progressing, stop mining on the stale tip and re-enter IBD rather
+///    than mining indefinitely (pre-PR the node stayed idle in this case). When
+///    a confirmed peer IS present the claims arm is suppressed, so a bogus
+///    unconfirmed claim cannot demote (and flap) a healthy confirmed-tip node.
+fn next_is_live(
+    currently_live: bool,
+    has_proof: bool,
+    has_confirmed_peer: bool,
+    peer_confirmed_ahead: bool,
+    peer_claims_ahead: bool,
+    recent_progress: bool,
+    bootstrap_eligible: bool,
+) -> bool {
+    if currently_live {
+        // The `peer_claims_ahead` backstop is gated to the delivery-only floor
+        // (`!has_confirmed_peer`). When a confirmed peer is present,
+        // `peer_confirmed_ahead` already governs the revert and an unconfirmed
+        // claim must NOT demote us: otherwise a single peer advertising a bogus
+        // higher tip it never confirms would flap a healthy confirmed-tip node
+        // Live<->CatchingUp every scan (revert clears the floor and cancels
+        // mining; next scan `has_confirmed_peer` re-grants Live; repeat),
+        // thrashing `mining_cancel`. The thrash itself keeps `recent_progress`
+        // false, so one bogus claimer could sustain it indefinitely.
+        let behind = peer_confirmed_ahead || (peer_claims_ahead && !has_confirmed_peer);
+        // Stay Live unless stalled while a peer is ahead.
+        !(behind && !recent_progress)
+    } else {
+        // A delivery-only floor must be backed by recent progress; a real
+        // confirmed peer does not need it.
+        let confirmation_or_fresh = has_confirmed_peer || recent_progress;
+        let go_live = has_proof && (!peer_confirmed_ahead || recent_progress) && confirmation_or_fresh;
+        go_live || bootstrap_eligible
+    }
+}
+
 /// The central sync manager task. Processes all block events, drives IBD,
 /// manages sync state. Runs as a single node-wide task.
 ///
@@ -6574,9 +6767,38 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     let mut last_no_ibd_diag: Option<Instant> = None;
     const NO_IBD_DIAG_PERIOD_SECS: u64 = 300;
 
+    // Wedge-fallback state. The strict `tip.confirmed || ever_confirmed_for_ibd`
+    // eligibility gate produces a permanent no-candidate state whenever
+    // background tip-validation can't complete (live on `exfer-node-stack`
+    // post-v1.11.1: a 24 k-header gap, 20/sec global Argon2 cap → ~1200 s of
+    // expected work but a 7200 s deadline that kept timing out on the network
+    // leg, so no peer ever crossed into `confirmed=true`). When the strict
+    // bucket has been empty AND no peer has been observed confirmed for at
+    // least `IBD_NO_CONFIRMED_FALLBACK_SECS`, we relax the gate to allow IBD
+    // against the highest-`cumulative_work` peer claim. Safe because `run_ibd`
+    // PoW-verifies every block at full Argon2id rate. The timer is *re-armable*
+    // (PR #13 review round 2): if the only confirmed peer is later evicted
+    // from `by_identity` and the strict bucket re-empties for ≥
+    // `IBD_NO_CONFIRMED_FALLBACK_SECS`, the fallback can fire again without
+    // a process restart. The previous design — a process-lifetime disarm-only
+    // latch — left the node permanently re-wedged in that churn case.
+    // Initialized to `Some(start_time)` so the existing boot grace works
+    // identically (strict bucket is empty by definition before any peer
+    // connects). See `is_eligible_ibd_candidate`, `select_ibd_candidate`,
+    // and `next_strict_absent_since`.
+    let mut strict_absent_since: Option<Instant> = Some(start_time);
+    const IBD_NO_CONFIRMED_FALLBACK_SECS: u64 = 600;
+
     node.sync_state
         .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
     let mut is_live = false;
+
+    // Proof-by-delivery floor for the liveness gate (PR #13 review round-3
+    // P1). Set to our tip's cumulative work on every successful `run_ibd`.
+    // `has_liveness_proof` honours it so a wedge-fallback IBD from an
+    // unconfirmed peer can make the node live even if no peer ever crosses
+    // `tip.confirmed=true` (missed post-IBD GetTip, or peer evicted first).
+    let mut proven_by_delivery: Option<[u8; 32]> = None;
 
     loop {
         if node.shutdown.load(Ordering::SeqCst) {
@@ -6784,8 +7006,27 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             }
         }
 
+        // Wedge-fallback gate (the *arming* condition only): the strict
+        // bucket has been continuously empty AND no peer has been observed
+        // confirmed for at least IBD_NO_CONFIRMED_FALLBACK_SECS. Whether the
+        // relaxed result is actually used is decided in the two-bucket
+        // selection below — armed is necessary but not sufficient. The
+        // `strict_absent_since` timer is updated at end-of-scan via
+        // `next_strict_absent_since`, so it correctly re-arms after a
+        // confirmed peer is evicted and the strict bucket re-empties.
+        let wedge_fallback_eligible = strict_absent_since
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS));
+
         // Derive all state from registry.by_identity
-        let (best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
+        let (
+            best_known_tip,
+            best_confirmed_work,
+            connected_count,
+            should_ibd,
+            any_confirmed_this_scan,
+            wedge_fallback_fired,
+            strict_present,
+        ) = {
             let peers = node.peers.lock().await;
             let our_tip = node.tip.read().await.clone();
             let now = std::time::Instant::now();
@@ -6793,7 +7034,21 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             let mut best_tip: Option<PeerTip> = None;
             let mut best_conf_work: [u8; 32] = [0u8; 32];
             let mut conn_count: usize = 0;
-            let mut best_ibd: Option<(PeerId, u64, PeerTip)> = None;
+            // Two buckets so the relaxed (wedge-fallback) path is a strict
+            // *fallback*, never a competitor: the relaxed bucket is consulted
+            // only when the strict bucket is empty. This is the P2 fix. The old
+            // single-pass form folded `wedge_fallback_eligible` into one
+            // eligibility check inline, so on the exact scan where the first
+            // confirmed peer appeared, a higher-work UNCONFIRMED peer could
+            // still win selection one tick before `last_any_peer_confirmed`
+            // armed at end-of-scan — extending the relaxed-path window by a
+            // tick and contradicting "latches off as soon as any peer confirms".
+            let mut best_ibd_strict: Option<(PeerId, u64, PeerTip)> = None;
+            let mut best_ibd_relaxed: Option<(PeerId, u64, PeerTip)> = None;
+            // Did ANY peer cross tip.confirmed=true in THIS scan? Disarms the
+            // relaxed bucket immediately — independent of (and one scan ahead
+            // of) the process-lifetime `last_any_peer_confirmed` latch.
+            let mut any_confirmed_this_scan = false;
 
             for (id, lp) in &peers.by_identity {
                 let sess = match &lp.session {
@@ -6817,52 +7072,126 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     best_tip = Some(*tip);
                 }
 
-                // Track best confirmed cumulative work
-                if tip.confirmed && tip.cumulative_work > best_conf_work {
-                    best_conf_work = tip.cumulative_work;
-                }
-
-                // IBD candidate check — only confirmed peers can trigger IBD.
-                // Unconfirmed handshake tips are just claims; a malicious peer
-                // can claim any height/work to suppress mining.
-                //
-                // v1.10.1: also accept peers that were previously proven via an
-                // on-chain proof path (sticky `ever_confirmed_for_ibd`). This
-                // closes the cold-bootstrap hang where the only proven peer's
-                // session drop deterministically clears `tip.confirmed` on
-                // reconnect (`attach_session()` at sync.rs:570–573), trapping
-                // the supervisor with no eligible IBD candidate.
-                if !tip.confirmed && !lp.ever_confirmed_for_ibd {
-                    continue;
-                }
-                let cooldown_ok = lp
-                    .ibd_cooldown_until
-                    .map_or(true, |until| now >= until);
-                if !cooldown_ok {
-                    continue;
-                }
+                let cooldown_ok = lp.ibd_cooldown_until.map_or(true, |until| now >= until);
                 let peer_ct = ChainTip {
                     block_id: tip.block_id,
                     height: tip.height,
                     cumulative_work: tip.cumulative_work,
                 };
-                if is_better_chain(&peer_ct, &our_tip) {
-                    let is_best_ibd = best_ibd.as_ref().map_or(true, |(_, _, bt)| {
-                        tip.cumulative_work > bt.cumulative_work
-                    });
-                    if is_best_ibd {
-                        best_ibd = Some((*id, sess.session_id, *tip));
+                let cw_better = is_better_chain(&peer_ct, &our_tip);
+
+                // Track best confirmed cumulative work — feeds the liveness
+                // gate, where EVERY confirmed peer counts (at-or-behind
+                // included: a confirmed peer at our tip is exactly the
+                // "caught up, go Live" signal).
+                if tip.confirmed && tip.cumulative_work > best_conf_work {
+                    best_conf_work = tip.cumulative_work;
+                }
+                // `any_confirmed_this_scan` gates the wedge-fallback re-arm
+                // timer and relaxed-bucket suppression, so it must require the
+                // peer be confirmed AND ahead (PR #13 review round-3 P2): a
+                // confirmed peer at or behind us is not a strict candidate, and
+                // letting it reset the timer kept the fallback disarmed while
+                // the only ahead peers were unconfirmed — re-forming the wedge.
+                if confirmed_peer_blocks_fallback(tip.confirmed, cw_better) {
+                    any_confirmed_this_scan = true;
+                }
+
+                // Strict gate — only confirmed peers (current or sticky
+                // `ever_confirmed_for_ibd`) can trigger IBD. Unconfirmed
+                // handshake tips are just claims; a malicious peer can claim
+                // any height/work to suppress mining. (v1.10.1 added the
+                // sticky-flag path to survive the proven peer's session drop
+                // clearing `tip.confirmed` on reconnect.)
+                if is_eligible_ibd_candidate(
+                    tip.confirmed,
+                    lp.ever_confirmed_for_ibd,
+                    cooldown_ok,
+                    cw_better,
+                    /* wedge_fallback_eligible */ false,
+                ) {
+                    let is_best = best_ibd_strict
+                        .as_ref()
+                        .map_or(true, |(_, _, bt)| tip.cumulative_work > bt.cumulative_work);
+                    if is_best {
+                        best_ibd_strict = Some((*id, sess.session_id, *tip));
+                    }
+                }
+
+                // Relaxed bucket — same predicate with the wedge flag set.
+                // Only computed when the gate is armed; only *used* as a
+                // fallback below. Cheap to evaluate, so no early-out.
+                if wedge_fallback_eligible
+                    && is_eligible_ibd_candidate(
+                        tip.confirmed,
+                        lp.ever_confirmed_for_ibd,
+                        cooldown_ok,
+                        cw_better,
+                        /* wedge_fallback_eligible */ true,
+                    )
+                {
+                    let is_best = best_ibd_relaxed
+                        .as_ref()
+                        .map_or(true, |(_, _, bt)| tip.cumulative_work > bt.cumulative_work);
+                    if is_best {
+                        best_ibd_relaxed = Some((*id, sess.session_id, *tip));
                     }
                 }
             }
+
+            // Strict candidate always wins. The relaxed bucket is consulted
+            // ONLY when (a) the strict pass found nothing, (b) the wedge gate is
+            // armed, AND (c) no peer is confirmed in this very scan. (c) closes
+            // the in-scan timing hole: the instant validation starts completing
+            // for any peer we must stop relaxing — one scan ahead of the
+            // `strict_absent_since` timer reset that happens at end-of-scan.
+            let strict_present = best_ibd_strict.is_some();
+            let (chosen, wedge_fallback_fired) = select_ibd_candidate(
+                best_ibd_strict,
+                best_ibd_relaxed,
+                wedge_fallback_eligible,
+                any_confirmed_this_scan,
+            );
 
             (
                 best_tip,
                 best_conf_work,
                 conn_count,
-                best_ibd.map(|(id, sid, _)| (id, sid)),
+                chosen.map(|(id, sid, _)| (id, sid)),
+                any_confirmed_this_scan,
+                wedge_fallback_fired,
+                strict_present,
             )
         };
+
+        // Re-armable wedge-fallback timer. Resets whenever the strict bucket
+        // has a candidate OR any peer is confirmed in this scan; otherwise
+        // starts (or continues) counting. The fallback is armed once the
+        // accumulated absence reaches `IBD_NO_CONFIRMED_FALLBACK_SECS`. Unlike
+        // the v1.11.6 disarm-only lifetime latch this replaces, eviction of
+        // the only confirmed peer cleanly re-enters the wedge-fallback path
+        // after another `IBD_NO_CONFIRMED_FALLBACK_SECS` of strict absence.
+        let was_armed = wedge_fallback_eligible;
+        strict_absent_since = next_strict_absent_since(
+            strict_absent_since,
+            Instant::now(),
+            strict_present,
+            any_confirmed_this_scan,
+        );
+        let now_armed = strict_absent_since
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS));
+        if was_armed && !now_armed {
+            info!(
+                "Sync manager: wedge-fallback path disarmed \
+                 (strict candidate observed or peer confirmed)"
+            );
+        } else if !was_armed && now_armed {
+            info!(
+                "Sync manager: wedge-fallback path ARMED \
+                 (no strict IBD candidate for ≥{}s)",
+                IBD_NO_CONFIRMED_FALLBACK_SECS
+            );
+        }
 
         // Diagnostic: if we have connected peers but no IBD candidate, dump
         // per-peer eligibility every NO_IBD_DIAG_PERIOD_SECS so the wedge
@@ -6962,8 +7291,21 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     rows
                 };
                 info!(
-                    "Sync manager: no IBD candidate among {} connected peer(s) — eligibility breakdown:",
-                    connected_count
+                    "Sync manager: no IBD candidate among {} connected peer(s) \
+                     [wedge_fallback={}] — eligibility breakdown:",
+                    connected_count,
+                    // Match the *effective* relaxed-bucket condition used by
+                    // `select_ibd_candidate`: armed AND no peer confirmed this
+                    // scan. On the scan where the first peer confirms,
+                    // `wedge_fallback_eligible` is still true but the relaxed
+                    // bucket is suppressed by `any_confirmed_this_scan`, so the
+                    // diagnostic must report `off` to stay consistent with
+                    // control flow.
+                    if wedge_fallback_eligible && !any_confirmed_this_scan {
+                        "ARMED (relaxed gate active)"
+                    } else {
+                        "off"
+                    }
                 );
                 for row in breakdown {
                     info!("  {}", row);
@@ -7002,7 +7344,20 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             if !installed {
                 continue;
             }
-            info!("Sync manager: starting IBD from identity {:?}", &peer_identity[..4]);
+            if wedge_fallback_fired {
+                info!(
+                    "Sync manager: starting IBD from identity {:?} via WEDGE-FALLBACK path \
+                     (no peer confirmed for ≥{}s; accepting highest-work unconfirmed claim — \
+                     run_ibd PoW-validates every block)",
+                    &peer_identity[..4],
+                    IBD_NO_CONFIRMED_FALLBACK_SECS
+                );
+            } else {
+                info!(
+                    "Sync manager: starting IBD from identity {:?}",
+                    &peer_identity[..4]
+                );
+            }
             is_live = false;
             node.sync_state
                 .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
@@ -7011,8 +7366,46 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             match run_ibd(&node, &mut rx, peer_identity, peer_session_id).await {
                 Ok(()) => {
                     info!("Sync manager: IBD complete");
-                    last_tip_height = node.tip.read().await.height;
+                    let new_tip = node.tip.read().await.clone();
+                    last_tip_height = new_tip.height;
                     last_tip_change = Instant::now();
+
+                    // P1 (PR #13 review round-3): record proof-by-delivery so
+                    // the liveness gate honours this completed IBD even if no
+                    // peer ever crosses `tip.confirmed=true`. On the wedge-
+                    // fallback path we IBD from an unconfirmed peer; should its
+                    // post-IBD GetTip below time out or the peer be evicted
+                    // first, `best_confirmed_work` stays zero and `is_live`
+                    // would never flip — leaving the node caught up but with
+                    // mining suppressed. `has_liveness_proof` uses this floor.
+                    proven_by_delivery = Some(new_tip.cumulative_work);
+
+                    // Change B (pairs with the wedge-fallback path): a
+                    // successful `run_ibd` is proof-of-chain by delivery — the
+                    // peer streamed valid headers + blocks all the way to our
+                    // new tip, every one PoW-validated. Promote the sticky
+                    // `ever_confirmed_for_ibd` flag immediately so subsequent
+                    // IBD attempts pick this peer up via the normal strict
+                    // path, regardless of whether the GetTip handshake below
+                    // lands. Without this, once the wedge fallback latches off
+                    // (it disarms the moment any peer confirms), a peer first
+                    // reached via the relaxed path would need to re-cross a
+                    // now-closed gate. The legacy `if confirmed { ... = true }`
+                    // in the GetTip handler below stays — it's an independent
+                    // path and a no-op once we've flipped the flag here.
+                    {
+                        let mut peers = node.peers.lock().await;
+                        if let Some(lp) = peers.get_mut_by_identity(&peer_identity) {
+                            if !lp.ever_confirmed_for_ibd {
+                                info!(
+                                    "Sync manager: promoting peer {:?} to \
+                                     ever_confirmed_for_ibd=true after successful IBD delivery",
+                                    &peer_identity[..4]
+                                );
+                                lp.ever_confirmed_for_ibd = true;
+                            }
+                        }
+                    }
 
                     // Immediately confirm the sync peer via GetTip
                     if node
@@ -7132,23 +7525,40 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         // Work "gap": best confirmed peer has more work than us
         let peer_ahead = best_confirmed_work > our_work;
 
-        if !is_live {
-            let has_confirmed_peer = best_confirmed_work != [0u8; 32];
-            if has_confirmed_peer && (!peer_ahead || recent_progress) {
-                is_live = true;
-            } else if connected_count == 0 && !ever_had_peer
-                && start_time.elapsed() > Duration::from_secs(60)
-            {
-                info!("Sync manager: no peers after 60s, entering Live (bootstrap)");
-                is_live = true;
-            }
-        } else {
-            if peer_ahead && !recent_progress {
-                info!(
-                    "Sync manager: peer has more work, no recent progress, reverting to CatchingUp"
-                );
-                is_live = false;
-            }
+        let has_proof = has_liveness_proof(best_confirmed_work, proven_by_delivery, our_work);
+        let bootstrap_eligible = connected_count == 0
+            && !ever_had_peer
+            && start_time.elapsed() > Duration::from_secs(60);
+        let was_live = is_live;
+        is_live = next_is_live(
+            is_live,
+            has_proof,
+            /* has_confirmed_peer */ best_confirmed_work != [0u8; 32],
+            /* peer_confirmed_ahead */ peer_ahead,
+            peer_claims_ahead,
+            recent_progress,
+            bootstrap_eligible,
+        );
+        if !was_live && is_live && best_confirmed_work == [0u8; 32] && connected_count == 0 {
+            info!("Sync manager: no peers after 60s, entering Live (bootstrap)");
+        } else if was_live && !is_live {
+            // Either a confirmed peer outweighs us with no progress, or — the
+            // round-4 staleness backstop — we delivered once via the wedge
+            // fallback, the chain has advanced past our tip, and we stopped
+            // progressing. Stop mining on the stale tip and re-enter IBD.
+            //
+            // Drop the delivery floor here so it is a one-shot rescue of a
+            // missed post-IBD GetTip, never a permanent liveness grant: after a
+            // staleness revert, going Live again requires a fresh `run_ibd` Ok
+            // (which re-sets it) or a genuinely confirmed peer. The go-live gate
+            // above already makes a stale floor inert; clearing it makes that
+            // invariant explicit rather than relying on the gate alone.
+            proven_by_delivery = None;
+            info!(
+                "Sync manager: tip stalled while a peer is ahead, reverting to CatchingUp \
+                 (peer_confirmed_ahead={}, peer_claims_ahead={})",
+                peer_ahead, peer_claims_ahead
+            );
         }
 
         if is_live {
@@ -9331,5 +9741,493 @@ mod stage_a_tests {
              must contain ASSUME_VALID_HEIGHT = {}",
             ASSUME_VALID_HEIGHT
         );
+    }
+}
+
+#[cfg(test)]
+mod ibd_eligibility_tests {
+    //! Pin the `is_eligible_ibd_candidate` decision tree, including the
+    //! wedge-fallback path added to break the catch-22 observed live on
+    //! `exfer-node-stack` post-v1.11.1 (no peer ever crosses
+    //! `tip.confirmed=true` because background tip-validation deadline-
+    //! exceeds on a 24 k-header gap → `should_ibd` returns `None` for
+    //! hours → the chain stops advancing).
+    //!
+    //! These tests cover the *predicate* in isolation. The selection
+    //! *control flow* in `run_sync_manager` invokes it twice — once with
+    //! the wedge flag `false` (strict bucket) and once `true` (relaxed
+    //! bucket) — and only ever falls back to the relaxed bucket when the
+    //! strict bucket is empty AND no peer is confirmed in the current scan.
+    //! That two-bucket ordering is the P2 fix and is exercised end-to-end
+    //! in the live `exfer-node-stack` validation, not here.
+
+    use super::is_eligible_ibd_candidate;
+
+    // ── Normal path: confirmed peer eligible ───────────────────────────
+
+    #[test]
+    fn confirmed_peer_with_better_chain_and_no_cooldown_is_eligible() {
+        // The healthy steady-state case: peer's tip is confirmed,
+        // their chain is better, no cooldown.
+        assert!(is_eligible_ibd_candidate(
+            /* tip_confirmed */ true,
+            /* ever_confirmed_for_ibd */ false,
+            /* cooldown_ok */ true,
+            /* cw_better */ true,
+            /* wedge_fallback_eligible */ false,
+        ));
+    }
+
+    #[test]
+    fn ever_confirmed_sticky_peer_is_eligible_without_current_confirmation() {
+        // v1.10.1's sticky flag: a peer that was confirmed earlier in the
+        // process stays eligible even after a reconnect clears
+        // `tip.confirmed`.
+        assert!(is_eligible_ibd_candidate(false, true, true, true, false));
+    }
+
+    #[test]
+    fn cooldown_blocks_otherwise_eligible_peer() {
+        // Even with confirmation and better chain, a peer in cooldown is
+        // skipped — this is what prevents a striked peer from being
+        // re-tried instantly after run_ibd failure.
+        assert!(!is_eligible_ibd_candidate(
+            true, true, /* cooldown_ok */ false, true, false,
+        ));
+    }
+
+    #[test]
+    fn no_better_chain_means_no_candidate_regardless_of_confirmation() {
+        // If the peer's chain is NOT better (we're already at their tip
+        // or ahead), there's nothing to IBD even if everything else
+        // looks healthy. Mining stays unsuppressed.
+        assert!(!is_eligible_ibd_candidate(
+            true, true, true, /* cw_better */ false, false,
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_peer_without_fallback_is_ineligible() {
+        // The pre-fix behavior: peer claims better chain but is neither
+        // currently confirmed nor sticky-confirmed → skipped. This is
+        // what produced the wedge documented in the commit body.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, true, true, /* wedge_fallback_eligible */ false,
+        ));
+    }
+
+    // ── Wedge-fallback path: new behavior under this commit ────────────
+
+    #[test]
+    fn wedge_fallback_accepts_unconfirmed_peer_with_better_chain() {
+        // THE regression test for the live wedge. Pre-fix: this
+        // returned false (no eligible peer, supervisor idles forever).
+        // Post-fix: `wedge_fallback_eligible=true` lets the unconfirmed
+        // peer's better-chain claim qualify, so the supervisor can pick
+        // them for IBD and break the deadlock.
+        assert!(is_eligible_ibd_candidate(
+            /* tip_confirmed */ false,
+            /* ever_confirmed_for_ibd */ false,
+            /* cooldown_ok */ true,
+            /* cw_better */ true,
+            /* wedge_fallback_eligible */ true,
+        ));
+    }
+
+    #[test]
+    fn wedge_fallback_does_not_relax_cooldown() {
+        // The fallback only relaxes confirmation — a peer that just
+        // failed run_ibd and is in cooldown must still wait the
+        // cooldown out before being retried, regardless of how stuck
+        // the supervisor is.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, /* cooldown_ok */ false, true, true,
+        ));
+    }
+
+    #[test]
+    fn wedge_fallback_does_not_promote_non_better_chain() {
+        // Fallback gives the better-chain peer a chance; it does NOT
+        // suddenly accept peers whose chain is not better. The whole
+        // point of fork-choice is unchanged.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, true, /* cw_better */ false, true,
+        ));
+    }
+
+    // ── Two-bucket selection: strict ALWAYS beats relaxed ──────────────
+
+    use super::{next_strict_absent_since, select_ibd_candidate};
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn select_returns_strict_when_present_and_does_not_set_fallback_fired() {
+        // Strict always wins. The wedge-fallback flag and the
+        // any-confirmed-this-scan signal are irrelevant when the strict
+        // bucket has a candidate.
+        let (chosen, fired) = select_ibd_candidate(
+            Some(42_u32),
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, Some(42));
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_falls_back_to_relaxed_only_when_strict_empty_and_armed_and_no_confirm() {
+        // The relaxed bucket is consulted only in this specific gap state.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, Some(7));
+        assert!(fired);
+    }
+
+    #[test]
+    fn select_suppresses_relaxed_when_any_peer_confirmed_this_scan() {
+        // The P2 timing fix: on the scan where any peer first crosses
+        // confirmed=true, even though `wedge_fallback_eligible` is still
+        // true from the start-of-scan compute, the relaxed bucket MUST be
+        // suppressed. Otherwise a higher-work unconfirmed peer could win
+        // selection one tick before the persistent re-arm state catches up.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ true,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_returns_none_when_strict_empty_and_fallback_not_armed() {
+        // Steady-state of a healthy node: strict bucket is the only
+        // source, the relaxed bucket isn't consulted at all.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            Some(7),
+            /* wedge_fallback_eligible */ false,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    #[test]
+    fn select_returns_none_with_both_buckets_empty_under_armed_fallback() {
+        // Fallback armed but no relaxed candidate either — supervisor
+        // simply has no peer to IBD from this scan.
+        let (chosen, fired) = select_ibd_candidate(
+            None::<u32>,
+            None,
+            /* wedge_fallback_eligible */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert_eq!(chosen, None);
+        assert!(!fired);
+    }
+
+    // ── Re-armable strict-absent timer ─────────────────────────────────
+
+    #[test]
+    fn timer_resets_to_none_when_strict_candidate_present() {
+        // Any scan with a strict candidate clears the timer — the
+        // supervisor is not in a wedge, even if it was earlier.
+        let now = Instant::now();
+        let prev = Some(now - Duration::from_secs(900));
+        let next = next_strict_absent_since(
+            prev,
+            now,
+            /* strict_present */ true,
+            /* any_confirmed_this_scan */ false,
+        );
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn timer_resets_to_none_when_any_peer_confirmed_even_with_strict_empty() {
+        // Confirmed peers carry candidacy forward via the sticky
+        // `ever_confirmed_for_ibd` flag, so any confirmation observation
+        // disarms the wedge fallback — even when strict happens to be
+        // empty this exact scan (e.g. confirmed peer in cooldown).
+        let now = Instant::now();
+        let prev = Some(now - Duration::from_secs(900));
+        let next = next_strict_absent_since(
+            prev,
+            now,
+            /* strict_present */ false,
+            /* any_confirmed_this_scan */ true,
+        );
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn timer_starts_at_now_when_previously_none_and_no_strict_or_confirmation() {
+        // After a disarm, the first scan that re-enters the wedge state
+        // starts a fresh timer. Subsequent scans must not bump it forward;
+        // we assert that separately below.
+        let now = Instant::now();
+        let next = next_strict_absent_since(None, now, false, false);
+        assert_eq!(next, Some(now));
+    }
+
+    #[test]
+    fn timer_keeps_original_start_across_consecutive_wedge_scans() {
+        // Re-arm semantics: while the wedge persists, the timer must
+        // count from when the wedge BEGAN, not from each scan. If we
+        // bumped it forward each scan the fallback would never arm.
+        let original = Instant::now() - Duration::from_secs(450);
+        let next = next_strict_absent_since(Some(original), Instant::now(), false, false);
+        assert_eq!(next, Some(original));
+    }
+
+    #[test]
+    fn timer_re_arms_after_disarm_then_strict_re_empties() {
+        // The headline P2 scenario, in three steps.
+        //   1. Wedge: strict empty, no confirms → timer arms at t0.
+        //   2. Sole confirmed peer arrives at t1 → timer disarms to None.
+        //   3. That peer is evicted at t2; strict empties again with no
+        //      confirms → timer re-arms at t2.
+        // After another IBD_NO_CONFIRMED_FALLBACK_SECS the wedge-fallback
+        // path can fire again — no process restart needed.
+        let t0 = Instant::now() - Duration::from_secs(1200);
+        let armed = next_strict_absent_since(None, t0, false, false);
+        assert_eq!(armed, Some(t0));
+
+        let t1 = t0 + Duration::from_secs(300);
+        let disarmed = next_strict_absent_since(armed, t1, false, true);
+        assert!(disarmed.is_none());
+
+        let t2 = t1 + Duration::from_secs(100);
+        let re_armed = next_strict_absent_since(disarmed, t2, false, false);
+        assert_eq!(re_armed, Some(t2));
+    }
+
+    // ── P2 round-3: confirmed-but-behind peer must not suppress fallback ──
+
+    use super::{confirmed_peer_blocks_fallback, has_liveness_proof};
+
+    /// Cumulative-work fixture. `[u8; 32]` compares lexicographically from the
+    /// high byte, matching the convention `is_better_chain` / `peer_ahead`
+    /// rely on, so larger `n` ⇒ strictly greater work; `work(0)` is the
+    /// no-confirmed-peer sentinel `[0u8; 32]`.
+    fn work(n: u8) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[0] = n;
+        a
+    }
+
+    #[test]
+    fn confirmed_and_ahead_peer_blocks_fallback() {
+        // The normal sticky-candidate signal: a confirmed peer that is also
+        // ahead resets the re-arm timer and suppresses the relaxed bucket.
+        assert!(confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ true,
+        ));
+    }
+
+    #[test]
+    fn confirmed_but_behind_peer_does_not_block_fallback() {
+        // THE round-3 P2 regression. A confirmed peer at or behind our tip is
+        // not a strict IBD candidate. Pre-fix it set `any_confirmed_this_scan`
+        // anyway, resetting `strict_absent_since` every scan so the fallback
+        // never armed while the only ahead peers were unconfirmed — the wedge
+        // re-formed. Post-fix it does not block the fallback.
+        assert!(!confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ false,
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_peer_never_blocks_fallback() {
+        // An unconfirmed peer — ahead or not — is exactly what the relaxed
+        // path exists for; it must never count as a confirmation observation.
+        assert!(!confirmed_peer_blocks_fallback(false, true));
+        assert!(!confirmed_peer_blocks_fallback(false, false));
+    }
+
+    #[test]
+    fn stale_confirmed_peer_lets_timer_keep_arming() {
+        // Loop-level composition of the round-3 P2 fix: a confirmed-but-behind
+        // peer present every scan (e.g. a peer pinned at our own tip) yields
+        // `any_confirmed_this_scan = false`, so the strict-absent timer keeps
+        // counting from when the wedge began and the fallback can still arm.
+        // Pre-fix the same peer reset the timer to `None` every scan.
+        let any_confirmed_this_scan = confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ false,
+        );
+        assert!(!any_confirmed_this_scan);
+        let t0 = Instant::now() - Duration::from_secs(1200);
+        let armed = next_strict_absent_since(
+            Some(t0),
+            Instant::now(),
+            /* strict_present */ false,
+            any_confirmed_this_scan,
+        );
+        assert_eq!(armed, Some(t0), "stale confirmed peer must not reset timer");
+    }
+
+    // ── P1 round-3: proof-by-delivery feeds the liveness gate ────────────
+
+    #[test]
+    fn liveness_proof_from_currently_confirmed_peer() {
+        // Healthy path: a peer carries `tip.confirmed=true`, so
+        // `best_confirmed_work != 0` and the node is live regardless of
+        // whether any IBD has been delivered this process.
+        assert!(has_liveness_proof(
+            /* best_confirmed_work */ work(5),
+            /* proven_by_delivery */ None,
+            /* our_work */ work(5),
+        ));
+    }
+
+    #[test]
+    fn no_confirmed_peer_and_no_delivery_is_not_live() {
+        // The wedge state before any IBD completes: nothing proves a peer's
+        // chain, so the node correctly stays CatchingUp.
+        assert!(!has_liveness_proof(
+            /* best_confirmed_work */ work(0),
+            /* proven_by_delivery */ None,
+            /* our_work */ work(3),
+        ));
+    }
+
+    #[test]
+    fn proof_by_delivery_goes_live_without_a_confirmed_peer() {
+        // THE round-3 P1 regression: wedge-fallback IBD from an unconfirmed
+        // peer completed, but its post-IBD GetTip was missed (or the peer was
+        // evicted) so no peer is flagged `tip.confirmed`. Pre-fix
+        // `has_confirmed_peer` stayed false and mining was suppressed despite a
+        // fully validated chain. Post-fix the delivery floor makes us live.
+        assert!(has_liveness_proof(
+            /* best_confirmed_work */ work(0),
+            /* proven_by_delivery */ Some(work(7)),
+            /* our_work */ work(7),
+        ));
+    }
+
+    #[test]
+    fn delivery_floor_requires_our_tip_to_have_reached_it() {
+        // Defensive: the floor only counts once our own tip has actually
+        // reached the delivered work. `our_work >= proven` holds for real post-
+        // IBD states (our tip IS the delivered chain); a lower `our_work` must
+        // not be treated as live.
+        assert!(!has_liveness_proof(work(0), Some(work(7)), work(6)));
+        assert!(has_liveness_proof(work(0), Some(work(7)), work(7)));
+        assert!(has_liveness_proof(work(0), Some(work(7)), work(9)));
+    }
+
+    // ── P1 round-4: delivery floor must not grant permanent liveness ─────
+
+    use super::next_is_live;
+
+    #[test]
+    fn delivery_floor_goes_live_then_reverts_when_tip_stalls() {
+        // THE round-4 regression, as a three-step loop sequence. No confirmed
+        // peer ever exists (the wedge), so peer_confirmed_ahead stays false.
+        //
+        // Step 1 — a wedge-fallback IBD just delivered: we hold a delivery
+        // floor (has_proof), our tip just advanced (recent_progress), a peer
+        // still claims to be ahead. The node goes Live and mines.
+        let live = next_is_live(
+            /* currently_live */ false,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ false,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ true,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(live, "delivery + recent progress should go Live");
+
+        // Step 2 — fallback IBD has stalled, the chain advanced past our
+        // delivered tip, our own tip stopped moving. The node MUST revert to
+        // CatchingUp rather than mine on the stale tip forever. (Pre-fix:
+        // peer_confirmed_ahead=false meant the only revert path never fired.)
+        let live = next_is_live(
+            /* currently_live */ true,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ false,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ false,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(!live, "stalled + peer ahead must revert to CatchingUp");
+
+        // Step 3 — still stalled, still behind, still no confirmed peer. The
+        // stale delivery floor must NOT re-grant Live (go-live gate), so the
+        // node stays idle until a fresh delivery or a confirmed peer — the
+        // safe pre-PR behavior.
+        let live = next_is_live(false, true, false, false, true, false, false);
+        assert!(!live, "stale floor without progress must not re-grant Live");
+    }
+
+    #[test]
+    fn delivery_floor_at_tip_stays_live_when_no_peer_is_ahead() {
+        // The original P1 rescue still works: post-IBD GetTip missed, no
+        // confirmed peer, but we ARE at the tip (no peer claims ahead). Go
+        // Live and stay Live even after progress goes quiet.
+        assert!(next_is_live(false, true, false, false, false, true, false));
+        // Quiet at tip (no recent progress, nobody ahead) — stays Live.
+        assert!(next_is_live(true, true, false, false, false, false, false));
+    }
+
+    #[test]
+    fn confirmed_peer_liveness_unchanged() {
+        // A real confirmed peer at/behind our tip goes Live without needing
+        // recent progress, and stays Live when quiet.
+        assert!(next_is_live(false, true, true, false, false, false, false));
+        assert!(next_is_live(true, true, true, false, false, false, false));
+        // Confirmed peer outweighs us and we've stalled — revert (unchanged).
+        assert!(!next_is_live(true, true, true, true, true, false, false));
+        // Confirmed peer ahead but we're still making progress — stay Live.
+        assert!(next_is_live(true, true, true, true, true, true, false));
+    }
+
+    #[test]
+    fn confirmed_peer_at_tip_not_demoted_by_unconfirmed_claim() {
+        // Round-5 regression. A healthy node with a confirmed peer AT its own
+        // tip (peer_confirmed_ahead=false, has_confirmed_peer=true) goes one
+        // quiet window without advancing (normal between blocks). A single peer
+        // advertises a higher tip it never confirms (peer_claims_ahead=true).
+        //
+        // The unconfirmed claim must NOT demote us — when a confirmed peer is
+        // present, peer_confirmed_ahead governs the revert. Otherwise the node
+        // would flap Live<->CatchingUp every scan, thrashing mining_cancel.
+        //
+        // Scan 1: stalled, confirmed peer at tip, bogus higher claim — stay Live.
+        let live = next_is_live(
+            /* currently_live */ true,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ true,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ false,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(live, "confirmed peer at tip must not be demoted by an unconfirmed claim");
+
+        // Scan 2: identical inputs (the claim persists, still no progress) —
+        // stays Live. No flap: the state is stable across repeated scans.
+        let live = next_is_live(true, true, true, false, true, false, false);
+        assert!(live, "must stay Live across scans — no Live<->CatchingUp flap");
+    }
+
+    #[test]
+    fn no_proof_no_bootstrap_is_not_live() {
+        // No liveness proof and not bootstrap-eligible: stay CatchingUp.
+        assert!(!next_is_live(false, false, false, false, true, true, false));
+        // Bootstrap path: no peers ever, past grace → Live.
+        assert!(next_is_live(false, false, false, false, false, false, true));
     }
 }
