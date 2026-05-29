@@ -1611,9 +1611,7 @@ impl ChainStorage {
         // block body into a `Vec<Vec<u8>>` up front, which on the very chains
         // this index exists for was multi-GB resident before the first write.
         // Block bodies are now read lazily, one chunk's worth per write txn,
-        // so peak body memory is a single block. There may be gaps if a reorg
-        // left a stale tail of height entries (removed by commit_reorg_atomic,
-        // but tolerate any None reads defensively).
+        // so peak body memory is a single block.
         let block_ids: Vec<Vec<u8>> = {
             let read_txn = self.db.begin_read()?;
             let height_idx = read_txn.open_table(HEIGHT_INDEX)?;
@@ -1642,9 +1640,20 @@ impl ChainStorage {
             {
                 let mut table = write_txn.open_table(SPENT_BY_TABLE)?;
                 for block_id in chunk {
-                    let Some(block_blob) = blocks_tbl.get(block_id.as_slice())? else {
-                        continue;
-                    };
+                    // A HEIGHT_INDEX entry whose body is missing is corruption,
+                    // not a reorg artifact: commit_reorg_atomic always re-inserts
+                    // promoted bodies and removes stale height entries inside one
+                    // txn, and this backfill is single-threaded at startup. Treat
+                    // it the same as a body that fails to deserialize (abort), so
+                    // we never report success on a partial index that would make
+                    // get_output_spent_by return spent:false for real spends.
+                    let block_blob = blocks_tbl.get(block_id.as_slice())?.ok_or_else(|| {
+                        StorageError::Corruption(format!(
+                            "build_spent_by_index_from_genesis: HEIGHT_INDEX references \
+                             block {} with no body",
+                            hex::encode(block_id)
+                        ))
+                    })?;
                     let (block, _) = Block::deserialize(block_blob.value()).map_err(|e| {
                         StorageError::Corruption(format!(
                             "build_spent_by_index_from_genesis: block decode: {e:?}"
