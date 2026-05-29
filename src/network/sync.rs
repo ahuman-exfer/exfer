@@ -6673,6 +6673,57 @@ fn has_liveness_proof(
     best_confirmed_work != [0u8; 32] || proven_by_delivery.is_some_and(|w| our_work >= w)
 }
 
+/// Live/CatchingUp transition decision. Returns the next `is_live`.
+///
+/// Inputs:
+/// - `currently_live` — current state.
+/// - `has_proof` — [`has_liveness_proof`]: a confirmed peer OR a delivery floor.
+/// - `has_confirmed_peer` — `best_confirmed_work != 0` (a peer flagged
+///   `tip.confirmed`). Distinguishes a *real* confirmation from a
+///   delivery-only floor.
+/// - `peer_confirmed_ahead` — `best_confirmed_work > our_work` (a confirmed
+///   peer outweighs us).
+/// - `peer_claims_ahead` — any connected peer's tip (confirmed or not)
+///   `is_better_chain` than ours, i.e. the chain has moved past us.
+/// - `recent_progress` — our tip advanced within `RECENT_PROGRESS_SECS`.
+/// - `bootstrap_eligible` — no peers ever seen and past the boot grace.
+///
+/// The PR #13 round-4 P1 fix lives in two clauses:
+///
+/// 1. **Go-live gate** — a *delivery-only* floor (no confirmed peer) grants
+///    Live only with `recent_progress`. Without this a wedged node that
+///    delivered once would treat `proven_by_delivery` as a permanent floor and
+///    go Live forever, since `peer_confirmed_ahead` is always false in the
+///    no-confirmed-peer wedge.
+/// 2. **Staleness revert** — once Live, revert to CatchingUp when our tip has
+///    stalled (`!recent_progress`) AND a peer is ahead — confirmed
+///    (`peer_confirmed_ahead`) OR merely claiming (`peer_claims_ahead`). The
+///    claims-ahead arm is the backstop: after a delivery-floor go-live, if the
+///    chain advances past our delivered tip and we stop progressing, stop
+///    mining on the stale tip and re-enter IBD rather than mining indefinitely
+///    (pre-PR the node stayed idle in this case).
+fn next_is_live(
+    currently_live: bool,
+    has_proof: bool,
+    has_confirmed_peer: bool,
+    peer_confirmed_ahead: bool,
+    peer_claims_ahead: bool,
+    recent_progress: bool,
+    bootstrap_eligible: bool,
+) -> bool {
+    if currently_live {
+        let behind = peer_confirmed_ahead || peer_claims_ahead;
+        // Stay Live unless stalled while a peer is ahead.
+        !(behind && !recent_progress)
+    } else {
+        // A delivery-only floor must be backed by recent progress; a real
+        // confirmed peer does not need it.
+        let confirmation_or_fresh = has_confirmed_peer || recent_progress;
+        let go_live = has_proof && (!peer_confirmed_ahead || recent_progress) && confirmation_or_fresh;
+        go_live || bootstrap_eligible
+    }
+}
+
 /// The central sync manager task. Processes all block events, drives IBD,
 /// manages sync state. Runs as a single node-wide task.
 ///
@@ -7462,24 +7513,40 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         // Work "gap": best confirmed peer has more work than us
         let peer_ahead = best_confirmed_work > our_work;
 
-        if !is_live {
-            let has_confirmed_peer =
-                has_liveness_proof(best_confirmed_work, proven_by_delivery, our_work);
-            if has_confirmed_peer && (!peer_ahead || recent_progress) {
-                is_live = true;
-            } else if connected_count == 0 && !ever_had_peer
-                && start_time.elapsed() > Duration::from_secs(60)
-            {
-                info!("Sync manager: no peers after 60s, entering Live (bootstrap)");
-                is_live = true;
-            }
-        } else {
-            if peer_ahead && !recent_progress {
-                info!(
-                    "Sync manager: peer has more work, no recent progress, reverting to CatchingUp"
-                );
-                is_live = false;
-            }
+        let has_proof = has_liveness_proof(best_confirmed_work, proven_by_delivery, our_work);
+        let bootstrap_eligible = connected_count == 0
+            && !ever_had_peer
+            && start_time.elapsed() > Duration::from_secs(60);
+        let was_live = is_live;
+        is_live = next_is_live(
+            is_live,
+            has_proof,
+            /* has_confirmed_peer */ best_confirmed_work != [0u8; 32],
+            /* peer_confirmed_ahead */ peer_ahead,
+            peer_claims_ahead,
+            recent_progress,
+            bootstrap_eligible,
+        );
+        if !was_live && is_live && best_confirmed_work == [0u8; 32] && connected_count == 0 {
+            info!("Sync manager: no peers after 60s, entering Live (bootstrap)");
+        } else if was_live && !is_live {
+            // Either a confirmed peer outweighs us with no progress, or — the
+            // round-4 staleness backstop — we delivered once via the wedge
+            // fallback, the chain has advanced past our tip, and we stopped
+            // progressing. Stop mining on the stale tip and re-enter IBD.
+            //
+            // Drop the delivery floor here so it is a one-shot rescue of a
+            // missed post-IBD GetTip, never a permanent liveness grant: after a
+            // staleness revert, going Live again requires a fresh `run_ibd` Ok
+            // (which re-sets it) or a genuinely confirmed peer. The go-live gate
+            // above already makes a stale floor inert; clearing it makes that
+            // invariant explicit rather than relying on the gate alone.
+            proven_by_delivery = None;
+            info!(
+                "Sync manager: tip stalled while a peer is ahead, reverting to CatchingUp \
+                 (peer_confirmed_ahead={}, peer_claims_ahead={})",
+                peer_ahead, peer_claims_ahead
+            );
         }
 
         if is_live {
@@ -10045,5 +10112,81 @@ mod ibd_eligibility_tests {
         assert!(!has_liveness_proof(work(0), Some(work(7)), work(6)));
         assert!(has_liveness_proof(work(0), Some(work(7)), work(7)));
         assert!(has_liveness_proof(work(0), Some(work(7)), work(9)));
+    }
+
+    // ── P1 round-4: delivery floor must not grant permanent liveness ─────
+
+    use super::next_is_live;
+
+    #[test]
+    fn delivery_floor_goes_live_then_reverts_when_tip_stalls() {
+        // THE round-4 regression, as a three-step loop sequence. No confirmed
+        // peer ever exists (the wedge), so peer_confirmed_ahead stays false.
+        //
+        // Step 1 — a wedge-fallback IBD just delivered: we hold a delivery
+        // floor (has_proof), our tip just advanced (recent_progress), a peer
+        // still claims to be ahead. The node goes Live and mines.
+        let live = next_is_live(
+            /* currently_live */ false,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ false,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ true,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(live, "delivery + recent progress should go Live");
+
+        // Step 2 — fallback IBD has stalled, the chain advanced past our
+        // delivered tip, our own tip stopped moving. The node MUST revert to
+        // CatchingUp rather than mine on the stale tip forever. (Pre-fix:
+        // peer_confirmed_ahead=false meant the only revert path never fired.)
+        let live = next_is_live(
+            /* currently_live */ true,
+            /* has_proof */ true,
+            /* has_confirmed_peer */ false,
+            /* peer_confirmed_ahead */ false,
+            /* peer_claims_ahead */ true,
+            /* recent_progress */ false,
+            /* bootstrap_eligible */ false,
+        );
+        assert!(!live, "stalled + peer ahead must revert to CatchingUp");
+
+        // Step 3 — still stalled, still behind, still no confirmed peer. The
+        // stale delivery floor must NOT re-grant Live (go-live gate), so the
+        // node stays idle until a fresh delivery or a confirmed peer — the
+        // safe pre-PR behavior.
+        let live = next_is_live(false, true, false, false, true, false, false);
+        assert!(!live, "stale floor without progress must not re-grant Live");
+    }
+
+    #[test]
+    fn delivery_floor_at_tip_stays_live_when_no_peer_is_ahead() {
+        // The original P1 rescue still works: post-IBD GetTip missed, no
+        // confirmed peer, but we ARE at the tip (no peer claims ahead). Go
+        // Live and stay Live even after progress goes quiet.
+        assert!(next_is_live(false, true, false, false, false, true, false));
+        // Quiet at tip (no recent progress, nobody ahead) — stays Live.
+        assert!(next_is_live(true, true, false, false, false, false, false));
+    }
+
+    #[test]
+    fn confirmed_peer_liveness_unchanged() {
+        // A real confirmed peer at/behind our tip goes Live without needing
+        // recent progress, and stays Live when quiet.
+        assert!(next_is_live(false, true, true, false, false, false, false));
+        assert!(next_is_live(true, true, true, false, false, false, false));
+        // Confirmed peer outweighs us and we've stalled — revert (unchanged).
+        assert!(!next_is_live(true, true, true, true, true, false, false));
+        // Confirmed peer ahead but we're still making progress — stay Live.
+        assert!(next_is_live(true, true, true, true, true, true, false));
+    }
+
+    #[test]
+    fn no_proof_no_bootstrap_is_not_live() {
+        // No liveness proof and not bootstrap-eligible: stay CatchingUp.
+        assert!(!next_is_live(false, false, false, false, true, true, false));
+        // Bootstrap path: no peers ever, past grace → Live.
+        assert!(next_is_live(false, false, false, false, false, false, true));
     }
 }
