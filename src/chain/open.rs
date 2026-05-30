@@ -221,6 +221,12 @@ pub fn open_chain(
 
     // -------- Cheap structural per-block walk (over [walk_from ..= tip]) --------
     let walk_start = std::time::Instant::now();
+    // Track the previous progress sample so ETA reflects the *recent* rate,
+    // not the cumulative average. This matters because the walk is far from
+    // uniform: blocks at/below ASSUME_VALID_HEIGHT skip PoW and fly, while
+    // blocks above it pay full Argon2id verification and crawl — a cumulative
+    // average would report a wildly optimistic ETA right when it slows down.
+    let mut last_sample = (walk_start, walk_from);
     if did_walk {
         info!(
             "Structural walk: verifying {} blocks [{}..={}]",
@@ -308,8 +314,16 @@ pub fn open_chain(
         if (height + 1) % 1000 == 0 || height == tip_height {
             let done = height - walk_from + 1;
             let total = tip_height - walk_from + 1;
-            let elapsed = walk_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+            let now = std::time::Instant::now();
+            // Recent rate over the interval since the last log line.
+            let (prev_t, prev_h) = last_sample;
+            let win_secs = now.duration_since(prev_t).as_secs_f64();
+            let win_blocks = height.saturating_sub(prev_h);
+            let rate = if win_secs > 0.0 {
+                win_blocks as f64 / win_secs
+            } else {
+                0.0
+            };
             let eta_secs = if rate > 0.0 {
                 ((total - done) as f64 / rate) as u64
             } else {
@@ -322,9 +336,10 @@ pub fn open_chain(
                 done as f64 / total as f64 * 100.0,
                 height,
                 rate,
-                elapsed as u64,
+                walk_start.elapsed().as_secs(),
                 eta_secs,
             );
+            last_sample = (now, height);
         }
     }
     if prev_id != tip_id {
@@ -526,6 +541,8 @@ pub fn replay_chain(
     let mut prev_id = Hash256::ZERO; // genesis has prev = ZERO
 
     let replay_start = std::time::Instant::now();
+    // Recent-rate tracker for a meaningful ETA (see the structural-walk note).
+    let mut last_sample = (replay_start, 0u64);
 
     info!("Replaying {} blocks...", tip_height + 1);
 
@@ -689,8 +706,15 @@ pub fn replay_chain(
         if (height + 1) % 1000 == 0 || height == tip_height {
             let done = height + 1;
             let total = tip_height + 1;
-            let elapsed = replay_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+            let now = std::time::Instant::now();
+            let (prev_t, prev_h) = last_sample;
+            let win_secs = now.duration_since(prev_t).as_secs_f64();
+            let win_blocks = (height + 1).saturating_sub(prev_h);
+            let rate = if win_secs > 0.0 {
+                win_blocks as f64 / win_secs
+            } else {
+                0.0
+            };
             let eta_secs = if rate > 0.0 {
                 ((total - done) as f64 / rate) as u64
             } else {
@@ -702,9 +726,10 @@ pub fn replay_chain(
                 total,
                 done as f64 / total as f64 * 100.0,
                 rate,
-                elapsed as u64,
+                replay_start.elapsed().as_secs(),
                 eta_secs,
             );
+            last_sample = (now, height + 1);
         }
 
         prev_id = block_id;
