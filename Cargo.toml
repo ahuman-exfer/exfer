@@ -16,6 +16,9 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 
+# Parallelism for per-input signature/script verification
+rayon = "1"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
