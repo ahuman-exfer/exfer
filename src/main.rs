@@ -13,6 +13,7 @@ compile_error!(
 mod chain;
 mod consensus;
 mod covenants;
+mod events;
 mod genesis;
 mod mempool;
 mod miner;
