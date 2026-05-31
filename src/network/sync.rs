@@ -941,6 +941,12 @@ pub struct Node {
     pub utxo_set: Arc<RwLock<UtxoSet>>,
     pub mempool: Arc<Mutex<Mempool>>,
     pub tip: Arc<RwLock<ChainTip>>,
+    /// Phase 2 SSE event bus. Owned here so chain commit / reorg paths
+    /// can emit script + tip nudges; the mempool also holds a clone via
+    /// `Mempool::set_event_bus` for its admit / remove / evict hooks; and
+    /// the JSON-RPC server passes it to SSE connection handlers for
+    /// per-connection subscribe / unsubscribe.
+    pub event_bus: Arc<crate::events::EventBus>,
     pub genesis_id: Hash256,
     /// Registry of logical peers, keyed by identity (Ed25519 pubkey).
     pub peers: Arc<Mutex<PeerRegistry>>,
@@ -3070,6 +3076,24 @@ impl Node {
                         reintroduced
                     );
                 }
+            }
+
+            // Phase 2 SSE: nudge every subscriber watching a script that
+            // changed in this block. Output scripts are emitted directly
+            // (new UTXO appeared); spent-input scripts are typically
+            // covered by the mempool deindex_entry path when the tx was
+            // visible in the mempool pre-confirmation. Block-only txs
+            // (miner-direct) get covered via the global TipChanged.
+            {
+                let bus = self.event_bus.clone();
+                let mut output_scripts: Vec<&[u8]> = Vec::new();
+                for tx in &all_confirmed_txs {
+                    for output in &tx.outputs {
+                        output_scripts.push(&output.script);
+                    }
+                }
+                bus.emit_scripts_changed(output_scripts);
+                bus.emit_tip_changed(block.header.height);
             }
 
             info!("New tip: height={}, id={}", block.header.height, block_id);

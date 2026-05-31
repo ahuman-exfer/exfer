@@ -3360,11 +3360,19 @@ async fn run_node(
             .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
             .unwrap_or(false);
 
+    // Phase 2 SSE event bus. Single instance shared between the chain
+    // commit / reorg path (in Node), the mempool admission / removal
+    // path, and the JSON-RPC SSE connection handlers.
+    let event_bus = events::EventBus::new();
+    let mut mempool = Mempool::new();
+    mempool.set_event_bus(event_bus.clone());
+
     let node = Arc::new(Node {
         storage,
         utxo_set: Arc::new(RwLock::new(utxo_set)),
-        mempool: Arc::new(Mutex::new(Mempool::new())),
+        mempool: Arc::new(Mutex::new(mempool)),
         tip: Arc::new(RwLock::new(tip)),
+        event_bus,
         genesis_id,
         peers: Arc::new(Mutex::new(
             network::sync::PeerRegistry::new(),

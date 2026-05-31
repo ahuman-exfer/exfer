@@ -1,10 +1,12 @@
 use crate::chain::state::UtxoSet;
 use crate::consensus::cost;
 use crate::consensus::validation::{validate_transaction, ValidationError};
+use crate::events::EventBus;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use crate::types::{COINBASE_MATURITY, MEMPOOL_CAPACITY};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Maximum total serialized bytes allowed in the mempool (256 MiB).
 const MAX_MEMPOOL_BYTES: usize = 256 * 1024 * 1024;
@@ -74,6 +76,12 @@ pub struct Mempool {
     by_script: BTreeMap<Vec<u8>, BTreeSet<Hash256>>,
     /// Total serialized bytes of all transactions currently in the mempool.
     total_bytes: usize,
+    /// Optional Phase 2 SSE event bus. Emitted to from `index_entry` /
+    /// `deindex_entry` so every mempool admission, removal, eviction,
+    /// confirmation drop, and revalidation drop nudges any subscriber
+    /// watching a touched script. `None` keeps the mempool standalone
+    /// (e.g. in unit tests).
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl Mempool {
@@ -84,6 +92,21 @@ impl Mempool {
             spent_outpoints: HashSet::new(),
             by_script: BTreeMap::new(),
             total_bytes: 0,
+            event_bus: None,
+        }
+    }
+
+    /// Install the Phase 2 SSE event bus. Must be called once at startup,
+    /// before any txs are admitted. After this point every script-touching
+    /// mempool mutation (admit / remove / evict / revalidate / confirm)
+    /// will nudge interested SSE subscribers.
+    pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
+        self.event_bus = Some(bus);
+    }
+
+    fn emit_script_changed(&self, script: &[u8]) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit_script_changed(script);
         }
     }
 
@@ -129,31 +152,41 @@ impl Mempool {
                 .entry(output.script.clone())
                 .or_default()
                 .insert(entry.tx_id);
+            self.emit_script_changed(&output.script);
         }
         for spent in &entry.spent_inputs {
             self.by_script
                 .entry(spent.script.clone())
                 .or_default()
                 .insert(entry.tx_id);
+            self.emit_script_changed(&spent.script);
         }
     }
 
     /// Remove this entry's tx_id from the `by_script` index, pruning any script
     /// whose set becomes empty (mirrors `UtxoSet::remove`).
     fn deindex_entry(&mut self, entry: &MempoolEntry) {
-        let scripts = entry
+        // Collect scripts first so we can emit AFTER the index update — the
+        // semantic is "the new state is visible, go re-pull". A subscriber
+        // that reacts faster than this method returns would still see the
+        // stale set; doing it after is one less surprising race.
+        let scripts: Vec<&Vec<u8>> = entry
             .tx
             .outputs
             .iter()
             .map(|o| &o.script)
-            .chain(entry.spent_inputs.iter().map(|s| &s.script));
-        for script in scripts {
-            if let Some(set) = self.by_script.get_mut(script) {
+            .chain(entry.spent_inputs.iter().map(|s| &s.script))
+            .collect();
+        for script in &scripts {
+            if let Some(set) = self.by_script.get_mut(*script) {
                 set.remove(&entry.tx_id);
                 if set.is_empty() {
-                    self.by_script.remove(script);
+                    self.by_script.remove(*script);
                 }
             }
+        }
+        for script in scripts {
+            self.emit_script_changed(script);
         }
     }
 
@@ -767,6 +800,32 @@ mod tests {
         mempool
             .add_validated(tx, fee, sc, svc, height, &snap)
             .expect("admit")
+    }
+
+    #[tokio::test]
+    async fn add_validated_emits_script_changed_for_recipient_and_sender() {
+        // Phase 2 SSE smoke: admitting a tx into the mempool should nudge
+        // any subscriber watching either the recipient (incoming) script
+        // or the sender (outgoing / spend-side) script.
+        let recipient = [10u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"E");
+        let bus = crate::events::EventBus::new();
+        let (_recv_id, mut recv_rx) = bus.subscribe(&[recipient_script.clone()]);
+        let (_send_id, mut send_rx) = bus.subscribe(&[sender_script.clone()]);
+        let mut mempool = Mempool::new();
+        mempool.set_event_bus(bus);
+        add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+
+        // Recipient subscriber must see its script in the nudge.
+        match recv_rx.try_recv() {
+            Ok(crate::events::ChainEvent::ScriptChanged(s)) => assert_eq!(s, recipient_script),
+            other => panic!("recipient subscriber: expected ScriptChanged, got {:?}", other),
+        }
+        // Sender subscriber must see its (spent-input) script in the nudge.
+        match send_rx.try_recv() {
+            Ok(crate::events::ChainEvent::ScriptChanged(s)) => assert_eq!(s, sender_script),
+            other => panic!("sender subscriber: expected ScriptChanged, got {:?}", other),
+        }
     }
 
     #[test]
