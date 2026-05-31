@@ -29,6 +29,7 @@ pub mod mempool;
 pub mod miner;
 pub mod network;
 pub mod rpc;
+pub mod rpc_sse;
 pub mod script;
 pub mod types;
 pub mod wallet;

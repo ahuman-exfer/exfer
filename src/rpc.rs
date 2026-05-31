@@ -6,6 +6,7 @@
 //! framed POSTs.
 
 use crate::network::sync::Node;
+use crate::rpc_sse;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -122,8 +124,13 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let scan_limiter: TxRateLimiter =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
-    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_RPC_CONNECTIONS));
+    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(Semaphore::new(1));
+
+    // Phase 2 SSE: separate pool + per-IP counter so long-lived streams
+    // can't starve the JSON-RPC slots.
+    let sse_conn_sem = rpc_sse::new_conn_semaphore();
+    let sse_per_ip = rpc_sse::new_per_ip_counter();
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -146,12 +153,16 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         let limiter = tx_limiter.clone();
         let scan_lim = scan_limiter.clone();
         let scan_sem = utxo_scan_sem.clone();
+        let sse_sem = sse_conn_sem.clone();
+        let sse_ip = sse_per_ip.clone();
         tokio::spawn(async move {
             let _permit = permit; // held until this task finishes
                                   // 30-second timeout on the entire request
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
-                handle_connection(stream, addr, node, limiter, scan_lim, scan_sem),
+                handle_connection(
+                    stream, addr, node, limiter, scan_lim, scan_sem, sse_sem, sse_ip,
+                ),
             )
             .await;
             match result {
@@ -171,6 +182,7 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     addr: SocketAddr,
@@ -178,6 +190,8 @@ async fn handle_connection(
     tx_limiter: TxRateLimiter,
     scan_limiter: TxRateLimiter,
     utxo_scan_sem: UtxoScanSemaphore,
+    sse_conn_sem: Arc<Semaphore>,
+    sse_per_ip: rpc_sse::SsePerIp,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the HTTP request line and headers.  We only need Content-Length.
     let mut header_buf = Vec::with_capacity(4096);
@@ -202,7 +216,47 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let header_str = String::from_utf8_lossy(&header_buf);
+    let header_str_raw = String::from_utf8_lossy(&header_buf);
+
+    // PROXY protocol v1 stripping: some L4 load balancers prepend a
+    // "PROXY TCP4 src dst sport dport\r\n" line before the HTTP request
+    // so the upstream sees the real client IP. Skip past it so the rest
+    // of this function sees a clean HTTP request line. Direct connections
+    // never carry the PROXY line, so the unconditional strip is a no-op
+    // there.
+    let header_str: std::borrow::Cow<'_, str> = if header_str_raw.starts_with("PROXY ") {
+        match header_str_raw.find("\r\n") {
+            Some(eol) => std::borrow::Cow::Owned(header_str_raw[eol + 2..].to_string()),
+            None => header_str_raw,
+        }
+    } else {
+        header_str_raw
+    };
+
+    // Phase 2 SSE: detect SSE upgrade requests and hand off to the
+    // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
+    // canonical Electrum-style form, curl-friendly) AND
+    // `POST /sse?addresses=...` (a POST-equivalent for clients behind
+    // proxies that mangle GETs or reject empty-body requests — the body
+    // is ignored either way, addresses live in the query string).
+    //
+    // The body of a POST /sse is ignored — addresses live in the query
+    // string either way so we don't have to read or parse the body for
+    // the SSE path.
+    //
+    // After hand-off the JSON-RPC pool permit drops at scope exit, so
+    // long-lived streams don't count against MAX_RPC_CONNECTIONS.
+    let request_line = header_str.lines().next().unwrap_or("");
+    let sse_after_path = request_line
+        .strip_prefix("GET /sse")
+        .or_else(|| request_line.strip_prefix("POST /sse"));
+    if let Some(rest) = sse_after_path {
+        let after_path = rest.split_whitespace().next().unwrap_or("");
+        let query = after_path.strip_prefix('?').unwrap_or("");
+        rpc_sse::handle_sse_connection(stream, addr, query, node.event_bus.clone(), sse_conn_sem, sse_per_ip)
+            .await;
+        return Ok(());
+    }
 
     // Require POST
     if !header_str.starts_with("POST ") {

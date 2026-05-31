@@ -19,6 +19,7 @@ mod mempool;
 mod miner;
 mod network;
 mod rpc;
+mod rpc_sse;
 mod script;
 mod types;
 mod wallet;
