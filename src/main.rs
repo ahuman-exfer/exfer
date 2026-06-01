@@ -13,11 +13,13 @@ compile_error!(
 mod chain;
 mod consensus;
 mod covenants;
+mod events;
 mod genesis;
 mod mempool;
 mod miner;
 mod network;
 mod rpc;
+mod rpc_sse;
 mod script;
 mod types;
 mod wallet;
@@ -105,7 +107,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.11.9";
+pub const RELEASE_TAG: &str = "1.12.0-phase2";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -3359,11 +3361,19 @@ async fn run_node(
             .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
             .unwrap_or(false);
 
+    // Phase 2 SSE event bus. Single instance shared between the chain
+    // commit / reorg path (in Node), the mempool admission / removal
+    // path, and the JSON-RPC SSE connection handlers.
+    let event_bus = events::EventBus::new();
+    let mut mempool = Mempool::new();
+    mempool.set_event_bus(event_bus.clone());
+
     let node = Arc::new(Node {
         storage,
         utxo_set: Arc::new(RwLock::new(utxo_set)),
-        mempool: Arc::new(Mutex::new(Mempool::new())),
+        mempool: Arc::new(Mutex::new(mempool)),
         tip: Arc::new(RwLock::new(tip)),
+        event_bus,
         genesis_id,
         peers: Arc::new(Mutex::new(
             network::sync::PeerRegistry::new(),

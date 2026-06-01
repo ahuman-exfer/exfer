@@ -6,6 +6,7 @@
 //! framed POSTs.
 
 use crate::network::sync::Node;
+use crate::rpc_sse;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -122,8 +124,13 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let scan_limiter: TxRateLimiter =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
-    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_RPC_CONNECTIONS));
+    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(Semaphore::new(1));
+
+    // Phase 2 SSE: separate pool + per-IP counter so long-lived streams
+    // can't starve the JSON-RPC slots.
+    let sse_conn_sem = rpc_sse::new_conn_semaphore();
+    let sse_per_ip = rpc_sse::new_per_ip_counter();
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -146,12 +153,16 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         let limiter = tx_limiter.clone();
         let scan_lim = scan_limiter.clone();
         let scan_sem = utxo_scan_sem.clone();
+        let sse_sem = sse_conn_sem.clone();
+        let sse_ip = sse_per_ip.clone();
         tokio::spawn(async move {
             let _permit = permit; // held until this task finishes
                                   // 30-second timeout on the entire request
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
-                handle_connection(stream, addr, node, limiter, scan_lim, scan_sem),
+                handle_connection(
+                    stream, addr, node, limiter, scan_lim, scan_sem, sse_sem, sse_ip,
+                ),
             )
             .await;
             match result {
@@ -171,6 +182,7 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     addr: SocketAddr,
@@ -178,6 +190,8 @@ async fn handle_connection(
     tx_limiter: TxRateLimiter,
     scan_limiter: TxRateLimiter,
     utxo_scan_sem: UtxoScanSemaphore,
+    sse_conn_sem: Arc<Semaphore>,
+    sse_per_ip: rpc_sse::SsePerIp,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the HTTP request line and headers.  We only need Content-Length.
     let mut header_buf = Vec::with_capacity(4096);
@@ -203,6 +217,28 @@ async fn handle_connection(
     }
 
     let header_str = String::from_utf8_lossy(&header_buf);
+
+    // Phase 2 SSE: detect `GET /sse?addresses=...` (the canonical
+    // Electrum-style form) and hand off to the long-lived handler.
+    let request_line = header_str.lines().next().unwrap_or("");
+    if let Some(rest) = request_line.strip_prefix("GET /sse") {
+        let after_path = rest.split_whitespace().next().unwrap_or("");
+        let query = after_path.strip_prefix('?').unwrap_or("").to_string();
+        // SSE streams are long-lived by design. The caller wraps
+        // `handle_connection` in a 30 s per-request timeout (a slowloris guard
+        // for JSON-RPC). If we awaited the SSE handler here it would inherit
+        // that timeout and the stream would be torn down every ~30 s. Detach
+        // it into its own task so it escapes the timeout scope, and the
+        // JSON-RPC pool permit drops immediately at scope exit — long-lived
+        // streams must not count against MAX_RPC_CONNECTIONS. SSE liveness is
+        // governed by the 25 s heartbeat, TCP keepalive, and write-error
+        // detection inside the handler (plus its own MAX_RPC_SSE_* caps).
+        let bus = node.event_bus.clone();
+        tokio::spawn(async move {
+            rpc_sse::handle_sse_connection(stream, addr, &query, bus, sse_conn_sem, sse_per_ip).await;
+        });
+        return Ok(());
+    }
 
     // Require POST
     if !header_str.starts_with("POST ") {
@@ -347,14 +383,22 @@ async fn dispatch(
                 _ => unreachable!(),
             }
         }
-        "get_address_mempool" => {
+        "get_address_mempool" | "get_address_mempool_batch" => {
             // Scan-rate-limited (counts toward the 30/min budget) but NOT held
             // under utxo_scan_sem: this endpoint only touches the mempool lock
             // briefly, not the UTXO read lock the semaphore exists to protect.
+            // The batch form costs ONE scan charge for up to MAX_BATCH_ADDRESSES
+            // addresses, so a multi-address wallet poll doesn't burn its budget.
             if let Some(resp) = check_scan_rate_limit(scan_limiter, peer_ip, &id) {
                 return resp;
             }
-            handle_get_address_mempool(id, req.params, node).await
+            match req.method.as_str() {
+                "get_address_mempool" => handle_get_address_mempool(id, req.params, node).await,
+                "get_address_mempool_batch" => {
+                    handle_get_address_mempool_batch(id, req.params, node).await
+                }
+                _ => unreachable!(),
+            }
         }
         "get_block" => handle_get_block(id, req.params, node).await,
         "get_transaction" => handle_get_transaction(id, req.params, node).await,
@@ -809,6 +853,74 @@ async fn handle_get_address_mempool(
             "tip_height": tip_height,
             "mempool": mempool_json,
         }),
+    )
+}
+
+/// Batched form of [`handle_get_address_mempool`]: one request returns the
+/// mempool view for up to `MAX_BATCH_ADDRESSES` addresses, under a single
+/// scan-rate-limit charge and a single mempool lock. A wallet polling N
+/// addresses would otherwise spend N of its 30 scans/min just on mempool;
+/// this collapses that to one.
+async fn handle_get_address_mempool_batch(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: BatchAddressParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+    let decoded = match decode_batch_addresses(&id, &parsed.addresses) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    let tip_height = node.tip.read().await.height;
+    // One mempool lock for the whole batch; collect raw, format after release.
+    let collected: Vec<_> = {
+        let mempool = node.mempool.lock().await;
+        decoded
+            .into_iter()
+            .map(|(addr, bytes)| (addr, mempool.address_mempool(&bytes)))
+            .collect()
+    };
+
+    let addresses: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|(addr, txs)| {
+            let mempool_json: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|t| {
+                    let received: Vec<serde_json::Value> = t
+                        .received
+                        .iter()
+                        .map(|(idx, val)| serde_json::json!({ "output_index": idx, "value": val }))
+                        .collect();
+                    let spent: Vec<serde_json::Value> = t
+                        .spent
+                        .iter()
+                        .map(|(op, val)| {
+                            serde_json::json!({
+                                "tx_id": hex::encode(op.tx_id.as_bytes()),
+                                "output_index": op.output_index,
+                                "value": val,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "tx_id": hex::encode(t.tx_id.as_bytes()),
+                        "received": received,
+                        "spent": spent,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "address": addr, "mempool": mempool_json })
+        })
+        .collect();
+
+    RpcResponse::ok(
+        id,
+        serde_json::json!({ "tip_height": tip_height, "addresses": addresses }),
     )
 }
 
