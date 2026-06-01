@@ -347,14 +347,22 @@ async fn dispatch(
                 _ => unreachable!(),
             }
         }
-        "get_address_mempool" => {
+        "get_address_mempool" | "get_address_mempool_batch" => {
             // Scan-rate-limited (counts toward the 30/min budget) but NOT held
             // under utxo_scan_sem: this endpoint only touches the mempool lock
             // briefly, not the UTXO read lock the semaphore exists to protect.
+            // The batch form costs ONE scan charge for up to MAX_BATCH_ADDRESSES
+            // addresses, so a multi-address wallet poll doesn't burn its budget.
             if let Some(resp) = check_scan_rate_limit(scan_limiter, peer_ip, &id) {
                 return resp;
             }
-            handle_get_address_mempool(id, req.params, node).await
+            match req.method.as_str() {
+                "get_address_mempool" => handle_get_address_mempool(id, req.params, node).await,
+                "get_address_mempool_batch" => {
+                    handle_get_address_mempool_batch(id, req.params, node).await
+                }
+                _ => unreachable!(),
+            }
         }
         "get_block" => handle_get_block(id, req.params, node).await,
         "get_transaction" => handle_get_transaction(id, req.params, node).await,
@@ -809,6 +817,74 @@ async fn handle_get_address_mempool(
             "tip_height": tip_height,
             "mempool": mempool_json,
         }),
+    )
+}
+
+/// Batched form of [`handle_get_address_mempool`]: one request returns the
+/// mempool view for up to `MAX_BATCH_ADDRESSES` addresses, under a single
+/// scan-rate-limit charge and a single mempool lock. A wallet polling N
+/// addresses would otherwise spend N of its 30 scans/min just on mempool;
+/// this collapses that to one.
+async fn handle_get_address_mempool_batch(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    node: &Arc<Node>,
+) -> RpcResponse {
+    let parsed: BatchAddressParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
+    };
+    let decoded = match decode_batch_addresses(&id, &parsed.addresses) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    let tip_height = node.tip.read().await.height;
+    // One mempool lock for the whole batch; collect raw, format after release.
+    let collected: Vec<_> = {
+        let mempool = node.mempool.lock().await;
+        decoded
+            .into_iter()
+            .map(|(addr, bytes)| (addr, mempool.address_mempool(&bytes)))
+            .collect()
+    };
+
+    let addresses: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|(addr, txs)| {
+            let mempool_json: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|t| {
+                    let received: Vec<serde_json::Value> = t
+                        .received
+                        .iter()
+                        .map(|(idx, val)| serde_json::json!({ "output_index": idx, "value": val }))
+                        .collect();
+                    let spent: Vec<serde_json::Value> = t
+                        .spent
+                        .iter()
+                        .map(|(op, val)| {
+                            serde_json::json!({
+                                "tx_id": hex::encode(op.tx_id.as_bytes()),
+                                "output_index": op.output_index,
+                                "value": val,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "tx_id": hex::encode(t.tx_id.as_bytes()),
+                        "received": received,
+                        "spent": spent,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "address": addr, "mempool": mempool_json })
+        })
+        .collect();
+
+    RpcResponse::ok(
+        id,
+        serde_json::json!({ "tip_height": tip_height, "addresses": addresses }),
     )
 }
 
