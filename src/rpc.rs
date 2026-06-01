@@ -216,45 +216,27 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let header_str_raw = String::from_utf8_lossy(&header_buf);
+    let header_str = String::from_utf8_lossy(&header_buf);
 
-    // PROXY protocol v1 stripping: some L4 load balancers prepend a
-    // "PROXY TCP4 src dst sport dport\r\n" line before the HTTP request
-    // so the upstream sees the real client IP. Skip past it so the rest
-    // of this function sees a clean HTTP request line. Direct connections
-    // never carry the PROXY line, so the unconditional strip is a no-op
-    // there.
-    let header_str: std::borrow::Cow<'_, str> = if header_str_raw.starts_with("PROXY ") {
-        match header_str_raw.find("\r\n") {
-            Some(eol) => std::borrow::Cow::Owned(header_str_raw[eol + 2..].to_string()),
-            None => header_str_raw,
-        }
-    } else {
-        header_str_raw
-    };
-
-    // Phase 2 SSE: detect SSE upgrade requests and hand off to the
-    // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
-    // canonical Electrum-style form, curl-friendly) AND
-    // `POST /sse?addresses=...` (a POST-equivalent for clients behind
-    // proxies that mangle GETs or reject empty-body requests — the body
-    // is ignored either way, addresses live in the query string).
-    //
-    // The body of a POST /sse is ignored — addresses live in the query
-    // string either way so we don't have to read or parse the body for
-    // the SSE path.
-    //
-    // After hand-off the JSON-RPC pool permit drops at scope exit, so
-    // long-lived streams don't count against MAX_RPC_CONNECTIONS.
+    // Phase 2 SSE: detect `GET /sse?addresses=...` (the canonical
+    // Electrum-style form) and hand off to the long-lived handler.
     let request_line = header_str.lines().next().unwrap_or("");
-    let sse_after_path = request_line
-        .strip_prefix("GET /sse")
-        .or_else(|| request_line.strip_prefix("POST /sse"));
-    if let Some(rest) = sse_after_path {
+    if let Some(rest) = request_line.strip_prefix("GET /sse") {
         let after_path = rest.split_whitespace().next().unwrap_or("");
-        let query = after_path.strip_prefix('?').unwrap_or("");
-        rpc_sse::handle_sse_connection(stream, addr, query, node.event_bus.clone(), sse_conn_sem, sse_per_ip)
-            .await;
+        let query = after_path.strip_prefix('?').unwrap_or("").to_string();
+        // SSE streams are long-lived by design. The caller wraps
+        // `handle_connection` in a 30 s per-request timeout (a slowloris guard
+        // for JSON-RPC). If we awaited the SSE handler here it would inherit
+        // that timeout and the stream would be torn down every ~30 s. Detach
+        // it into its own task so it escapes the timeout scope, and the
+        // JSON-RPC pool permit drops immediately at scope exit — long-lived
+        // streams must not count against MAX_RPC_CONNECTIONS. SSE liveness is
+        // governed by the 25 s heartbeat, TCP keepalive, and write-error
+        // detection inside the handler (plus its own MAX_RPC_SSE_* caps).
+        let bus = node.event_bus.clone();
+        tokio::spawn(async move {
+            rpc_sse::handle_sse_connection(stream, addr, &query, bus, sse_conn_sem, sse_per_ip).await;
+        });
         return Ok(());
     }
 

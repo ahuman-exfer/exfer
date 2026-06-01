@@ -41,6 +41,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -50,11 +51,11 @@ use tracing::debug;
 /// Route A (per-script subscription routing): each event walks the
 /// interested-subscribers set, not all connections, so this can sit
 /// well above the 32-slot one-shot pool.
-pub const MAX_RPC_SSE_CONNECTIONS: usize = 256;
+pub const MAX_RPC_SSE_CONNECTIONS: usize = 2048;
 
 /// Maximum SSE connections per remote IP. Defense against one client
 /// monopolising the pool by opening hundreds of streams.
-pub const MAX_RPC_SSE_PER_IP: usize = 4;
+pub const MAX_RPC_SSE_PER_IP: usize = 64;
 
 /// Maximum addresses one SSE connection may subscribe to. Bounds the
 /// filter cost and the "subscribe to every address on the chain"
@@ -175,6 +176,18 @@ pub async fn handle_sse_connection(
             return;
         }
     };
+
+    // Keep-alive so a silently-dropped client (no FIN — common on mobile/NAT)
+    // is detected and its per-IP slot freed in ~120s, not the ~15min a dead
+    // half-open socket would otherwise linger holding the slot. A healthy
+    // client's kernel auto-ACKs the probes, so this never disconnects a live
+    // app; only a peer that has genuinely stopped responding gets reset.
+    let _ = SockRef::from(&stream).set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(20))
+            .with_retries(3),
+    );
 
     // Address list.
     let scripts = match parse_addresses(query) {

@@ -107,7 +107,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.11.9";
+pub const RELEASE_TAG: &str = "1.12.0-phase2";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
