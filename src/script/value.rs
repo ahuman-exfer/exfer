@@ -229,6 +229,53 @@ impl Value {
         }
     }
 
+    /// Serialize only the **structural skeleton** of a value: every
+    /// variant tag and the nesting between compound variants is
+    /// preserved, but the scalar payload bytes (integer values, byte
+    /// contents, the boolean bit, hash/u256 bytes) are dropped.
+    ///
+    /// Used by [`crate::script::structural_merkle_hash`] so that two
+    /// `Const`s of the same type *and shape* collapse regardless of the
+    /// specific value, while constants of a different type or shape stay
+    /// distinct: `Bool` vs `U64` differ by their variant tag, and a flat
+    /// `Bytes` differs from a `Pair(Bytes, Bytes)` by its nesting.
+    ///
+    /// The `List` length prefix is retained — it is structural arity, not
+    /// scalar payload, and dropping it would make the skeleton grammar
+    /// ambiguous (e.g. `List[Bytes]` followed by a sibling could alias
+    /// `List[Bytes, Bytes]`).
+    pub(crate) fn structural_skeleton_into(&self, buf: &mut Vec<u8>) {
+        match self {
+            Value::Unit => buf.push(0x00),
+            Value::Left(v) => {
+                buf.push(0x01);
+                v.structural_skeleton_into(buf);
+            }
+            Value::Right(v) => {
+                buf.push(0x02);
+                v.structural_skeleton_into(buf);
+            }
+            Value::Pair(a, b) => {
+                buf.push(0x03);
+                a.structural_skeleton_into(buf);
+                b.structural_skeleton_into(buf);
+            }
+            Value::List(vs) => {
+                buf.push(0x04);
+                buf.extend_from_slice(&(vs.len() as u32).to_le_bytes());
+                for v in vs {
+                    v.structural_skeleton_into(buf);
+                }
+            }
+            // Scalar leaves: keep the variant tag, drop the payload bytes.
+            Value::Bytes(_) => buf.push(0x05),
+            Value::U64(_) => buf.push(0x06),
+            Value::U256(_) => buf.push(0x07),
+            Value::Bool(_) => buf.push(0x08),
+            Value::Hash(_) => buf.push(0x09),
+        }
+    }
+
     /// Deserialize a value from bytes. Returns (value, bytes_consumed).
     pub fn deserialize(data: &[u8]) -> Result<(Value, usize), &'static str> {
         Self::deserialize_depth(data, 0)
