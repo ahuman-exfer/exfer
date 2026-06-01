@@ -57,6 +57,15 @@ struct SubscriberSender {
     /// next successful send the bus prepends a `ChainEvent::Resync` so
     /// the client knows it has missed events.
     lagged: AtomicBool,
+    /// Whether this subscriber opted into tip (new-block) nudges. OFF by
+    /// default: a per-script subscriber (e.g. a wallet watching its own
+    /// addresses) only cares when one of ITS scripts changes — a bare tip
+    /// would wake every connection on every block for nothing, and a wallet
+    /// that re-pulls on each wake can blow the node's scan-rate budget.
+    /// Confirmations of a watched script still arrive as `ScriptChanged`
+    /// (mempool removal emits it), so a tip is redundant for them. Opt in
+    /// with `?tips=1` on the SSE request for a height-only feed.
+    wants_tip: bool,
 }
 
 /// The bus itself. Cheap to share via `Arc`. Held by the mempool and by
@@ -85,7 +94,11 @@ impl EventBus {
     ///
     /// The caller is responsible for calling `unsubscribe(id)` when the
     /// connection closes — otherwise the per-script routing entries leak.
-    pub fn subscribe(&self, scripts: &[ScriptKey]) -> (SubscriberId, mpsc::Receiver<ChainEvent>) {
+    pub fn subscribe(
+        &self,
+        scripts: &[ScriptKey],
+        wants_tip: bool,
+    ) -> (SubscriberId, mpsc::Receiver<ChainEvent>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(SUBSCRIBER_BUFFER);
 
@@ -96,6 +109,7 @@ impl EventBus {
                 SubscriberSender {
                     tx,
                     lagged: AtomicBool::new(false),
+                    wants_tip,
                 },
             );
         }
@@ -167,11 +181,16 @@ impl EventBus {
         }
     }
 
-    /// Tip advanced. Sent to every active subscriber.
+    /// Tip advanced. Sent only to subscribers that opted into tip nudges
+    /// (`wants_tip`); per-script subscribers are deliberately NOT woken on
+    /// every block — see [`SubscriberSender::wants_tip`].
     pub fn emit_tip_changed(&self, height: u64) {
         let ids: Vec<SubscriberId> = {
             let subs = self.subscribers.read().expect("subscribers lock poisoned");
-            subs.keys().copied().collect()
+            subs.iter()
+                .filter(|(_, s)| s.wants_tip)
+                .map(|(id, _)| *id)
+                .collect()
         };
         if ids.is_empty() {
             return;
@@ -228,7 +247,7 @@ mod tests {
     async fn subscribe_receives_emitted_event_for_its_script() {
         let bus = EventBus::new();
         let s = script_of(7);
-        let (_id, mut rx) = bus.subscribe(&[s.clone()]);
+        let (_id, mut rx) = bus.subscribe(&[s.clone()], false);
         bus.emit_script_changed(&s);
         match rx.recv().await {
             Some(ChainEvent::ScriptChanged(got)) => assert_eq!(got, s),
@@ -239,21 +258,41 @@ mod tests {
     #[tokio::test]
     async fn subscribe_does_not_receive_events_for_other_scripts() {
         let bus = EventBus::new();
-        let (_id, mut rx) = bus.subscribe(&[script_of(1)]);
+        // wants_tip = false (the default): this subscriber must receive
+        // NOTHING here — not the unrelated script-2 change, and not the tip
+        // (tip is opt-in now).
+        let (_id, mut rx) = bus.subscribe(&[script_of(1)], false);
         bus.emit_script_changed(&script_of(2));
-        bus.emit_tip_changed(100); // ensure something else doesn't accidentally fire
+        bus.emit_tip_changed(100);
         match rx.try_recv() {
             Err(mpsc::error::TryRecvError::Empty) => {} // good: filtered out
-            Ok(ChainEvent::TipChanged { height: 100 }) => {} // tip emit is global, also OK
             other => panic!("subscriber for script 1 got unrelated event: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn tip_is_opt_in_per_subscriber() {
+        let bus = EventBus::new();
+        // Default subscriber: no tip.
+        let (_a, mut rx_off) = bus.subscribe(&[script_of(1)], false);
+        // Opted-in subscriber: gets tip.
+        let (_b, mut rx_on) = bus.subscribe(&[script_of(1)], true);
+        bus.emit_tip_changed(42);
+        assert!(matches!(
+            rx_on.try_recv(),
+            Ok(ChainEvent::TipChanged { height: 42 })
+        ));
+        assert!(matches!(
+            rx_off.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
     async fn unsubscribe_removes_routes_and_closes_channel() {
         let bus = EventBus::new();
         let s = script_of(3);
-        let (id, mut rx) = bus.subscribe(&[s.clone()]);
+        let (id, mut rx) = bus.subscribe(&[s.clone()], false);
         assert_eq!(bus.subscriber_count(), 1);
         assert_eq!(bus.route_count(), 1);
         bus.unsubscribe(id);
@@ -267,7 +306,7 @@ mod tests {
     async fn lagged_subscriber_gets_resync_before_next_event() {
         let bus = EventBus::new();
         let s = script_of(9);
-        let (_id, mut rx) = bus.subscribe(&[s.clone()]);
+        let (_id, mut rx) = bus.subscribe(&[s.clone()], false);
         // Step 1: overflow the buffer to force a try_send failure and flip
         // the lagged flag. SUBSCRIBER_BUFFER + 1 emits → last one fails.
         for _ in 0..(SUBSCRIBER_BUFFER + 1) {
@@ -298,7 +337,7 @@ mod tests {
     async fn emit_scripts_changed_dedups_within_one_block() {
         let bus = EventBus::new();
         let s = script_of(5);
-        let (_id, mut rx) = bus.subscribe(&[s.clone()]);
+        let (_id, mut rx) = bus.subscribe(&[s.clone()], false);
         // Same script repeated → subscriber should still only get one event.
         bus.emit_scripts_changed(vec![s.clone(), s.clone(), s.clone()]);
         let first = rx.try_recv();

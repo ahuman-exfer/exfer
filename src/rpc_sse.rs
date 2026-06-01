@@ -223,8 +223,15 @@ pub async fn handle_sse_connection(
         return;
     }
 
+    // Opt-in tip feed: by default a per-address subscriber is NOT woken on
+    // every block (only when one of its scripts changes). A client that wants
+    // a height feed adds `&tips=1`.
+    let wants_tip = query
+        .split('&')
+        .any(|p| matches!(p, "tips=1" | "tips=true"));
+
     // Subscribe.
-    let (sub_id, mut rx) = bus.subscribe(&scripts);
+    let (sub_id, mut rx) = bus.subscribe(&scripts, wants_tip);
     debug!(
         "SSE subscribed: peer={} sub_id={} addresses={}",
         addr,

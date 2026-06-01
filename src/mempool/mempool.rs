@@ -810,8 +810,8 @@ mod tests {
         let recipient = [10u8; 32];
         let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"E");
         let bus = crate::events::EventBus::new();
-        let (_recv_id, mut recv_rx) = bus.subscribe(&[recipient_script.clone()]);
-        let (_send_id, mut send_rx) = bus.subscribe(&[sender_script.clone()]);
+        let (_recv_id, mut recv_rx) = bus.subscribe(&[recipient_script.clone()], false);
+        let (_send_id, mut send_rx) = bus.subscribe(&[sender_script.clone()], false);
         let mut mempool = Mempool::new();
         mempool.set_event_bus(bus);
         add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
