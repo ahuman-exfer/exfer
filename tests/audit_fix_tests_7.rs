@@ -226,6 +226,14 @@ mod deferred_storage_tests {
             mining_cancel: std::sync::atomic::AtomicBool::new(false),
             assume_valid: false,
             assume_valid_verified: std::sync::atomic::AtomicBool::new(false),
+            event_bus: exfer::events::EventBus::new(),
+            ever_confirmed_peer: std::sync::atomic::AtomicBool::new(false),
+            frame_budget: exfer::network::frame_budget::FrameBudget::new(),
+            tip_validation_coord: Arc::new(
+                exfer::network::tip_validation::TipValidationCoordinator::new(),
+            ),
+            assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
+            stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
         };
 
         let pubkey = [42u8; 32];
