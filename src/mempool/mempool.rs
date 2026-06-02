@@ -536,12 +536,28 @@ impl Mempool {
     /// were locked to `script` (outpoint + value). A tx that both pays and
     /// spends `script` appears once with both populated.
     pub fn address_mempool(&self, script: &[u8]) -> Vec<MempoolAddressTx> {
+        self.address_mempool_capped(script, usize::MAX)
+    }
+
+    /// Capped form of [`address_mempool`]: stops after collecting `limit`
+    /// touching txs. A caller that needs to detect truncation requests
+    /// `cap + 1` and compares the result length against `cap`, mirroring
+    /// [`crate::chain::state::UtxoSet::utxos_for_script`].
+    ///
+    /// This bounds both the mempool-lock scan time and the response size for
+    /// the batch endpoint: `by_script[S]` can be driven toward the whole
+    /// mempool by fee-filling it with txs all paying one script `S`, so an
+    /// uncapped scan under the exclusive mempool lock is a liveness hazard.
+    pub fn address_mempool_capped(&self, script: &[u8], limit: usize) -> Vec<MempoolAddressTx> {
         let tx_ids = match self.by_script.get(script) {
             Some(set) => set,
             None => return Vec::new(),
         };
-        let mut out = Vec::with_capacity(tx_ids.len());
+        let mut out = Vec::with_capacity(tx_ids.len().min(limit));
         for tx_id in tx_ids {
+            if out.len() >= limit {
+                break;
+            }
             let entry = match self.entries.get(tx_id) {
                 Some(e) => e,
                 None => continue,
@@ -855,6 +871,36 @@ mod tests {
         assert!(sent[0].received.is_empty());
         assert_eq!(sent[0].spent.len(), 1);
         assert_eq!(sent[0].spent[0].1, 1_000_000_000);
+    }
+
+    #[test]
+    fn address_mempool_capped_bounds_results() {
+        // Several distinct txs all paying the same recipient script — the
+        // shape an attacker drives toward whole-mempool by fee-filling with
+        // txs that all pay one script S.
+        let recipient = [21u8; 32];
+        let mut mempool = Mempool::new();
+        let seeds: [&[u8]; 5] = [b"c0", b"c1", b"c2", b"c3", b"c4"];
+        let mut recipient_script = Vec::new();
+        for seed in seeds {
+            let (utxo_set, tx, _sender, rscript) = signed_spend(&recipient, seed);
+            recipient_script = rscript;
+            add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+        }
+
+        // Uncapped delegates to capped(usize::MAX): all five.
+        assert_eq!(mempool.address_mempool(&recipient_script).len(), 5);
+
+        // Capped stops early at the cap.
+        assert_eq!(mempool.address_mempool_capped(&recipient_script, 2).len(), 2);
+
+        // The batch endpoint's truncation probe: request cap + 1 so that
+        // len > cap signals "there are more" without scanning the rest.
+        let probe = mempool.address_mempool_capped(&recipient_script, 3 + 1);
+        assert!(
+            probe.len() > 3,
+            "cap+1 probe must exceed cap to flag truncation"
+        );
     }
 
     #[test]
