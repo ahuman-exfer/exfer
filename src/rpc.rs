@@ -5,6 +5,7 @@
 //! used — just raw tokio TCP with enough parsing to handle Content-Length
 //! framed POSTs.
 
+use crate::mempool::MempoolAddressTx;
 use crate::network::sync::Node;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
@@ -840,18 +841,40 @@ async fn handle_get_address_mempool_batch(
     };
 
     let tip_height = node.tip.read().await.height;
+    // Per-address result cap, parity with get_address_utxos_batch's
+    // MAX_UTXO_RESULTS. Bounds both the worst-case mempool-lock scan and the
+    // response size when one watched script is touched by a near-whole-mempool
+    // set of txs (an attacker can fee-fill the mempool with txs paying S).
+    const MAX_MEMPOOL_RESULTS: usize = 1000;
     // One mempool lock for the whole batch; collect raw, format after release.
-    let collected: Vec<_> = {
+    #[allow(clippy::type_complexity)]
+    let collected: Vec<(String, Vec<MempoolAddressTx>, bool)> = {
         let mempool = node.mempool.lock().await;
         decoded
             .into_iter()
-            .map(|(addr, bytes)| (addr, mempool.address_mempool(&bytes)))
+            .map(|(addr, bytes)| {
+                let mut txs = mempool.address_mempool_capped(&bytes, MAX_MEMPOOL_RESULTS + 1);
+                let truncated = txs.len() > MAX_MEMPOOL_RESULTS;
+                txs.truncate(MAX_MEMPOOL_RESULTS);
+                (addr, txs, truncated)
+            })
             .collect()
     };
 
+    RpcResponse::ok(id, assemble_address_mempool_batch(tip_height, &collected))
+}
+
+/// Build the `get_address_mempool_batch` result JSON. Pulled out of the
+/// handler as a pure fn so the batch assembly, per-tx JSON shape, the
+/// `truncated` flag, and the Nth-in / Nth-out address-to-result pairing are
+/// unit-testable without standing up a Node.
+fn assemble_address_mempool_batch(
+    tip_height: u64,
+    collected: &[(String, Vec<MempoolAddressTx>, bool)],
+) -> serde_json::Value {
     let addresses: Vec<serde_json::Value> = collected
         .iter()
-        .map(|(addr, txs)| {
+        .map(|(addr, txs, truncated)| {
             let mempool_json: Vec<serde_json::Value> = txs
                 .iter()
                 .map(|t| {
@@ -878,14 +901,11 @@ async fn handle_get_address_mempool_batch(
                     })
                 })
                 .collect();
-            serde_json::json!({ "address": addr, "mempool": mempool_json })
+            serde_json::json!({ "address": addr, "mempool": mempool_json, "truncated": truncated })
         })
         .collect();
 
-    RpcResponse::ok(
-        id,
-        serde_json::json!({ "tip_height": tip_height, "addresses": addresses }),
-    )
+    serde_json::json!({ "tip_height": tip_height, "addresses": addresses })
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +943,7 @@ fn decode_batch_addresses(
         ));
     }
     let mut decoded = Vec::with_capacity(addresses.len());
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for addr in addresses {
         let bytes = match hex::decode(addr) {
             Ok(b) => b,
@@ -945,7 +966,16 @@ fn decode_batch_addresses(
                 ),
             ));
         }
-        decoded.push((addr.clone(), bytes));
+        // Dedup by decoded script. A repeated address (e.g. `addresses=[S; 100]`)
+        // must not multiply the downstream per-address work — for the mempool
+        // batch that means N scans of the same `by_script[S]` under one lock
+        // hold and N copies of the same view in the response. Legit clients
+        // pass distinct addresses, so this is a no-op for them and preserves
+        // Nth-in / Nth-out pairing. Validation still runs for every entry, so
+        // a malformed duplicate is still rejected.
+        if seen.insert(bytes.clone()) {
+            decoded.push((addr.clone(), bytes));
+        }
     }
     Ok(decoded)
 }
@@ -1680,6 +1710,86 @@ pub fn rpc_call(
 mod rpc_client_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn decode_batch_addresses_dedups_repeats() {
+        let id = serde_json::Value::from(1);
+        let s = hex::encode([0xABu8; 32]);
+        // 100 copies of one address collapse to a single decoded entry —
+        // kills the [S; 100] amplification on the downstream per-address work.
+        let dups = vec![s.clone(); 100];
+        let ok = |r: Result<Vec<(String, Vec<u8>)>, RpcResponse>| match r {
+            Ok(d) => d,
+            Err(_) => panic!("valid addresses should decode"),
+        };
+        let decoded = ok(decode_batch_addresses(&id, &dups));
+        assert_eq!(decoded.len(), 1, "repeated address must dedup to one");
+        assert_eq!(decoded[0].0, s);
+
+        // Distinct addresses are kept in first-seen order; a trailing dup of
+        // an earlier address is dropped (pairing for legit clients preserved).
+        let a = hex::encode([1u8; 32]);
+        let b = hex::encode([2u8; 32]);
+        let c = hex::encode([3u8; 32]);
+        let list = vec![a.clone(), b.clone(), c.clone(), a.clone()];
+        let decoded = ok(decode_batch_addresses(&id, &list));
+        assert_eq!(
+            decoded.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
+            vec![a, b, c],
+            "distinct kept in order, trailing dup dropped"
+        );
+    }
+
+    #[test]
+    fn assemble_address_mempool_batch_shape_and_pairing() {
+        let addr_a = hex::encode([1u8; 32]);
+        let addr_b = hex::encode([2u8; 32]);
+        let tx = Hash256([9u8; 32]);
+        let op = OutPoint::new(Hash256([5u8; 32]), 2);
+        // Two addresses: A received-only (not truncated), B spent-only (truncated).
+        let collected = vec![
+            (
+                addr_a.clone(),
+                vec![MempoolAddressTx {
+                    tx_id: tx,
+                    received: vec![(0u32, 700u64)],
+                    spent: vec![],
+                }],
+                false,
+            ),
+            (
+                addr_b.clone(),
+                vec![MempoolAddressTx {
+                    tx_id: tx,
+                    received: vec![],
+                    spent: vec![(op, 1000u64)],
+                }],
+                true,
+            ),
+        ];
+        let v = assemble_address_mempool_batch(42, &collected);
+        assert_eq!(v["tip_height"], 42);
+        let arr = v["addresses"].as_array().expect("addresses array");
+        assert_eq!(arr.len(), 2);
+
+        // Nth-in / Nth-out address-to-result pairing.
+        assert_eq!(arr[0]["address"], addr_a);
+        assert_eq!(arr[1]["address"], addr_b);
+
+        // Received-side JSON shape + truncated flag.
+        let a_tx = &arr[0]["mempool"][0];
+        assert_eq!(a_tx["tx_id"], hex::encode(tx.as_bytes()));
+        assert_eq!(a_tx["received"][0]["output_index"], 0);
+        assert_eq!(a_tx["received"][0]["value"], 700);
+        assert_eq!(arr[0]["truncated"], false);
+
+        // Spent-side JSON shape + truncated flag propagation.
+        let b_tx = &arr[1]["mempool"][0];
+        assert_eq!(b_tx["spent"][0]["tx_id"], hex::encode(op.tx_id.as_bytes()));
+        assert_eq!(b_tx["spent"][0]["output_index"], 2);
+        assert_eq!(b_tx["spent"][0]["value"], 1000);
+        assert_eq!(arr[1]["truncated"], true);
+    }
 
     #[test]
     fn utxo_cursor_round_trips_with_tip_id() {
