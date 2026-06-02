@@ -20,7 +20,14 @@ pub const PROTOCOL_VERSION: u32 = 5;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 10;
 pub const RETARGET_WINDOW: u64 = 4_320;
 pub const MAX_RETARGET_FACTOR: u64 = 4;
+#[cfg(not(feature = "devnet"))]
 pub const COINBASE_MATURITY: u64 = 360;
+/// Devnet only: coinbase spendable after a single confirmation so an isolated
+/// local chain has usable funds within seconds. Gated on the `devnet` feature
+/// (not `testnet`) so the test suite, run under `--features testnet`, still
+/// pins the canonical maturity in the consensus-constant tests.
+#[cfg(feature = "devnet")]
+pub const COINBASE_MATURITY: u64 = 1;
 pub const MAX_BLOCK_SIZE: usize = 4_194_304; // 4 MiB
 pub const MAX_TX_SIZE: usize = 1_048_576; // 1 MiB
 pub const MTP_WINDOW: usize = 11;

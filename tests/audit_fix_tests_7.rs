@@ -157,7 +157,7 @@ mod deferred_storage_tests {
     use exfer::types::hash::Hash256;
     use exfer::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
     use exfer::types::TARGET_BLOCK_TIME_SECS;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{Mutex, RwLock};
@@ -234,6 +234,7 @@ mod deferred_storage_tests {
             ),
             assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
             stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
+            devnet: false,
         };
 
         let pubkey = [42u8; 32];

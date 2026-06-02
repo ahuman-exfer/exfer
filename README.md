@@ -20,6 +20,22 @@ Build from source:
 cargo build --release
 ```
 
+### Local devnet (one command)
+
+Spin up an isolated single-node chain — instant blocks, no networking,
+spendable coinbase after one block, JSON-RPC + SSE on. Ideal for
+development, CI, and demos. Build with the `devnet` feature (it pulls in
+`testnet` for trivial difficulty and lowers coinbase maturity to one block):
+
+```bash
+cargo run --features devnet --bin exfer -- devnet
+# → mines instantly to an auto-created wallet (coins land there),
+#   RPC + SSE on http://127.0.0.1:9334
+```
+
+Then point any client (CLI, walletd, the MCP server) at
+`http://127.0.0.1:9334` and you have a funded local chain in seconds.
+
 Run:
 
 ```bash
