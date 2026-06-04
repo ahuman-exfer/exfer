@@ -1280,7 +1280,14 @@ fn test_consensus_constants() {
     assert_eq!(TARGET_BLOCK_TIME_SECS, 10);
     assert_eq!(RETARGET_WINDOW, 4_320);
     assert_eq!(MAX_RETARGET_FACTOR, 4);
+    // The `devnet` cargo feature deliberately lowers COINBASE_MATURITY to 1
+    // (fast-maturity local chain); every other build keeps the canonical 360.
+    // Assert per-feature so the `--features devnet` / `--all-features` test
+    // lanes stay green while still pinning the mainnet constant everywhere else.
+    #[cfg(not(feature = "devnet"))]
     assert_eq!(COINBASE_MATURITY, 360);
+    #[cfg(feature = "devnet")]
+    assert_eq!(COINBASE_MATURITY, 1);
     assert_eq!(MAX_BLOCK_SIZE, 4_194_304);
     assert_eq!(MAX_TX_SIZE, 1_048_576);
     assert_eq!(MTP_WINDOW, 11);

@@ -269,7 +269,9 @@ enum Commands {
         /// JSON-RPC + SSE bind address.
         #[arg(long, default_value = "127.0.0.1:9334")]
         rpc_bind: SocketAddr,
-        /// P2P listen address (bound but unused — devnet is isolated).
+        /// P2P listen address. Accepted for CLI symmetry with `node`/`mine`
+        /// but never bound or used — a devnet is isolated, so it stands up no
+        /// inbound listener (see the `!devnet` guard in `run_node`).
         #[arg(long, default_value = "127.0.0.1:9433")]
         bind: SocketAddr,
         /// Mine to this pubkey (hex). Default: an auto-created devnet wallet
@@ -938,6 +940,17 @@ async fn main() {
                 "devnet on a NON-testnet build: real difficulty means blocks will NOT mine \
                  quickly. Rebuild with `--features testnet` (release: `--features \
                  allow-testnet-release`) for instant devnet blocks."
+            );
+            // COINBASE_MATURITY is gated on the `devnet` feature, not the
+            // runtime subcommand: without it, mined coinbase stays locked for
+            // the mainnet 360 confirmations, so the "spendable after 1 block"
+            // promise silently doesn't hold. `--features devnet` pulls in
+            // `testnet` too, so it also fixes the difficulty warning above.
+            #[cfg(not(feature = "devnet"))]
+            warn!(
+                "devnet built WITHOUT `--features devnet`: COINBASE_MATURITY is the mainnet \
+                 360, so mined coinbase will NOT be spendable after one block. Rebuild with \
+                 `--features devnet` for fast-maturity local coins."
             );
             // Resolve the miner pubkey: an explicit flag, or an auto-created
             // unencrypted devnet wallet kept in the datadir (coins land there).
@@ -3000,7 +3013,11 @@ async fn run_node(
     rpc_sse_enabled: bool,
     devnet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let assume_valid = !no_assume_valid && !verify_all;
+    // Devnet mines its own chain from genesis, so it can never match the
+    // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
+    // assume-valid on would wedge it at that height. A devnet always verifies
+    // its own (trivial-PoW) chain in full, regardless of the other flags.
+    let assume_valid = !no_assume_valid && !verify_all && !devnet;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
     // walk by withholding trust in the WALK_VERIFIED_TIP marker for this boot.
     let trust_walk_marker = !full_verify;
@@ -3744,7 +3761,16 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
         // also lets a fresh chain started from an old hard-coded genesis
         // walk its timestamps forward to the present over a few instant
         // blocks (each at most +MAX_TIMESTAMP_GAP) instead of stalling.
-        let clamped_timestamp = now.clamp(min_timestamp, max_timestamp);
+        //
+        // `max_timestamp.max(min_timestamp)` guards the degenerate window where
+        // `min_timestamp > max_timestamp` (e.g. MTP+1 already past
+        // parent+MAX_TIMESTAMP_GAP): bare `clamp(min, max)` panics when
+        // min > max. The non-devnet bail above only catches `now > max`, not
+        // `min > max`, so `now <= max < min` would reach this line and panic
+        // the mining task. With the guard the upper bound is never below the
+        // lower, and on the non-devnet path (where the bail guarantees
+        // now <= max) this reduces exactly to the previous `now.max(min)`.
+        let clamped_timestamp = now.clamp(min_timestamp, max_timestamp.max(min_timestamp));
 
         let utxo_set = node.utxo_set.read().await.clone();
         // Clone candidate list under the lock, then release immediately.
