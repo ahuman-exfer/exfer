@@ -7,6 +7,7 @@
 
 use crate::mempool::MempoolAddressTx;
 use crate::network::sync::Node;
+use crate::rpc_sse;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -98,7 +100,7 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 /// Prevents public RPC traffic from stalling process_block's write lock.
 type UtxoScanSemaphore = Arc<tokio::sync::Semaphore>;
 
-pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
+pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>, sse_enabled: bool) {
     // Warn if RPC is exposed beyond localhost — unauthenticated HTTP control surface.
     if !bind.ip().is_loopback() {
         warn!(
@@ -123,8 +125,13 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let scan_limiter: TxRateLimiter =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
-    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_RPC_CONNECTIONS));
+    let utxo_scan_sem: UtxoScanSemaphore = Arc::new(Semaphore::new(1));
+
+    // Phase 2 SSE: separate pool + per-IP counter so long-lived streams
+    // can't starve the JSON-RPC slots.
+    let sse_conn_sem = rpc_sse::new_conn_semaphore();
+    let sse_per_ip = rpc_sse::new_per_ip_counter();
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -147,12 +154,17 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
         let limiter = tx_limiter.clone();
         let scan_lim = scan_limiter.clone();
         let scan_sem = utxo_scan_sem.clone();
+        let sse_sem = sse_conn_sem.clone();
+        let sse_ip = sse_per_ip.clone();
         tokio::spawn(async move {
             let _permit = permit; // held until this task finishes
                                   // 30-second timeout on the entire request
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
-                handle_connection(stream, addr, node, limiter, scan_lim, scan_sem),
+                handle_connection(
+                    stream, addr, node, limiter, scan_lim, scan_sem, sse_sem, sse_ip,
+                    sse_enabled,
+                ),
             )
             .await;
             match result {
@@ -172,6 +184,7 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     addr: SocketAddr,
@@ -179,6 +192,9 @@ async fn handle_connection(
     tx_limiter: TxRateLimiter,
     scan_limiter: TxRateLimiter,
     utxo_scan_sem: UtxoScanSemaphore,
+    sse_conn_sem: Arc<Semaphore>,
+    sse_per_ip: rpc_sse::SsePerIp,
+    sse_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the HTTP request line and headers.  We only need Content-Length.
     let mut header_buf = Vec::with_capacity(4096);
@@ -204,6 +220,36 @@ async fn handle_connection(
     }
 
     let header_str = String::from_utf8_lossy(&header_buf);
+
+    // Phase 2 SSE: detect `GET /sse?addresses=...` (the canonical
+    // Electrum-style form) and hand off to the long-lived handler.
+    let request_line = header_str.lines().next().unwrap_or("");
+    if let Some(rest) = request_line.strip_prefix("GET /sse") {
+        // Operator opt-out (issue #15 Q4). When SSE is disabled the node still
+        // serves one-shot JSON-RPC, but refuses to stand up the persistent,
+        // address-linkable subscription channel: `/sse` looks like it isn't
+        // there (404), so a push-capable client just falls back to polling.
+        if !sse_enabled {
+            send_http_response(&mut stream, 404, b"Not Found").await?;
+            return Ok(());
+        }
+        let after_path = rest.split_whitespace().next().unwrap_or("");
+        let query = after_path.strip_prefix('?').unwrap_or("").to_string();
+        // SSE streams are long-lived by design. The caller wraps
+        // `handle_connection` in a 30 s per-request timeout (a slowloris guard
+        // for JSON-RPC). If we awaited the SSE handler here it would inherit
+        // that timeout and the stream would be torn down every ~30 s. Detach
+        // it into its own task so it escapes the timeout scope, and the
+        // JSON-RPC pool permit drops immediately at scope exit — long-lived
+        // streams must not count against MAX_RPC_CONNECTIONS. SSE liveness is
+        // governed by the 25 s heartbeat, TCP keepalive, and write-error
+        // detection inside the handler (plus its own MAX_RPC_SSE_* caps).
+        let bus = node.event_bus.clone();
+        tokio::spawn(async move {
+            rpc_sse::handle_sse_connection(stream, addr, &query, bus, sse_conn_sem, sse_per_ip).await;
+        });
+        return Ok(());
+    }
 
     // Require POST
     if !header_str.starts_with("POST ") {
@@ -1492,6 +1538,7 @@ async fn send_http_response(
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
+        404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",
     };

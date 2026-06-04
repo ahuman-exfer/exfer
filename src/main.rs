@@ -13,11 +13,13 @@ compile_error!(
 mod chain;
 mod consensus;
 mod covenants;
+mod events;
 mod genesis;
 mod mempool;
 mod miner;
 mod network;
 mod rpc;
+mod rpc_sse;
 mod script;
 mod types;
 mod wallet;
@@ -105,7 +107,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.11.9";
+pub const RELEASE_TAG: &str = "1.12.0-phase2";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -177,6 +179,15 @@ enum Commands {
         /// on a chain at the current mainnet height. Safe to re-run.
         #[arg(long)]
         build_spent_by_index: bool,
+        /// Serve the Phase 2 SSE push endpoint (`GET /sse`) on the JSON-RPC
+        /// port. On by default — the released wallets consume it for
+        /// sub-RTT balance updates, so turning it off breaks push and they
+        /// fall back to polling. Set `--rpc-sse-enabled false` to refuse
+        /// `/sse` (404) and expose only the one-shot JSON-RPC surface, for
+        /// operators who'd rather not run a persistent, address-linkable
+        /// subscription channel (issue #15 Q4). No effect without --rpc-bind.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        rpc_sse_enabled: bool,
     },
     /// Run the miner
     Mine {
@@ -237,6 +248,15 @@ enum Commands {
         /// `node --build-spent-by-index`).
         #[arg(long)]
         build_spent_by_index: bool,
+        /// Serve the Phase 2 SSE push endpoint (`GET /sse`) on the JSON-RPC
+        /// port. On by default — the released wallets consume it for
+        /// sub-RTT balance updates, so turning it off breaks push and they
+        /// fall back to polling. Set `--rpc-sse-enabled false` to refuse
+        /// `/sse` (404) and expose only the one-shot JSON-RPC surface, for
+        /// operators who'd rather not run a persistent, address-linkable
+        /// subscription channel (issue #15 Q4). No effect without --rpc-bind.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        rpc_sse_enabled: bool,
     },
     /// Wallet operations
     Wallet {
@@ -834,9 +854,10 @@ async fn main() {
             rebuild_state,
             full_verify,
             build_spent_by_index,
+            rpc_sse_enabled,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index, rpc_sse_enabled).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -858,6 +879,7 @@ async fn main() {
             rebuild_state,
             full_verify,
             build_spent_by_index,
+            rpc_sse_enabled,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -880,7 +902,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index, rpc_sse_enabled).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2888,6 +2910,7 @@ async fn run_node(
     rebuild_state: bool,
     full_verify: bool,
     build_spent_by_index: bool,
+    rpc_sse_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
@@ -3359,11 +3382,19 @@ async fn run_node(
             .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
             .unwrap_or(false);
 
+    // Phase 2 SSE event bus. Single instance shared between the chain
+    // commit / reorg path (in Node), the mempool admission / removal
+    // path, and the JSON-RPC SSE connection handlers.
+    let event_bus = events::EventBus::new();
+    let mut mempool = Mempool::new();
+    mempool.set_event_bus(event_bus.clone());
+
     let node = Arc::new(Node {
         storage,
         utxo_set: Arc::new(RwLock::new(utxo_set)),
-        mempool: Arc::new(Mutex::new(Mempool::new())),
+        mempool: Arc::new(Mutex::new(mempool)),
         tip: Arc::new(RwLock::new(tip)),
+        event_bus,
         genesis_id,
         peers: Arc::new(Mutex::new(
             network::sync::PeerRegistry::new(),
@@ -3423,7 +3454,7 @@ async fn run_node(
     if let Some(rpc_addr) = rpc_bind {
         let rpc_node = node.clone();
         tokio::spawn(async move {
-            rpc::run_rpc_server(rpc_addr, rpc_node).await;
+            rpc::run_rpc_server(rpc_addr, rpc_node, rpc_sse_enabled).await;
         });
     }
 

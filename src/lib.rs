@@ -23,11 +23,13 @@ compile_error!(
 pub mod chain;
 pub mod consensus;
 pub mod covenants;
+pub mod events;
 pub mod genesis;
 pub mod mempool;
 pub mod miner;
 pub mod network;
 pub mod rpc;
+pub mod rpc_sse;
 pub mod script;
 pub mod types;
 pub mod wallet;

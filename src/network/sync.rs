@@ -941,6 +941,12 @@ pub struct Node {
     pub utxo_set: Arc<RwLock<UtxoSet>>,
     pub mempool: Arc<Mutex<Mempool>>,
     pub tip: Arc<RwLock<ChainTip>>,
+    /// Phase 2 SSE event bus. Owned here so chain commit / reorg paths
+    /// can emit script + tip nudges; the mempool also holds a clone via
+    /// `Mempool::set_event_bus` for its admit / remove / evict hooks; and
+    /// the JSON-RPC server passes it to SSE connection handlers for
+    /// per-connection subscribe / unsubscribe.
+    pub event_bus: Arc<crate::events::EventBus>,
     pub genesis_id: Hash256,
     /// Registry of logical peers, keyed by identity (Ed25519 pubkey).
     pub peers: Arc<Mutex<PeerRegistry>>,
@@ -2431,6 +2437,17 @@ impl Node {
             let mut all_confirmed_txs: Vec<Transaction> = Vec::new();
             let mut orphaned_txs: Vec<Transaction> = Vec::new();
 
+            // Phase 2 SSE: spend-side scripts whose confirmed UTXO membership
+            // changed in this commit. Output (receive-side) scripts are derived
+            // from `all_confirmed_txs` at the fanout below; the spend side is
+            // collected here from the commit path's resolved spent-UTXO entries
+            // (the `Remove` mutations carry the script). A block-only /
+            // miner-direct tx never transited this node's mempool, so no
+            // `deindex_entry` emit fires for its spent inputs — without this it
+            // would silently miss the nudge. Reorg disconnects also push here so
+            // a restored/removed watched UTXO nudges its watcher.
+            let mut spent_side_scripts: Vec<Vec<u8>> = Vec::new();
+
             // Read tip UNDER the UTXO write lock — prevents TOCTOU race
             let current_tip = self.tip.read().await.clone();
 
@@ -2511,6 +2528,8 @@ impl Node {
                 // utxo_set already reflects the applied block — no swap needed
 
                 all_confirmed_txs = block.transactions.clone();
+                spent_side_scripts
+                    .extend(spent_utxos.iter().map(|(_, e)| e.output.script.clone()));
             } else {
                 // Fork wins but doesn't extend tip — perform reorg in-place.
                 // The triggering block is NOT stored to disk before the walk —
@@ -2604,6 +2623,20 @@ impl Node {
                             break;
                         }
                     };
+                    // Phase 2 SSE: disconnecting this old-chain block removes
+                    // its outputs and restores the UTXOs it spent. Nudge both
+                    // sides so a watcher of a restored/removed script re-pulls,
+                    // even when the tx is not reintroduced to the mempool.
+                    // (Reached only on the success path — any undo failure below
+                    // early-returns before the fanout.)
+                    for (_, e) in &spent {
+                        spent_side_scripts.push(e.output.script.clone());
+                    }
+                    for tx in &blk.transactions {
+                        for output in &tx.outputs {
+                            spent_side_scripts.push(output.script.clone());
+                        }
+                    }
                     for tx in blk.transactions.iter().rev() {
                         let tx_spent: Vec<_> = spent
                             .iter()
@@ -2874,6 +2907,12 @@ impl Node {
                 for blk in &new_chain {
                     all_confirmed_txs.extend(blk.transactions.clone());
                 }
+                // Phase 2 SSE: spend side of the newly-applied chain (block-only
+                // txs included) — outputs are covered by the fanout below.
+                for (_, spent) in &all_spent {
+                    spent_side_scripts
+                        .extend(spent.iter().map(|(_, e)| e.output.script.clone()));
+                }
 
                 // Collect orphaned txs from disconnected blocks for mempool
                 // re-introduction. Non-coinbase txs that were in the old chain
@@ -3070,6 +3109,27 @@ impl Node {
                         reintroduced
                     );
                 }
+            }
+
+            // Phase 2 SSE: nudge every subscriber watching a script that
+            // changed in this block. Output scripts (new UTXOs) are derived
+            // from the confirmed txs here; spend-side scripts (consumed UTXOs,
+            // including block-only txs that never hit this node's mempool, plus
+            // reorg-disconnected restores/removes) were collected from the
+            // commit path's resolved spent-UTXO entries above. Tip is opt-in
+            // (`wants_tip`, default off), so a confirmed change MUST be carried
+            // by script_changed — it cannot rely on TipChanged as a fallback.
+            // emit_scripts_changed dedups, so output/spend overlap is harmless.
+            {
+                let bus = self.event_bus.clone();
+                let mut touched: Vec<Vec<u8>> = spent_side_scripts;
+                for tx in &all_confirmed_txs {
+                    for output in &tx.outputs {
+                        touched.push(output.script.clone());
+                    }
+                }
+                bus.emit_scripts_changed(touched);
+                bus.emit_tip_changed(block.header.height);
             }
 
             info!("New tip: height={}, id={}", block.header.height, block_id);

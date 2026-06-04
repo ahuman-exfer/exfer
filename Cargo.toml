@@ -18,6 +18,8 @@ rand = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# Raw socket options (TCP keepalive on SSE connections)
+socket2 = { version = "0.6", features = ["all"] }
 
 # Storage
 redb = "2"
