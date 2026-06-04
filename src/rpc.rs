@@ -99,7 +99,7 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 /// Prevents public RPC traffic from stalling process_block's write lock.
 type UtxoScanSemaphore = Arc<tokio::sync::Semaphore>;
 
-pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
+pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>, sse_enabled: bool) {
     // Warn if RPC is exposed beyond localhost — unauthenticated HTTP control surface.
     if !bind.ip().is_loopback() {
         warn!(
@@ -162,6 +162,7 @@ pub async fn run_rpc_server(bind: SocketAddr, node: Arc<Node>) {
                 std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
                 handle_connection(
                     stream, addr, node, limiter, scan_lim, scan_sem, sse_sem, sse_ip,
+                    sse_enabled,
                 ),
             )
             .await;
@@ -192,6 +193,7 @@ async fn handle_connection(
     utxo_scan_sem: UtxoScanSemaphore,
     sse_conn_sem: Arc<Semaphore>,
     sse_per_ip: rpc_sse::SsePerIp,
+    sse_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the HTTP request line and headers.  We only need Content-Length.
     let mut header_buf = Vec::with_capacity(4096);
@@ -222,6 +224,14 @@ async fn handle_connection(
     // Electrum-style form) and hand off to the long-lived handler.
     let request_line = header_str.lines().next().unwrap_or("");
     if let Some(rest) = request_line.strip_prefix("GET /sse") {
+        // Operator opt-out (issue #15 Q4). When SSE is disabled the node still
+        // serves one-shot JSON-RPC, but refuses to stand up the persistent,
+        // address-linkable subscription channel: `/sse` looks like it isn't
+        // there (404), so a push-capable client just falls back to polling.
+        if !sse_enabled {
+            send_http_response(&mut stream, 404, b"Not Found").await?;
+            return Ok(());
+        }
         let after_path = rest.split_whitespace().next().unwrap_or("");
         let query = after_path.strip_prefix('?').unwrap_or("").to_string();
         // SSE streams are long-lived by design. The caller wraps
@@ -1422,6 +1432,7 @@ async fn send_http_response(
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
+        404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",
     };
