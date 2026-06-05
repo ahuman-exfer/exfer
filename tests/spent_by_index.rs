@@ -13,7 +13,7 @@
 
 use exfer::chain::storage::ChainStorage;
 use exfer::chain::state::{UtxoMutation, UtxoSet};
-use exfer::types::transaction::{OutPoint, Transaction, TxInput, TxOutput, TxWitness};
+use exfer::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use exfer::types::{block::{Block, BlockHeader}, Hash256};
 use tempfile::TempDir;
 

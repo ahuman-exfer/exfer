@@ -20,7 +20,37 @@ pub const PROTOCOL_VERSION: u32 = 5;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 10;
 pub const RETARGET_WINDOW: u64 = 4_320;
 pub const MAX_RETARGET_FACTOR: u64 = 4;
+/// Canonical coinbase maturity (Spec 8.1 Rule 9): coinbase outputs are locked
+/// for this many blocks before they can be spent.
 pub const COINBASE_MATURITY: u64 = 360;
+/// Devnet coinbase maturity: spendable after a single confirmation so an
+/// isolated local chain has usable funds within seconds.
+pub const DEVNET_COINBASE_MATURITY: u64 = 1;
+
+/// Live coinbase maturity in blocks. This is a *runtime* value, not a
+/// compile-time constant: a single binary must serve both a mainnet-faithful
+/// `node`/`mine` (360) and an isolated `devnet` (1) without a cargo feature
+/// mutating a consensus constant for the whole build (which would silently
+/// give a networked node a 1-block maturity it must never have). It defaults
+/// to the canonical 360 and is only ever lowered by `exfer devnet` at startup
+/// via [`set_devnet_coinbase_maturity`]; every networked path keeps 360.
+static COINBASE_MATURITY_BLOCKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(COINBASE_MATURITY);
+
+/// Current coinbase maturity in blocks. Defaults to the canonical
+/// [`COINBASE_MATURITY`]; equals [`DEVNET_COINBASE_MATURITY`] only inside a
+/// process that booted via `exfer devnet`.
+#[inline]
+pub fn coinbase_maturity() -> u64 {
+    COINBASE_MATURITY_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lower coinbase maturity to the devnet value. Call ONCE at devnet startup,
+/// before any block is processed. Never called on the `node`/`mine` paths, so a
+/// devnet-capable binary still runs networked nodes at the canonical maturity.
+pub fn set_devnet_coinbase_maturity() {
+    COINBASE_MATURITY_BLOCKS.store(DEVNET_COINBASE_MATURITY, std::sync::atomic::Ordering::Relaxed);
+}
 pub const MAX_BLOCK_SIZE: usize = 4_194_304; // 4 MiB
 pub const MAX_TX_SIZE: usize = 1_048_576; // 1 MiB
 pub const MTP_WINDOW: usize = 11;

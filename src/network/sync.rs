@@ -948,6 +948,10 @@ pub struct Node {
     /// per-connection subscribe / unsubscribe.
     pub event_bus: Arc<crate::events::EventBus>,
     pub genesis_id: Hash256,
+    /// Devnet mode: an isolated single-node local chain. When set, the
+    /// node boots straight to `Live` and mines from genesis with no peers,
+    /// no IBD, and no outbound networking. Never true on mainnet.
+    pub devnet: bool,
     /// Registry of logical peers, keyed by identity (Ed25519 pubkey).
     pub peers: Arc<Mutex<PeerRegistry>>,
     /// Address-only bootstrap entries for outbound dials (identity not yet known).

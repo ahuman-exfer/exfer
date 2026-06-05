@@ -325,7 +325,7 @@ impl UtxoSet {
         for op in outpoints {
             if let Some(entry) = self.utxos.get(op) {
                 if entry.is_coinbase
-                    && current_height.saturating_sub(entry.height) < super::super::types::COINBASE_MATURITY
+                    && current_height.saturating_sub(entry.height) < super::super::types::coinbase_maturity()
                 {
                     continue;
                 }
@@ -351,7 +351,7 @@ impl UtxoSet {
         for op in outpoints {
             if let Some(entry) = self.utxos.get(op) {
                 let mature = if entry.is_coinbase {
-                    current_height.saturating_sub(entry.height) >= super::super::types::COINBASE_MATURITY
+                    current_height.saturating_sub(entry.height) >= super::super::types::coinbase_maturity()
                 } else {
                     true
                 };
@@ -398,7 +398,7 @@ impl UtxoSet {
             if let Some(entry) = self.utxos.get(op) {
                 let mature = if entry.is_coinbase {
                     current_height.saturating_sub(entry.height)
-                        >= super::super::types::COINBASE_MATURITY
+                        >= super::super::types::coinbase_maturity()
                 } else {
                     true
                 };
