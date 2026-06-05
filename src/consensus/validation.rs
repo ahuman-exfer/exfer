@@ -450,7 +450,7 @@ pub fn validate_transaction(
         // Rule 10: coinbase maturity
         if utxo_entry.is_coinbase {
             let age = current_height.saturating_sub(utxo_entry.height);
-            if age < COINBASE_MATURITY {
+            if age < crate::types::coinbase_maturity() {
                 return Err(ValidationError::CoinbaseImmature { outpoint, age });
             }
         }

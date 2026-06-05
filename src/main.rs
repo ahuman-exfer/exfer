@@ -941,17 +941,11 @@ async fn main() {
                  quickly. Rebuild with `--features testnet` (release: `--features \
                  allow-testnet-release`) for instant devnet blocks."
             );
-            // COINBASE_MATURITY is gated on the `devnet` feature, not the
-            // runtime subcommand: without it, mined coinbase stays locked for
-            // the mainnet 360 confirmations, so the "spendable after 1 block"
-            // promise silently doesn't hold. `--features devnet` pulls in
-            // `testnet` too, so it also fixes the difficulty warning above.
-            #[cfg(not(feature = "devnet"))]
-            warn!(
-                "devnet built WITHOUT `--features devnet`: COINBASE_MATURITY is the mainnet \
-                 360, so mined coinbase will NOT be spendable after one block. Rebuild with \
-                 `--features devnet` for fast-maturity local coins."
-            );
+            // Coinbase maturity is lowered to 1 block at runtime (inside
+            // `run_node` on the devnet path), so coinbase is spendable fast
+            // without a cargo feature mutating a consensus constant for the
+            // whole binary — the networked `node`/`mine` commands keep the
+            // canonical 360 even on this same build.
             // Resolve the miner pubkey: an explicit flag, or an auto-created
             // unencrypted devnet wallet kept in the datadir (coins land there).
             let (pubkey, wallet_addr) = if let Some(hex_str) = miner_pubkey {
@@ -3013,6 +3007,14 @@ async fn run_node(
     rpc_sse_enabled: bool,
     devnet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Devnet lowers coinbase maturity to 1 block at runtime so local coins are
+    // spendable within seconds. This is a runtime store (not a cargo feature),
+    // so it only ever fires on this isolated-node path — the networked
+    // `node`/`mine` commands never call it and keep the canonical 360, even on
+    // the same binary. Set before any block is processed.
+    if devnet {
+        crate::types::set_devnet_coinbase_maturity();
+    }
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
     // assume-valid on would wedge it at that height. A devnet always verifies

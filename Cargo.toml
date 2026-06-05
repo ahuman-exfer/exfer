@@ -42,7 +42,6 @@ serde_json = "1"
 [features]
 default = []
 testnet = []
-devnet = ["testnet"]  # Isolated single-node local chain: implies testnet (trivial difficulty) and additionally lowers COINBASE_MATURITY so coinbase is spendable fast. Kept separate from `testnet` so the test suite (run under `--features testnet`) still pins the canonical consensus constants.
 allow-testnet-release = ["testnet"]  # Override compile_error for testnet in release profile. Use with extreme caution.
 testing = []  # Exposes test-only helpers (e.g. dispute_script_unchecked). Never enable in production builds.
 channels = []  # Payment channel covenant templates. Off by default.

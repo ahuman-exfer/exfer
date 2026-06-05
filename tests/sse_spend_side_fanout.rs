@@ -79,6 +79,7 @@ fn make_node(
         assume_valid: false,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(false),
         event_bus: bus,
+        devnet: false,
         ever_confirmed_peer: std::sync::atomic::AtomicBool::new(false),
         frame_budget: exfer::network::frame_budget::FrameBudget::new(),
         tip_validation_coord: Arc::new(exfer::network::tip_validation::TipValidationCoordinator::new()),

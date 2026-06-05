@@ -1,7 +1,7 @@
 use crate::chain::state::UtxoSet;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction, TxInput, TxOutput, TxWitness};
-use crate::types::COINBASE_MATURITY;
+use crate::types::coinbase_maturity;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
@@ -196,7 +196,7 @@ impl Wallet {
         for (_, entry) in utxo_set.iter() {
             if entry.output.script == addr.as_bytes().as_slice() {
                 if entry.is_coinbase
-                    && current_height.saturating_sub(entry.height) < COINBASE_MATURITY
+                    && current_height.saturating_sub(entry.height) < coinbase_maturity()
                 {
                     continue;
                 }
@@ -214,7 +214,7 @@ impl Wallet {
         for (outpoint, entry) in utxo_set.iter() {
             if entry.output.script == addr.as_bytes().as_slice() {
                 if entry.is_coinbase
-                    && current_height.saturating_sub(entry.height) < COINBASE_MATURITY
+                    && current_height.saturating_sub(entry.height) < coinbase_maturity()
                 {
                     continue;
                 }

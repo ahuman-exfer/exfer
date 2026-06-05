@@ -4,7 +4,7 @@ use crate::consensus::validation::{validate_transaction, ValidationError};
 use crate::events::EventBus;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
-use crate::types::{COINBASE_MATURITY, MEMPOOL_CAPACITY};
+use crate::types::{coinbase_maturity, MEMPOOL_CAPACITY};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -527,7 +527,7 @@ impl Mempool {
                         Some(utxo) => {
                             // Coinbase maturity may have changed after reorg
                             utxo.is_coinbase
-                                && current_height.saturating_sub(utxo.height) < COINBASE_MATURITY
+                                && current_height.saturating_sub(utxo.height) < coinbase_maturity()
                         }
                     }
                 });
