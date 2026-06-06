@@ -75,6 +75,57 @@ pub fn open_chain(
         }
     };
 
+    // Genesis-identity guard (issue #29). The stored chain's genesis MUST match
+    // the genesis this node expects — on EVERY path, including the fast path
+    // below, which (with a current walk marker) sets an empty walk range and so
+    // never reaches the in-walk height-0 check. Without this guard a datadir
+    // built under a different genesis — e.g. an `exfer devnet` chain (distinct
+    // genesis, 1-block coinbase maturity) — would load into a networked node via
+    // the fast path, which trusts the snapshot state_root and never re-validates
+    // per-tx rules. One O(1) height-index lookup.
+    //
+    // Scope: this catches every NEW devnet datadir (distinct genesis) and any
+    // cross-BUILD open (a testnet build's genesis differs from mainnet's, since
+    // the difficulty target is part of block_id). It does NOT catch a PRE-fix
+    // devnet datadir: shipped PR #27 devnet had no distinct genesis, so it
+    // stored the canonical id at height 0, matches `expected_genesis_id` on a
+    // same-build node, and loads its age-1 coinbase history via the fast path
+    // (which never re-checks maturity). The network is NOT protected by this
+    // guard for that case — the genesis handshake also passes a canonical-genesis
+    // datadir — it is protected by peer-side re-validation: inbound blocks go
+    // through validate_and_apply_block_transactions_atomic at
+    // coinbase_maturity()=360 (sync.rs), so honest peers reject the age-1 spends
+    // and the trivial-PoW tip loses fork choice. The residual is LOCAL: such a
+    // datadir's own RPC reports age-1 coinbase as spendable. So wipe any pre-fix
+    // devnet datadir; never reopen a devnet datadir as a networked node.
+    // Out of scope by design: forcing a per-tx replay on every unmarked canonical
+    // datadir would re-trigger the v1.10.2 mass-replay wedge for all legit
+    // mainnet users, so it is not done here.
+    match storage
+        .get_block_id_by_height(0)
+        .map_err(|e| format!("db error reading stored genesis id: {}", e))?
+    {
+        Some(stored) if stored == *expected_genesis_id => {}
+        Some(stored) => {
+            return Err(format!(
+                "genesis mismatch: datadir genesis is {} but this node expects {} — \
+                 refusing to load a chain from a different network (e.g. an `exfer devnet` \
+                 datadir opened as a networked node)",
+                stored, expected_genesis_id
+            ));
+        }
+        None => {
+            // Tip exists but no height-0 entry — corrupt index; let replay surface it.
+            return run_replay_and_maybe_migrate(
+                storage,
+                utxo_set,
+                expected_genesis_id,
+                assume_valid,
+                auto_migrate,
+            );
+        }
+    }
+
     // Snapshot marker must (a) exist + complete and (b) point at the
     // current tip. Anything else → fall through to full replay, and
     // (when auto_migrate is on) backfill the snapshot atomically at the
@@ -438,8 +489,23 @@ pub fn replay_chain(
 
             // First start: apply genesis atomically (block + header +
             // height index + work + tip + UTXOS in one write transaction).
+            //
+            // This bootstrap can only seed the CANONICAL genesis (it has the
+            // expected id, not the block, so it can't reconstruct a foreign
+            // one). If the caller expects a different genesis — e.g. an
+            // `exfer devnet` process, which seeds its distinct genesis itself
+            // before reaching here — refuse rather than silently seed the
+            // wrong chain and return a tip that doesn't match expected.
             let genesis = genesis_block();
             let gid = genesis.header.block_id();
+            if gid != *expected_genesis_id {
+                return Err(format!(
+                    "cannot bootstrap an empty datadir: only the canonical genesis {} is \
+                     available here, but this node expects {} — the caller must seed its \
+                     own genesis first (e.g. the devnet path)",
+                    gid, expected_genesis_id
+                ));
+            }
 
             let mut genesis_mutations: Vec<UtxoMutation> = Vec::new();
             for tx in &genesis.transactions {

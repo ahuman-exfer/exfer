@@ -357,3 +357,62 @@ fn open_chain_walk_checkpoint_skip_and_full_verify_parity() {
         "--full-verify re-stamps the marker so the next boot is fast again"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #29: devnet is a separate chain (distinct genesis), so a devnet
+// datadir cannot be reopened as a networked node and vice versa. open_chain
+// must refuse the cross-open at the height-0 genesis-id check — on the FAST
+// (snapshot) path too, which is where #29's per-tx-validation gap lived.
+// ---------------------------------------------------------------------------
+
+/// Seed `storage` with `genesis` as a committed, snapshot-finalized chain —
+/// the shape a real datadir has after one boot. Forces the next open_chain
+/// onto the fast path.
+fn seed_genesis_datadir(storage: &Arc<ChainStorage>, genesis: &exfer::types::block::Block) {
+    let mut u = UtxoSet::new();
+    let muts = u
+        .apply_transaction(&genesis.transactions[0], 0)
+        .expect("apply genesis coinbase");
+    storage
+        .commit_genesis_atomic(genesis, &[0u8; 32], &muts)
+        .expect("commit genesis");
+    storage
+        .finalize_utxo_snapshot(&u, &genesis.header.block_id())
+        .expect("finalize snapshot (forces fast path on next open)");
+}
+
+#[test]
+#[cfg(feature = "testnet")] // devnet genesis nonce=0 is PoW-valid only at trivial difficulty
+fn devnet_datadir_refuses_to_open_as_networked_node() {
+    let dir = TempDir::new().unwrap();
+    let storage = fresh_storage(&dir, "devnet.redb");
+    // What `exfer devnet` creates: a chain rooted at the devnet genesis.
+    seed_genesis_datadir(&storage, &exfer::genesis::devnet_genesis_block());
+
+    // What `exfer node` does: open with the CANONICAL genesis id. Must refuse
+    // (fast path, since the snapshot is finalized) rather than load a chain
+    // whose history was produced under devnet's 1-block coinbase maturity.
+    let canonical_id = genesis_block().header.block_id();
+    let mut u = UtxoSet::new();
+    let res = open_chain(&storage, &mut u, &canonical_id, false, true, true);
+    assert!(
+        res.is_err(),
+        "a devnet datadir must NOT open under the canonical genesis (issue #29)"
+    );
+}
+
+#[test]
+#[cfg(feature = "testnet")]
+fn canonical_datadir_refuses_to_open_as_devnet() {
+    let dir = TempDir::new().unwrap();
+    let storage = fresh_storage(&dir, "main.redb");
+    seed_genesis_datadir(&storage, &genesis_block());
+
+    let devnet_id = exfer::genesis::devnet_genesis_block().header.block_id();
+    let mut u = UtxoSet::new();
+    let res = open_chain(&storage, &mut u, &devnet_id, false, true, true);
+    assert!(
+        res.is_err(),
+        "a canonical datadir must NOT open under the devnet genesis"
+    );
+}

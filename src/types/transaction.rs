@@ -328,7 +328,12 @@ impl Transaction {
     /// `"EXFER-SIG" || genesis_block_id(32) || signing_bytes`.
     ///
     /// The genesis block ID binds signatures to this chain, preventing
-    /// cross-chain transaction replay.
+    /// cross-chain transaction replay. It is the canonical `GENESIS_BLOCK_ID`
+    /// on every build — including inside an `exfer devnet` process. Devnet is
+    /// therefore NOT signature-domain-separated from a same-build testnet chain;
+    /// see the scope note on `genesis::DEVNET_GENESIS_TIMESTAMP` for why this is
+    /// accepted dev-only (separating it would require every signing client to
+    /// agree on the domain, which a node cannot change unilaterally).
     /// Returns Err if field sizes exceed u16::MAX.
     pub fn sig_message(&self) -> Result<Vec<u8>, SerError> {
         let signing = self.signing_bytes()?;
