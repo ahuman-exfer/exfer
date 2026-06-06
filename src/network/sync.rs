@@ -3990,13 +3990,32 @@ impl Node {
                     // Granting it here would award credit to invalid-PoW
                     // senders and to blocks whose event was dropped by the
                     // try_send below.
-                    let _ = self.peer_events_tx.try_send(PeerEvent::NewBlock {
+                    let block_height = block.header.height;
+                    match self.peer_events_tx.try_send(PeerEvent::NewBlock {
                         from: meta.addr,
                         from_identity: meta.identity,
                         session_id,
                         block,
                         pre_validated: false,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Event bus saturated: silently dropping this block
+                            // inflates our orphan/stale rate when it is a fresh
+                            // tip. Do NOT block the read loop (no .await) — WARN
+                            // and trigger recovery by re-requesting the block from
+                            // this peer over normal_tx (the same non-blocking
+                            // writer channel used for the GetTip reply above). If
+                            // even that enqueue fails, the 60s GetTip poll is the
+                            // backstop.
+                            warn!(
+                                "peer_events_tx full: dropping NewBlock from {} (height={}, id={}); re-requesting via GetBlocks",
+                                meta.addr, block_height, block_id
+                            );
+                            let _ = normal_tx.try_send(Message::GetBlocks(vec![block_id]));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
                 Message::NewTx(tx) => {
                     // v1.10.0 rev8: stronger freshness gate.
@@ -4486,13 +4505,30 @@ impl Node {
                     }
                 }
                 Message::TipResponse(tip_msg) => {
-                    let _ = self.peer_events_tx.try_send(PeerEvent::TipResponse {
+                    let tip_height = tip_msg.height;
+                    match self.peer_events_tx.try_send(PeerEvent::TipResponse {
                         from_identity: meta.identity,
                         session_id,
                         height: tip_msg.height,
                         block_id: tip_msg.block_id,
                         cumulative_work: tip_msg.cumulative_work,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Event bus saturated: dropping a TipResponse means we
+                            // may never learn this peer advanced, stalling sync and
+                            // inflating stale-block risk. WARN and trigger recovery
+                            // by re-polling the tip over normal_tx (non-blocking;
+                            // no .await on the read path). The 60s GetTip poll is
+                            // the backstop.
+                            warn!(
+                                "peer_events_tx full: dropping TipResponse from {} (height={}); re-requesting via GetTip",
+                                meta.addr, tip_height
+                            );
+                            let _ = normal_tx.try_send(Message::GetTip);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
                 _ => {
                     // v1.10.0: post-handshake catch-all. At this point in the
