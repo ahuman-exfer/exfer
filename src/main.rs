@@ -935,12 +935,20 @@ async fn main() {
             bind,
             miner_pubkey,
         } => {
-            #[cfg(not(feature = "testnet"))]
-            warn!(
-                "devnet on a NON-testnet build: real difficulty means blocks will NOT mine \
-                 quickly. Rebuild with `--features testnet` (release: `--features \
-                 allow-testnet-release`) for instant devnet blocks."
-            );
+            // Devnet requires a trivial-difficulty build: its distinct genesis
+            // uses nonce=0, which only satisfies PoW under the testnet target,
+            // and at real difficulty devnet couldn't mine anyway. Fail clearly
+            // here rather than later on an opaque genesis PoW rejection.
+            // (Runtime `if cfg!` rather than `#[cfg]` so the rest of the arm
+            // stays reachable for the compiler — no unreachable-code warning.)
+            if !cfg!(feature = "testnet") {
+                eprintln!(
+                    "ERROR: `exfer devnet` requires a trivial-difficulty build. \
+                     Rebuild with `--features testnet` (release: `--features \
+                     allow-testnet-release`)."
+                );
+                std::process::exit(1);
+            }
             // Coinbase maturity is lowered to 1 block at runtime (inside
             // `run_node` on the devnet path), so coinbase is spendable fast
             // without a cargo feature mutating a consensus constant for the
@@ -3012,6 +3020,11 @@ async fn run_node(
     // so it only ever fires on this isolated-node path — the networked
     // `node`/`mine` commands never call it and keep the canonical 360, even on
     // the same binary. Set before any block is processed.
+    //
+    // Note: the signature domain is deliberately NOT overridden here. It is a
+    // process-global read by every signing client (the CLI wallet, walletd, the
+    // MCP server) as well as the node; a node cannot change it unilaterally
+    // without breaking client spends. See genesis::DEVNET_GENESIS_TIMESTAMP.
     if devnet {
         crate::types::set_devnet_coinbase_maturity();
     }
@@ -3158,8 +3171,16 @@ async fn run_node(
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    // Ensure genesis block is stored and has valid PoW
-    let genesis = genesis_block();
+    // Ensure genesis block is stored and has valid PoW.
+    // Devnet is a deliberately separate chain (distinct genesis id), so a
+    // devnet datadir can't be reopened as a networked node and vice versa
+    // (issue #29). expected_genesis_id, the genesis seeding below, open_chain's
+    // genesis check, and Node.genesis_id (the P2P handshake) all flow from this.
+    let genesis = if devnet {
+        genesis::devnet_genesis_block()
+    } else {
+        genesis_block()
+    };
     let expected_genesis_id = genesis.header.block_id();
 
     // Validate genesis PoW — refuse to start with a placeholder nonce
