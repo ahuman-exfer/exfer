@@ -289,7 +289,13 @@ pub const MAX_BLOCKS_PER_MIN: u32 = 60;
 /// at-tip duplicate chatter. Shares the same 60s window reset as
 /// MAX_BLOCKS_PER_MIN.
 pub const MAX_DUPLICATE_BLOCKS_PER_MIN: u32 = 60;
-pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 24;
+/// Aggregate (all-peer) novel-block cap per 60s window. Bounds total PoW
+/// verification CPU across the whole node, independent of per-peer caps. Set
+/// well above the honest network cadence (6 blocks/min mean) so a healthy tip
+/// never trips it; CPU stays bounded by pow_semaphore and the per-peer
+/// MAX_BLOCKS_PER_MIN caps regardless. Tip-extending blocks bypass this cap
+/// (see process_block_event) since they are the scarce, time-critical case.
+pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 120;
 pub const MAX_TXS_PER_MIN: u32 = 60;
 pub const MAX_GLOBAL_TXS_PER_MIN: u32 = 200;
 pub const MAX_PINGS_PER_MIN: u32 = 10;

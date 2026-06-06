@@ -5318,7 +5318,16 @@ async fn process_block_event(node: &Node, from: SocketAddr, from_identity: PeerI
 
     // Global block slot — consume only after orphan, height, and difficulty checks.
     // Cheap rejections don't burn budget; only blocks entering PoW validation count.
-    if !node.try_consume_global_block_slot() {
+    // Tip-extending blocks (prev == current tip) are the scarce, time-critical case
+    // and must never be dropped by the aggregate cap, so they bypass the slot. Only
+    // non-tip-extending blocks are subject to the global slot; on exhaustion we log
+    // at WARN (height/hash) rather than silently dropping a valid block.
+    let extends_tip = node.tip.read().await.block_id == block.header.prev_block_id;
+    if !extends_tip && !node.try_consume_global_block_slot() {
+        warn!(
+            "Global block-rate cap reached — dropping non-tip-extending block at height {} ({}) from {}",
+            block.header.height, block_id, from
+        );
         return;
     }
 
