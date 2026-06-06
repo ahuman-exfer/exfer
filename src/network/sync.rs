@@ -2131,6 +2131,18 @@ impl Node {
             return Ok(false);
         }
 
+        // Snapshot the set of block ids the reorg machinery is currently
+        // waiting for (the missing ancestors of pending reorg triggers). This
+        // set is bounded by the trigger caps (at most MAX_GLOBAL_TRIGGERS
+        // distinct ancestors), so it is always small. Taken before the
+        // fork_blocks lock so we never nest the two locks (avoids any
+        // lock-order hazard) and so the admission decision below can consult it
+        // without blocking I/O under the mutex.
+        let reorg_needed_ids: std::collections::HashSet<Hash256> = {
+            let rt = self.reorg_triggers.lock().unwrap_or_else(|e| e.into_inner());
+            rt.triggers.keys().copied().collect()
+        };
+
         // --- Decision phase: acquire lock, determine action, release lock.
         //     No blocking I/O while holding the mutex — prevents async
         //     runtime starvation under fork-pressure traffic.
@@ -2154,6 +2166,35 @@ impl Node {
                 {
                     if *cumulative_work > fork_blocks[min_idx].1 {
                         evict_id = Some(fork_blocks[min_idx].0);
+                    } else if reorg_needed_ids.contains(&block_id) {
+                        // Live-lock fix: this body is weaker than the weakest
+                        // fork entry, so plain min-work eviction would drop it.
+                        // But it is currently NEEDED to complete a pending
+                        // reorg (it is a missing ancestor the reorg walk is
+                        // waiting for). Dropping it deadlocks recovery: the walk
+                        // re-requests it, a peer re-delivers it, and we re-drop
+                        // it forever for forks deeper than MAX_FORK_BLOCKS.
+                        // Admit it past min-work eviction by evicting the
+                        // weakest NON-needed fork block to make room, so the
+                        // pool stays bounded and we never displace another body
+                        // the reorg machinery also needs. The needed set is
+                        // bounded (<= MAX_GLOBAL_TRIGGERS ancestors, which is
+                        // < MAX_FORK_BLOCKS), so a non-needed victim always
+                        // exists when the pool is full; this is therefore not a
+                        // general bypass of the fork-pool bound.
+                        match fork_blocks
+                            .iter()
+                            .filter(|(id, _)| !reorg_needed_ids.contains(id))
+                            .min_by(|a, b| a.1.cmp(&b.1))
+                        {
+                            Some((victim_id, _)) => evict_id = Some(*victim_id),
+                            // Defensive: unreachable while MAX_GLOBAL_TRIGGERS
+                            // < MAX_FORK_BLOCKS. If every fork block were itself
+                            // reorg-needed there is no non-needed victim; drop
+                            // rather than grow the pool unbounded (boundedness
+                            // wins; the walk will re-request this body later).
+                            None => return Ok(false),
+                        }
                     } else {
                         // Incoming block is weaker — don't evict, don't store
                         return Ok(false);
@@ -2215,11 +2256,28 @@ impl Node {
             // lowest-work entries so the vec never exceeds the hard cap.
             let mut removed = Vec::new();
             while fork_blocks.len() as u32 > MAX_FORK_BLOCKS {
-                if let Some((min_idx, _)) = fork_blocks
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
-                {
+                // Prefer trimming the weakest NON-needed entry so a body that
+                // was just admitted for a pending reorg is not immediately
+                // re-evicted here (which would re-open the live-lock). Fall back
+                // to the global weakest only if every entry is reorg-needed, so
+                // the pool always stays bounded.
+                let victim = {
+                    let non_needed = fork_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (id, _))| !reorg_needed_ids.contains(id))
+                        .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
+                        .map(|(idx, _)| idx);
+                    match non_needed {
+                        Some(idx) => Some(idx),
+                        None => fork_blocks
+                            .iter()
+                            .enumerate()
+                            .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
+                            .map(|(idx, _)| idx),
+                    }
+                };
+                if let Some(min_idx) = victim {
                     let (rid, _) = fork_blocks.swap_remove(min_idx);
                     removed.push(rid);
                 } else {
