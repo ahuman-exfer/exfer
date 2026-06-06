@@ -24,7 +24,7 @@ mod script;
 mod types;
 mod wallet;
 
-use chain::open::open_chain;
+use chain::open::{open_chain, replay_chain};
 use chain::state::UtxoSet;
 use chain::storage::ChainStorage;
 use clap::{Parser, Subcommand};
@@ -935,12 +935,13 @@ async fn main() {
             bind,
             miner_pubkey,
         } => {
-            #[cfg(not(feature = "testnet"))]
-            warn!(
-                "devnet on a NON-testnet build: real difficulty means blocks will NOT mine \
-                 quickly. Rebuild with `--features testnet` (release: `--features \
-                 allow-testnet-release`) for instant devnet blocks."
-            );
+            if cfg!(not(feature = "testnet")) {
+                eprintln!(
+                    "ERROR: `exfer devnet` requires a testnet build. Rebuild with \
+                     `--features testnet` (release: `--features allow-testnet-release`)."
+                );
+                std::process::exit(1);
+            }
             // Coinbase maturity is lowered to 1 block at runtime (inside
             // `run_node` on the devnet path), so coinbase is spendable fast
             // without a cargo feature mutating a consensus constant for the
@@ -1136,6 +1137,27 @@ async fn main() {
                 let recipient = Hash256(hash);
 
                 let (utxo_set, tip_height) = if let Some(ref url) = rpc_url {
+                    // If a caller supplies --rpc with --datadir pointing at a
+                    // devnet datadir, still bind signatures to the devnet
+                    // genesis. Do not create a local DB for pure-RPC usage.
+                    let db_path = datadir.join("chain.redb");
+                    if db_path.exists() {
+                        let storage = ChainStorage::open(&db_path)
+                            .unwrap_or_else(|e| {
+                                eprintln!("ERROR: failed to open database: {}", e);
+                                std::process::exit(1);
+                            });
+                        if storage.datadir_is_devnet().unwrap_or_else(|e| {
+                            eprintln!("ERROR: db error reading chain-mode marker: {}", e);
+                            std::process::exit(1);
+                        }) {
+                            info!(
+                                "devnet datadir detected; wallet operating against the devnet chain"
+                            );
+                            crate::types::enter_devnet_mode();
+                        }
+                    }
+
                     // v1.4.2 Fix 1: treat `get_address_utxos` as returning a
                     // list of outpoints only. The JSON `value` and `script`
                     // fields are deliberately NOT read in the spend path —
@@ -2424,6 +2446,16 @@ fn rebuild_utxo_set_inner(datadir: &Path) -> Result<(UtxoSet, u64), String> {
     let storage =
         ChainStorage::open(&db_path).map_err(|e| format!("failed to open database: {}", e))?;
 
+    // Wallet commands are passive readers/signers. If the datadir is devnet,
+    // validate balances and bind signatures against the devnet chain.
+    if storage
+        .datadir_is_devnet()
+        .map_err(|e| format!("db error reading chain-mode marker: {}", e))?
+    {
+        info!("devnet datadir detected; wallet operating against the devnet chain");
+        crate::types::enter_devnet_mode();
+    }
+
     let mut utxo_set = UtxoSet::new();
     let expected_genesis_id = genesis_block().header.block_id();
 
@@ -3007,13 +3039,10 @@ async fn run_node(
     rpc_sse_enabled: bool,
     devnet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Devnet lowers coinbase maturity to 1 block at runtime so local coins are
-    // spendable within seconds. This is a runtime store (not a cargo feature),
-    // so it only ever fires on this isolated-node path — the networked
-    // `node`/`mine` commands never call it and keep the canonical 360, even on
-    // the same binary. Set before any block is processed.
+    // Devnet enters its own runtime consensus mode: maturity 1 and a distinct
+    // genesis. The networked `node`/`mine` paths keep canonical consensus.
     if devnet {
-        crate::types::set_devnet_coinbase_maturity();
+        crate::types::enter_devnet_mode();
     }
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
@@ -3034,6 +3063,77 @@ async fn run_node(
         ChainStorage::open(&db_path)
             .map_err(|e| format!("failed to open database {}: {e}", db_path.display()))?,
     );
+
+    // Issue #29: devnet datadirs and networked datadirs must not cross-open.
+    // The marker gives a clear error; the distinct devnet genesis is the
+    // marker-independent consensus boundary.
+    let chain_mode = storage
+        .datadir_chain_mode()
+        .map_err(|e| format!("db error reading chain-mode marker: {e}"))?;
+    let has_chain = storage
+        .get_tip()
+        .map_err(|e| format!("db error reading tip: {e}"))?
+        .is_some();
+    let legacy_unmarked_chain = if devnet {
+        match chain_mode.as_deref() {
+            Some(b"devnet") => false,
+            Some(mode) => {
+                return Err(format!(
+                    "datadir {} is marked for chain mode {}; refusing to open it as a devnet.",
+                    datadir.display(),
+                    String::from_utf8_lossy(mode)
+                )
+                .into());
+            }
+            None if has_chain => {
+                return Err(format!(
+                    "datadir {} contains an existing chain without the devnet marker \
+                     (created by `exfer node`/`mine`, or by a devnet build that predates \
+                     the marker). Refusing to open it as a devnet. Devnet chains are \
+                     disposable; delete the datadir or pass a different --datadir.",
+                    datadir.display()
+                )
+                .into());
+            }
+            None => {
+                storage
+                    .mark_datadir_devnet()
+                    .map_err(|e| format!("failed to stamp devnet marker: {e}"))?;
+                false
+            }
+        }
+    } else {
+        match chain_mode.as_deref() {
+            Some(b"devnet") => {
+                return Err(format!(
+                    "datadir {} was created by `exfer devnet`; refusing to open it as a \
+                     networked node. A devnet chain is isolated (coinbase maturity 1, \
+                     devnet genesis) and is never valid on the public network. Use \
+                     `exfer devnet --datadir {}` or pick a different --datadir.",
+                    datadir.display(),
+                    datadir.display()
+                )
+                .into());
+            }
+            Some(b"networked") => false,
+            Some(mode) => {
+                return Err(format!(
+                    "datadir {} has unknown chain-mode marker {}; refusing to start.",
+                    datadir.display(),
+                    String::from_utf8_lossy(mode)
+                )
+                .into());
+            }
+            None if has_chain => {
+                info!(
+                    "legacy unmarked datadir detected; forcing one-time full transaction replay \
+                     before stamping networked chain mode"
+                );
+                true
+            }
+            None => false,
+        }
+    };
 
     // Load or generate persistent node identity key (Ed25519)
     let identity_key = {
@@ -3242,6 +3342,11 @@ async fn run_node(
         storage
             .commit_genesis_atomic(&genesis, &genesis_work, &genesis_mutations)
             .map_err(|e| format!("failed to store genesis block: {e}"))?;
+        if !devnet {
+            storage
+                .mark_datadir_networked()
+                .map_err(|e| format!("failed to stamp networked marker: {e}"))?;
+        }
         info!("Stored genesis block: {}", expected_genesis_id);
     }
 
@@ -3302,19 +3407,33 @@ async fn run_node(
     // is on (default), a successful full-replay fallback automatically
     // backfills the snapshot inside `open_chain` so the next boot uses the
     // fast path.
-    let tip = open_chain(
-        &storage,
-        &mut utxo_set,
-        &expected_genesis_id,
-        assume_valid,
-        auto_migrate,
-        trust_walk_marker,
-    )
-    .map_err(|e| {
-        format!(
-            "Chain open failed: {e}. Database may be corrupt. Delete data directory and re-sync."
+    let tip = if legacy_unmarked_chain {
+        let tip = replay_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid)
+            .map_err(|e| {
+                format!(
+                    "Legacy unmarked chain replay failed: {e}. \
+                     Refusing to stamp networked chain mode."
+                )
+            })?;
+        storage
+            .mark_datadir_networked()
+            .map_err(|e| format!("failed to stamp networked marker after replay: {e}"))?;
+        tip
+    } else {
+        open_chain(
+            &storage,
+            &mut utxo_set,
+            &expected_genesis_id,
+            assume_valid,
+            auto_migrate,
+            trust_walk_marker,
         )
-    })?;
+        .map_err(|e| {
+            format!(
+                "Chain open failed: {e}. Database may be corrupt. Delete data directory and re-sync."
+            )
+        })?
+    };
 
     // Stale HEIGHT_INDEX detection: if there are height entries above the
     // tip, the database is corrupt (e.g. partial reorg write).  Refuse to

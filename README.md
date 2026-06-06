@@ -24,9 +24,11 @@ cargo build --release
 
 Spin up an isolated single-node chain — instant blocks, no networking,
 spendable coinbase after one block, JSON-RPC + SSE on. Ideal for
-development, CI, and demos. Build with the `testnet` feature for trivial
-difficulty; the `devnet` subcommand lowers coinbase maturity to one block at
-runtime (the networked `node`/`mine` commands keep the canonical maturity):
+development, CI, and demos. Requires the `testnet` feature (trivial
+difficulty); the `devnet` subcommand lowers coinbase maturity to one block
+and switches to a distinct devnet genesis at runtime (the networked
+`node`/`mine` commands keep the canonical maturity and genesis, and refuse
+to open a devnet datadir):
 
 ```bash
 cargo run --features testnet --bin exfer -- devnet

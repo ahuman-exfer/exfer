@@ -124,6 +124,10 @@ const UTXO_SNAPSHOT_TIP_KEY: &str = "utxo_snapshot_tip";
 /// the proof. Absent → full walk (legacy datadir / post-rebuild / post
 /// --full-verify); stale ancestor → partial walk of the suffix only.
 const WALK_VERIFIED_TIP_KEY: &str = "walk_verified_tip";
+/// Issue #29: chain-mode marker for datadirs created by `exfer devnet`.
+const CHAIN_MODE_KEY: &str = "chain_mode";
+const CHAIN_MODE_DEVNET: &[u8] = b"devnet";
+const CHAIN_MODE_NETWORKED: &[u8] = b"networked";
 
 /// Serialize a list of spent UTXOs for storage.
 /// Format: count(u32 LE) || for each: tx_id(32) | output_index(u32 LE) | serialized_output | height(u64 LE) | is_coinbase(u8)
@@ -942,6 +946,39 @@ impl ChainStorage {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Raw datadir chain-mode marker. `None` means legacy/unmarked.
+    pub fn datadir_chain_mode(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+        Ok(table.get(CHAIN_MODE_KEY)?.map(|v| v.value().to_vec()))
+    }
+
+    /// True iff this datadir was stamped by `exfer devnet`.
+    pub fn datadir_is_devnet(&self) -> Result<bool, StorageError> {
+        Ok(matches!(self.datadir_chain_mode()?.as_deref(), Some(CHAIN_MODE_DEVNET)))
+    }
+
+    fn mark_datadir_chain_mode(&self, mode: &[u8]) -> Result<(), StorageError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            meta.insert(CHAIN_MODE_KEY, mode)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Stamp this datadir as devnet before the first devnet chain write.
+    pub fn mark_datadir_devnet(&self) -> Result<(), StorageError> {
+        self.mark_datadir_chain_mode(CHAIN_MODE_DEVNET)
+    }
+
+    /// Stamp this datadir as networked after a fresh networked bootstrap or a
+    /// successful one-time replay of legacy unmarked chain data.
+    pub fn mark_datadir_networked(&self) -> Result<(), StorageError> {
+        self.mark_datadir_chain_mode(CHAIN_MODE_NETWORKED)
     }
 
     #[allow(dead_code)] // wired in commit 5 (open_chain) and commit 6 (lazy migration).
@@ -2226,6 +2263,48 @@ mod tests {
         let tmpdir = TempDir::new().unwrap();
         let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
         assert!(storage.get_utxo_snapshot_tip().unwrap().is_none());
+    }
+
+    #[test]
+    fn devnet_marker_absent_on_fresh_db_and_persists_once_stamped() {
+        let tmpdir = TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.redb");
+
+        let storage = ChainStorage::open(&db_path).unwrap();
+        assert!(!storage.datadir_is_devnet().unwrap());
+        assert!(storage.datadir_chain_mode().unwrap().is_none());
+
+        storage.mark_datadir_devnet().unwrap();
+        storage.mark_datadir_devnet().unwrap();
+        assert!(storage.datadir_is_devnet().unwrap());
+        assert_eq!(
+            storage.datadir_chain_mode().unwrap().as_deref(),
+            Some(CHAIN_MODE_DEVNET)
+        );
+
+        drop(storage);
+        let reopened = ChainStorage::open(&db_path).unwrap();
+        assert!(reopened.datadir_is_devnet().unwrap());
+    }
+
+    #[test]
+    fn networked_marker_persists_once_stamped() {
+        let tmpdir = TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.redb");
+
+        let storage = ChainStorage::open(&db_path).unwrap();
+        storage.mark_datadir_networked().unwrap();
+        assert_eq!(
+            storage.datadir_chain_mode().unwrap().as_deref(),
+            Some(CHAIN_MODE_NETWORKED)
+        );
+
+        drop(storage);
+        let reopened = ChainStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.datadir_chain_mode().unwrap().as_deref(),
+            Some(CHAIN_MODE_NETWORKED)
+        );
     }
 
     // -------- Phase 3a behavior: persist + load + idempotency invariants -------

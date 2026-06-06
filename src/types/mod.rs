@@ -51,6 +51,14 @@ pub fn coinbase_maturity() -> u64 {
 pub fn set_devnet_coinbase_maturity() {
     COINBASE_MATURITY_BLOCKS.store(DEVNET_COINBASE_MATURITY, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Enter devnet consensus mode for this process: maturity 1 and devnet
+/// genesis. Call once, before any chain operation.
+pub fn enter_devnet_mode() {
+    set_devnet_coinbase_maturity();
+    crate::genesis::set_devnet_genesis();
+}
+
 pub const MAX_BLOCK_SIZE: usize = 4_194_304; // 4 MiB
 pub const MAX_TX_SIZE: usize = 1_048_576; // 1 MiB
 pub const MTP_WINDOW: usize = 11;

@@ -19,13 +19,33 @@ use crate::types::VERSION;
 /// Fixed genesis timestamp: 2026-03-15T01:00:00Z
 const GENESIS_TIMESTAMP: u64 = 1773536400;
 
+/// Devnet genesis timestamp: canonical + 1 second. This gives devnet a
+/// different genesis block id, so a devnet datadir is a different chain and
+/// devnet signatures are bound away from testnet/mainnet.
+const DEVNET_GENESIS_TIMESTAMP: u64 = GENESIS_TIMESTAMP + 1;
+
 /// Mined genesis nonce (satisfies Argon2id PoW at 2^248 target).
 /// Testnet uses a trivial difficulty target, so any nonce works there.
+/// Devnet reuses this nonce because `exfer devnet` is testnet-build-only.
 const GENESIS_NONCE: u64 = 259;
 
+static DEVNET_GENESIS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch this process to the devnet genesis. Call before any chain/signature
+/// operation; panics if GENESIS_BLOCK_ID was already initialized canonically.
+pub fn set_devnet_genesis() {
+    DEVNET_GENESIS.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        *GENESIS_BLOCK_ID,
+        devnet_genesis_block().header.block_id(),
+        "set_devnet_genesis() called after canonical GENESIS_BLOCK_ID initialization"
+    );
+}
+
 /// Build the genesis block template (everything except nonce).
-/// Used by both `genesis_block()` and `mine_genesis_nonce()`.
-fn genesis_template() -> (Block, UtxoSet) {
+/// Used by `genesis_block()`, `devnet_genesis_block()` and `mine_genesis_nonce()`.
+fn genesis_template_for(devnet: bool) -> (Block, UtxoSet) {
     // Genesis coinbase: 100 EXFER to unspendable output (all-zeros script).
     // SPEC: coinbase should pay the miner's pubkey hash; for the genesis block
     // the all-zeros script is intentionally unspendable (no private key).
@@ -61,7 +81,7 @@ fn genesis_template() -> (Block, UtxoSet) {
             version: VERSION,
             height: 0,
             prev_block_id: Hash256::ZERO,
-            timestamp: GENESIS_TIMESTAMP,
+            timestamp: if devnet { DEVNET_GENESIS_TIMESTAMP } else { GENESIS_TIMESTAMP },
             difficulty_target: genesis_target(),
             nonce: 0, // placeholder — caller sets the real nonce
             tx_root,
@@ -73,14 +93,23 @@ fn genesis_template() -> (Block, UtxoSet) {
     (block, utxo_set)
 }
 
-/// Returns the deterministic genesis block.
+/// Returns the deterministic genesis block for the current process mode:
+/// canonical by default, devnet after [`set_devnet_genesis`].
 ///
 /// All fields are protocol constants. This function always returns
 /// the same block on every machine.
 /// Production: difficulty target is 2^248 (real mining required; GENESIS_NONCE must be mined).
 /// Testnet (--features testnet): difficulty target is all 0xFF (nonce=0 passes).
 pub fn genesis_block() -> Block {
-    let (mut block, _) = genesis_template();
+    let (mut block, _) =
+        genesis_template_for(DEVNET_GENESIS.load(std::sync::atomic::Ordering::Relaxed));
+    block.header.nonce = GENESIS_NONCE;
+    block
+}
+
+/// Returns the devnet genesis block unconditionally.
+pub fn devnet_genesis_block() -> Block {
+    let (mut block, _) = genesis_template_for(true);
     block.header.nonce = GENESIS_NONCE;
     block
 }
@@ -113,7 +142,7 @@ pub fn genesis_block_id() -> Hash256 {
 pub fn mine_genesis_nonce(progress: impl Fn(u64)) -> (u64, Hash256) {
     use crate::consensus::pow::verify_pow;
 
-    let (mut block, _) = genesis_template();
+    let (mut block, _) = genesis_template_for(false);
 
     for nonce in 0..u64::MAX {
         block.header.nonce = nonce;
@@ -126,4 +155,22 @@ pub fn mine_genesis_nonce(progress: impl Fn(u64)) -> (u64, Hash256) {
         }
     }
     unreachable!("nonce space exhausted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn devnet_genesis_is_a_distinct_chain() {
+        let (mut canonical, _) = genesis_template_for(false);
+        canonical.header.nonce = GENESIS_NONCE;
+        let devnet = devnet_genesis_block();
+
+        assert_ne!(canonical.header.block_id(), devnet.header.block_id());
+        assert_eq!(devnet.header.timestamp, canonical.header.timestamp + 1);
+        assert_eq!(canonical.header.tx_root, devnet.header.tx_root);
+        assert_eq!(canonical.header.state_root, devnet.header.state_root);
+        assert_eq!(canonical.transactions, devnet.transactions);
+    }
 }
