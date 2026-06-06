@@ -3777,6 +3777,7 @@ impl Node {
     ) -> Result<(), PeerError> {
         // Rate limiting: rolling window counts
         let mut block_count: u32 = 0;
+        let mut duplicate_block_count: u32 = 0;
         let mut tx_count: u32 = 0;
         let mut ping_count: u32 = 0;
         let mut request_count: u32 = 0;
@@ -3800,6 +3801,7 @@ impl Node {
             let now = Instant::now();
             if now.duration_since(window_start) >= Duration::from_secs(60) {
                 block_count = 0;
+                duplicate_block_count = 0;
                 tx_count = 0;
                 ping_count = 0;
                 request_count = 0;
@@ -3899,9 +3901,10 @@ impl Node {
                     // would trip MAX_BLOCKS_PER_MIN during the flicker
                     // and disconnect. Use active_ibd_peer + peer-work
                     // signal instead so the per-min cap only applies
-                    // when we're TRULY at tip (network produces ~6 b/h
-                    // = 0.1 b/min, so > 12 b/min when truly at tip is
-                    // genuinely anomalous).
+                    // when we're TRULY at tip. At tip the network produces
+                    // ~6 novel blocks/min (10s target), so the 60/min novel
+                    // cap leaves 10x headroom; novel and duplicate blocks are
+                    // metered on separate budgets (see the dedup split below).
                     let actually_caught_up = {
                         let no_active_ibd = self
                             .active_ibd_peer
@@ -3923,17 +3926,6 @@ impl Node {
                     // gate above — covers the 60s-no-peers fallback-to-Live
                     // window (src/network/sync.rs:5466) before any
                     // confirmation has landed.
-                    if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
-                        block_count += 1;
-                        if block_count > MAX_BLOCKS_PER_MIN {
-                            // v1.10.0: TrafficQuotaExceeded — at-tip NewBlock chatter is not a strike signal.
-                            // Disconnect (no strike); peer can reconnect cleanly.
-                            // Soft-drop deferred — blanket soft-drop weakens
-                            // bandwidth/CPU defense against valid-block replay
-                            // floods (per expert rev9 review).
-                            return Err(PeerError::TrafficQuotaExceeded);
-                        }
-                    }
                     if self.is_ip_banned(meta.addr.ip()) {
                         continue;
                     }
@@ -3943,7 +3935,37 @@ impl Node {
                         .has_block(&block_id)
                         .map_err(|e| PeerError::Io(format!("storage read failed: {}", e)))?;
                     if already_known {
+                        // Duplicate (already-stored) block. Count it against a
+                        // SEPARATE per-min budget so the rev9 valid-block replay
+                        // -flood defense stays in place (duplicates are not
+                        // free), but normal at-tip duplicate chatter never
+                        // disconnects an honest peer. Over-cap = soft-drop.
+                        if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
+                            duplicate_block_count += 1;
+                            if duplicate_block_count > MAX_DUPLICATE_BLOCKS_PER_MIN {
+                                tracing::debug!(
+                                    "Soft-dropping duplicate NewBlock from {} (over MAX_DUPLICATE_BLOCKS_PER_MIN)",
+                                    meta.addr
+                                );
+                            }
+                        }
                         continue;
+                    }
+                    // Novel block — consume the novel-block budget only now,
+                    // AFTER the dedup check above, so duplicates never spend it.
+                    // The honest 6/min cadence sits far below the 60/min cap;
+                    // over-cap = soft-drop (no strike, no disconnect) rather
+                    // than TrafficQuotaExceeded, since at-tip NewBlock chatter
+                    // is not an attack signal.
+                    if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
+                        block_count += 1;
+                        if block_count > MAX_BLOCKS_PER_MIN {
+                            tracing::debug!(
+                                "Soft-dropping novel NewBlock from {} (over MAX_BLOCKS_PER_MIN)",
+                                meta.addr
+                            );
+                            continue;
+                        }
                     }
                     if block.header.height == 0 || block.header.version != VERSION {
                         warn!("Rejected trivially invalid block from {}", meta.addr);

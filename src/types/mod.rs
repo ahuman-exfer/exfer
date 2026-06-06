@@ -278,7 +278,17 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 pub const MAX_INV_ITEMS: usize = 64;
 pub const MAX_GETBLOCKS_ITEMS: usize = 64;
 pub const MEMPOOL_CAPACITY: usize = 8_192;
-pub const MAX_BLOCKS_PER_MIN: u32 = 12;
+/// Per-peer novel-block cap per 60s window. Derived from the 10s block target
+/// (6 blocks/min honest mean) with 10x headroom: P[Poisson(6) > 60] is
+/// negligible, so an honest at-tip peer never trips this. Only NOVEL blocks
+/// (post-dedup) consume this budget; duplicates are accounted separately under
+/// MAX_DUPLICATE_BLOCKS_PER_MIN.
+pub const MAX_BLOCKS_PER_MIN: u32 = 60;
+/// Per-peer duplicate-block cap per 60s window. Bounds valid-block replay
+/// floods (the rev9 defense) without disconnecting honest peers for normal
+/// at-tip duplicate chatter. Shares the same 60s window reset as
+/// MAX_BLOCKS_PER_MIN.
+pub const MAX_DUPLICATE_BLOCKS_PER_MIN: u32 = 60;
 pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 24;
 pub const MAX_TXS_PER_MIN: u32 = 60;
 pub const MAX_GLOBAL_TXS_PER_MIN: u32 = 200;
