@@ -899,6 +899,16 @@ impl ReorgTriggerState {
     /// per-ancestor cap and global cap (evicting oldest if needed).
     /// Returns true if inserted, false if dropped.
     pub fn insert(&mut self, ancestor_id: Hash256, trigger_block: Block) -> bool {
+        // Enforce per-ancestor cap before any eviction, so a doomed insert
+        // never evicts a live trigger to make room for nothing.
+        if self
+            .triggers
+            .get(&ancestor_id)
+            .map(|v| v.len() >= MAX_TRIGGERS_PER_ANCESTOR)
+            .unwrap_or(false)
+        {
+            return false;
+        }
         // Enforce global cap before inserting
         while self.order.len() >= MAX_GLOBAL_TRIGGERS {
             if let Some(evict_ancestor) = self.order.pop_front() {
@@ -931,6 +941,9 @@ impl ReorgTriggerState {
 
     /// Take all trigger blocks for a given ancestor (removing them).
     pub fn take(&mut self, ancestor_id: &Hash256) -> Option<Vec<Block>> {
+        // Drop the matching order-queue entries so the one-entry-per-stored-trigger
+        // invariant holds; otherwise stale ids accumulate and skew global-cap eviction.
+        self.order.retain(|a| a != ancestor_id);
         self.triggers.remove(ancestor_id)
     }
 }
