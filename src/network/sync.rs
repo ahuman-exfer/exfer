@@ -2704,6 +2704,13 @@ impl Node {
                     for blk in &new_chain {
                         // Defense-in-depth: re-validate headers for stored fork
                         // blocks to catch local DB corruption/tampering.
+                        // PoW is skipped here: every fork block already passed
+                        // Argon2id verification at admission before
+                        // try_store_fork_block persisted it, and on-disk integrity
+                        // is enforced by the block_id == storage-key check inside
+                        // Storage::get_block. Re-running Argon2id under the
+                        // utxo_set write lock is redundant; the skip variant still
+                        // checks height/prev/difficulty/MTP/tx_root.
                         {
                             let blk_parent = self
                                 .storage
@@ -2758,7 +2765,7 @@ impl Node {
                                     )));
                                 }
                             };
-                            if let Err(e) = validate_block_header(
+                            if let Err(e) = validate_block_header_skip_pow(
                                 blk,
                                 Some(&blk_parent),
                                 &anc_ts,
