@@ -3929,7 +3929,15 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .map(|d| d.as_secs());
-                match node.process_block(block.clone(), wall_clock).await {
+                // Our own block has valid PoW by construction (mine() only
+                // returns once pow < target) and its template was fully
+                // validated at build, so skip the Argon2id self-verify exactly
+                // as the NewBlock pre-check path does. Difficulty, tx, and
+                // state-root checks still run locally.
+                match node
+                    .process_block_pre_validated(block.clone(), wall_clock)
+                    .await
+                {
                     Ok(ProcessBlockOutcome::Accepted) => {
                         info!("Block {} accepted", block_id);
                         node.broadcast(&network::protocol::Message::NewBlock(block), None)
@@ -3950,7 +3958,12 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
                         return;
                     }
                     Err(e) => {
-                        error!("Mined block rejected: {}", e);
+                        // With PoW self-verify skipped and the template fully
+                        // validated at build time, a local rejection of our own
+                        // block is unexpected. Log loudly and drop the block
+                        // (it is not broadcast); the next loop mines a fresh
+                        // template rather than retrying this one.
+                        error!("Mined block unexpectedly rejected locally: {}", e);
                         // Only purge mempool when the rejection is due to
                         // transaction invalidity. Header-only rejections
                         // (bad timestamp, bad difficulty, bad PoW) mean the
