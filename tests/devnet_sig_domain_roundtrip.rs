@@ -51,22 +51,31 @@ fn free_port() -> u16 {
 }
 
 fn spawn_devnet(dir: &std::path::Path) -> DevnetNode {
+    spawn_devnet_on(&dir.join("devnet-data"), None)
+}
+
+/// Spawn a devnet node on an explicit datadir (so a restart can reopen the
+/// same chain), optionally capturing stderr to a file for boot-log assertions.
+fn spawn_devnet_on(datadir: &std::path::Path, stderr_path: Option<&std::path::Path>) -> DevnetNode {
     let rpc_port = free_port();
     let p2p_port = free_port();
-    let datadir = dir.join("devnet-data");
+    let stderr = match stderr_path {
+        Some(p) => Stdio::from(std::fs::File::create(p).expect("create stderr log")),
+        None => Stdio::null(),
+    };
     let child = Command::new(exfer_bin())
         .args(["devnet", "--datadir"])
-        .arg(&datadir)
+        .arg(datadir)
         .args(["--rpc-bind", &format!("127.0.0.1:{rpc_port}")])
         .args(["--bind", &format!("127.0.0.1:{p2p_port}")])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn exfer devnet");
     DevnetNode {
         child,
         rpc: format!("http://127.0.0.1:{rpc_port}"),
-        datadir,
+        datadir: datadir.to_path_buf(),
     }
 }
 
@@ -271,6 +280,48 @@ fn devnet_domain_roundtrip_and_canonical_replay_rejection() {
              signature domains are NOT separated: {v}"
         ),
     }
+
+    // ── 5. Restart-replay: bind-before-replay regression guard (#32) ───
+    // The stored chain now holds a confirmed spend signed in the DEVNET
+    // domain (step 3). On restart the node must enter_devnet() — bind the
+    // devnet signature domain — BEFORE open_chain replays history; the
+    // ordering (main.rs: enter_devnet in the `if devnet` gate, ahead of
+    // open_chain) is otherwise correct by inspection only. If the bind moved
+    // below open_chain, replay would re-verify those stored signatures in the
+    // CANONICAL domain and fail with SignatureInvalid, wedging the boot. Kill
+    // the node, reopen the SAME datadir, and assert the replay holds.
+    let height_before = rpc(&node.rpc, "get_block_height", serde_json::json!({}))
+        .unwrap()
+        .get("height")
+        .and_then(|h| h.as_u64())
+        .unwrap();
+    let datadir = node.datadir.clone();
+    drop(node); // kill the first node and release the datadir lock
+
+    let restart_log = tmp.path().join("restart.stderr");
+    let node2 = spawn_devnet_on(&datadir, Some(&restart_log));
+    // If replay verified the stored devnet-domain signatures in the canonical
+    // domain, the boot wedges and never reaches the prior height — this waits
+    // out to a clear timeout rather than hanging forever.
+    let tip2 = wait_for_height(&node2, height_before, Duration::from_secs(120));
+    assert_eq!(
+        tip2.get("genesis_block_id").and_then(|v| v.as_str()).unwrap(),
+        hex::encode(devnet_id.as_bytes()),
+        "restarted devnet node must still report the devnet genesis id"
+    );
+    // The confirmed spend survived replay — history intact, not rolled back.
+    rpc(
+        &node2.rpc,
+        "get_transaction",
+        serde_json::json!({"hash": sent_tx_id}),
+    )
+    .expect("the devnet-domain spend must survive restart replay");
+    // And no replay-time signature rejection appears in the boot log.
+    let log = std::fs::read_to_string(&restart_log).unwrap_or_default();
+    assert!(
+        !log.contains("SignatureInvalid"),
+        "restart replay must not reject stored devnet-domain signatures:\n{log}"
+    );
 
     // Hygiene: nothing in this process ever bound the domain.
     assert!(!exfer::genesis::signature_domain_is_bound());

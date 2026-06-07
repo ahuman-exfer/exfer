@@ -66,19 +66,16 @@ pub fn set_devnet_coinbase_maturity() {
 /// devnet-capable binary still runs networked nodes at canonical maturity in
 /// the canonical domain.
 ///
-/// Panics if the signature domain is already bound to a different id — a
-/// devnet process whose domain was pre-bound elsewhere is a programming
-/// error, and continuing would verify blocks in one domain while reporting
-/// another over RPC.
-pub fn enter_devnet() {
-    set_devnet_coinbase_maturity();
+/// Binds the domain FIRST, then lowers maturity: on a conflicting pre-bind it
+/// returns `Err(bound_id)` having touched neither switch (no partial
+/// activation on the error path). The node-startup caller treats that as a
+/// fatal programming error (`.expect`); the signer caller maps it to a typed
+/// `AuthError::GenesisRebind`, symmetric with the non-devnet bind branch.
+pub fn enter_devnet() -> Result<(), Hash256> {
     let devnet_id = crate::genesis::devnet_genesis_block().header.block_id();
-    if let Err(bound) = crate::genesis::bind_signature_domain(devnet_id) {
-        panic!(
-            "enter_devnet: signature domain already bound to {} (devnet expects {})",
-            bound, devnet_id
-        );
-    }
+    crate::genesis::bind_signature_domain(devnet_id)?;
+    set_devnet_coinbase_maturity();
+    Ok(())
 }
 pub const MAX_BLOCK_SIZE: usize = 4_194_304; // 4 MiB
 pub const MAX_TX_SIZE: usize = 1_048_576; // 1 MiB

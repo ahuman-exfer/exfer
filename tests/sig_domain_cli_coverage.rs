@@ -1,6 +1,6 @@
 //! Per-subcommand signature-domain coverage (issue #32).
 //!
-//! Every CLI signing surface — `wallet send --rpc` plus all 18 script
+//! Every CLI signing surface — `wallet send --rpc` plus all 19 script
 //! subcommands (locks via `fetch_utxos_select` + `sign_p2pkh`; spends via
 //! `fetch_lock_tx_output`/`authenticated_output_lookup` +
 //! `sign_tx_with_wallet`; HtlcClaim/HtlcReclaim signing INLINE — the two

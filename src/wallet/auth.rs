@@ -212,6 +212,17 @@ pub fn set_expected_genesis(genesis_id: Hash256) -> Result<(), Hash256> {
 /// calls it first, and `fetch_utxos_select` (main.rs) calls it before coin
 /// selection, so a signing flow cannot reach `sig_message` without the
 /// domain having been established against the node it is about to submit to.
+///
+/// CAVEAT — the established latch is PER-PROCESS, not per-node. After the
+/// first success this returns `Ok` for ANY `rpc_url` with no re-fetch, because
+/// the signature domain it guards is itself a process-global. The `exfer`
+/// binary handles exactly one node per invocation, so this is unreachable
+/// there. But this is `pub` lib API (walletd consumes it): an in-process
+/// caller that pivots to a SECOND node after the first establish would sign in
+/// the first node's domain without re-checking. A caller that talks to more
+/// than one chain in one process must run in separate processes, or gate its
+/// own per-node check ahead of this — the OnceLock domain cannot be re-aimed
+/// mid-process by design.
 pub fn ensure_signature_domain(rpc_url: &str) -> Result<(), AuthError> {
     use std::sync::atomic::Ordering;
     if DOMAIN_ESTABLISHED.load(Ordering::Acquire) {
@@ -257,8 +268,12 @@ pub fn ensure_signature_domain(rpc_url: &str) -> Result<(), AuthError> {
         // one call (`types::enter_devnet`), never one without the other.
         // Without the maturity half, the wallet's own maturity filter
         // (wallet.rs list_utxos, canonical 360) would discard every young
-        // devnet coinbase the node reports as spendable.
-        crate::types::enter_devnet();
+        // devnet coinbase the node reports as spendable. A conflicting
+        // pre-bind surfaces as GenesisRebind, symmetric with the branch below.
+        crate::types::enter_devnet().map_err(|bound| AuthError::GenesisRebind {
+            bound,
+            checked: reported,
+        })?;
     } else {
         crate::genesis::bind_signature_domain(reported).map_err(|bound| {
             AuthError::GenesisRebind {

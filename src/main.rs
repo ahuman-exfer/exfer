@@ -3089,7 +3089,10 @@ async fn run_node(
     // against an operator-named expectation — see
     // wallet::auth::ensure_signature_domain.
     if devnet {
-        crate::types::enter_devnet();
+        // At node startup nothing should have bound the domain yet; a
+        // conflicting pre-bind is a programming error, fatal here.
+        crate::types::enter_devnet()
+            .expect("devnet node startup: signature domain unexpectedly pre-bound");
     }
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
