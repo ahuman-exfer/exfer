@@ -899,6 +899,16 @@ impl ReorgTriggerState {
     /// per-ancestor cap and global cap (evicting oldest if needed).
     /// Returns true if inserted, false if dropped.
     pub fn insert(&mut self, ancestor_id: Hash256, trigger_block: Block) -> bool {
+        // Enforce per-ancestor cap before any eviction, so a doomed insert
+        // never evicts a live trigger to make room for nothing.
+        if self
+            .triggers
+            .get(&ancestor_id)
+            .map(|v| v.len() >= MAX_TRIGGERS_PER_ANCESTOR)
+            .unwrap_or(false)
+        {
+            return false;
+        }
         // Enforce global cap before inserting
         while self.order.len() >= MAX_GLOBAL_TRIGGERS {
             if let Some(evict_ancestor) = self.order.pop_front() {
@@ -920,6 +930,10 @@ impl ReorgTriggerState {
             }
         }
         let triggers = self.triggers.entry(ancestor_id).or_default();
+        // Defensive only: the early per-ancestor cap check above already
+        // guarantees room (this ancestor had < MAX before the eviction loop,
+        // which can only shrink it), so this is always true and the else arm is
+        // unreachable. Kept as a belt-and-suspenders invariant guard.
         if triggers.len() < MAX_TRIGGERS_PER_ANCESTOR {
             triggers.push(trigger_block);
             self.order.push_back(ancestor_id);
@@ -931,6 +945,9 @@ impl ReorgTriggerState {
 
     /// Take all trigger blocks for a given ancestor (removing them).
     pub fn take(&mut self, ancestor_id: &Hash256) -> Option<Vec<Block>> {
+        // Drop the matching order-queue entries so the one-entry-per-stored-trigger
+        // invariant holds; otherwise stale ids accumulate and skew global-cap eviction.
+        self.order.retain(|a| a != ancestor_id);
         self.triggers.remove(ancestor_id)
     }
 }
@@ -1144,6 +1161,19 @@ impl Node {
     /// the per-minute budget is exhausted. Check and increment happen under a
     /// single mutex acquisition so concurrent peers cannot overshoot the limit.
     fn try_consume_global_block_slot(&self) -> bool {
+        self.try_consume_global_block_slot_inner(false)
+    }
+
+    /// Consume one global block-validation slot from the shared per-minute
+    /// limiter. `tip_extender` raises the ceiling by a small bounded reserve so
+    /// a genuine next-tip block is not dropped when the chain is under a flood,
+    /// WITHOUT granting an unbounded pre-PoW bypass: `prev_block_id == tip` is an
+    /// attacker-forgeable field checked before `verify_pow`, so the exemption
+    /// must stay bounded or a rotating-IP flood of forged "tip-extenders" could
+    /// queue unbounded work on the PoW semaphore and starve honest verification.
+    /// Both classes still consume the shared counter; tip-extenders cap at
+    /// MAX_GLOBAL_BLOCKS_PER_MIN + MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN.
+    fn try_consume_global_block_slot_inner(&self, tip_extender: bool) -> bool {
         let mut limiter = self
             .global_block_limiter
             .lock()
@@ -1153,7 +1183,12 @@ impl Node {
             limiter.0 = now;
             limiter.1 = 0;
         }
-        if limiter.1 < MAX_GLOBAL_BLOCKS_PER_MIN {
+        let cap = if tip_extender {
+            MAX_GLOBAL_BLOCKS_PER_MIN + MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN
+        } else {
+            MAX_GLOBAL_BLOCKS_PER_MIN
+        };
+        if limiter.1 < cap {
             limiter.1 += 1;
             true
         } else {
@@ -2094,7 +2129,13 @@ impl Node {
     ///
     /// Returns Ok(true) if stored, Ok(false) if dropped (lower work than
     /// all existing fork blocks).
-    fn try_store_fork_block(
+    ///
+    /// Exposed (pub) for the deep-fork re-admission regression test in
+    /// `tests/orphan_rate_fix_regression.rs`. Behavior is unchanged; only the
+    /// visibility is widened so the fork-pool admission decision can be
+    /// exercised directly (standing up a full multi-node IBD is blocked
+    /// locally by the assume-valid bootstrap anchor).
+    pub fn try_store_fork_block(
         &self,
         block: &Block,
         cumulative_work: &[u8; 32],
@@ -2117,6 +2158,18 @@ impl Node {
         if block_size > MAX_FORK_BLOCK_SIZE {
             return Ok(false);
         }
+
+        // Snapshot the set of block ids the reorg machinery is currently
+        // waiting for (the missing ancestors of pending reorg triggers). This
+        // set is bounded by the trigger caps (at most MAX_GLOBAL_TRIGGERS
+        // distinct ancestors), so it is always small. Taken before the
+        // fork_blocks lock so we never nest the two locks (avoids any
+        // lock-order hazard) and so the admission decision below can consult it
+        // without blocking I/O under the mutex.
+        let reorg_needed_ids: std::collections::HashSet<Hash256> = {
+            let rt = self.reorg_triggers.lock().unwrap_or_else(|e| e.into_inner());
+            rt.triggers.keys().copied().collect()
+        };
 
         // --- Decision phase: acquire lock, determine action, release lock.
         //     No blocking I/O while holding the mutex — prevents async
@@ -2141,6 +2194,35 @@ impl Node {
                 {
                     if *cumulative_work > fork_blocks[min_idx].1 {
                         evict_id = Some(fork_blocks[min_idx].0);
+                    } else if reorg_needed_ids.contains(&block_id) {
+                        // Live-lock fix: this body is weaker than the weakest
+                        // fork entry, so plain min-work eviction would drop it.
+                        // But it is currently NEEDED to complete a pending
+                        // reorg (it is a missing ancestor the reorg walk is
+                        // waiting for). Dropping it deadlocks recovery: the walk
+                        // re-requests it, a peer re-delivers it, and we re-drop
+                        // it forever for forks deeper than MAX_FORK_BLOCKS.
+                        // Admit it past min-work eviction by evicting the
+                        // weakest NON-needed fork block to make room, so the
+                        // pool stays bounded and we never displace another body
+                        // the reorg machinery also needs. The needed set is
+                        // bounded (<= MAX_GLOBAL_TRIGGERS ancestors, which is
+                        // < MAX_FORK_BLOCKS), so a non-needed victim always
+                        // exists when the pool is full; this is therefore not a
+                        // general bypass of the fork-pool bound.
+                        match fork_blocks
+                            .iter()
+                            .filter(|(id, _)| !reorg_needed_ids.contains(id))
+                            .min_by(|a, b| a.1.cmp(&b.1))
+                        {
+                            Some((victim_id, _)) => evict_id = Some(*victim_id),
+                            // Defensive: unreachable while MAX_GLOBAL_TRIGGERS
+                            // < MAX_FORK_BLOCKS. If every fork block were itself
+                            // reorg-needed there is no non-needed victim; drop
+                            // rather than grow the pool unbounded (boundedness
+                            // wins; the walk will re-request this body later).
+                            None => return Ok(false),
+                        }
                     } else {
                         // Incoming block is weaker — don't evict, don't store
                         return Ok(false);
@@ -2202,11 +2284,28 @@ impl Node {
             // lowest-work entries so the vec never exceeds the hard cap.
             let mut removed = Vec::new();
             while fork_blocks.len() as u32 > MAX_FORK_BLOCKS {
-                if let Some((min_idx, _)) = fork_blocks
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
-                {
+                // Prefer trimming the weakest NON-needed entry so a body that
+                // was just admitted for a pending reorg is not immediately
+                // re-evicted here (which would re-open the live-lock). Fall back
+                // to the global weakest only if every entry is reorg-needed, so
+                // the pool always stays bounded.
+                let victim = {
+                    let non_needed = fork_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (id, _))| !reorg_needed_ids.contains(id))
+                        .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
+                        .map(|(idx, _)| idx);
+                    match non_needed {
+                        Some(idx) => Some(idx),
+                        None => fork_blocks
+                            .iter()
+                            .enumerate()
+                            .min_by(|a, b| a.1 .1.cmp(&b.1 .1))
+                            .map(|(idx, _)| idx),
+                    }
+                };
+                if let Some(min_idx) = victim {
                     let (rid, _) = fork_blocks.swap_remove(min_idx);
                     removed.push(rid);
                 } else {
@@ -2691,6 +2790,13 @@ impl Node {
                     for blk in &new_chain {
                         // Defense-in-depth: re-validate headers for stored fork
                         // blocks to catch local DB corruption/tampering.
+                        // PoW is skipped here: every fork block already passed
+                        // Argon2id verification at admission before
+                        // try_store_fork_block persisted it, and on-disk integrity
+                        // is enforced by the block_id == storage-key check inside
+                        // Storage::get_block. Re-running Argon2id under the
+                        // utxo_set write lock is redundant; the skip variant still
+                        // checks height/prev/difficulty/MTP/tx_root.
                         {
                             let blk_parent = self
                                 .storage
@@ -2745,7 +2851,7 @@ impl Node {
                                     )));
                                 }
                             };
-                            if let Err(e) = validate_block_header(
+                            if let Err(e) = validate_block_header_skip_pow(
                                 blk,
                                 Some(&blk_parent),
                                 &anc_ts,
@@ -3777,6 +3883,7 @@ impl Node {
     ) -> Result<(), PeerError> {
         // Rate limiting: rolling window counts
         let mut block_count: u32 = 0;
+        let mut duplicate_block_count: u32 = 0;
         let mut tx_count: u32 = 0;
         let mut ping_count: u32 = 0;
         let mut request_count: u32 = 0;
@@ -3800,6 +3907,7 @@ impl Node {
             let now = Instant::now();
             if now.duration_since(window_start) >= Duration::from_secs(60) {
                 block_count = 0;
+                duplicate_block_count = 0;
                 tx_count = 0;
                 ping_count = 0;
                 request_count = 0;
@@ -3899,9 +4007,10 @@ impl Node {
                     // would trip MAX_BLOCKS_PER_MIN during the flicker
                     // and disconnect. Use active_ibd_peer + peer-work
                     // signal instead so the per-min cap only applies
-                    // when we're TRULY at tip (network produces ~6 b/h
-                    // = 0.1 b/min, so > 12 b/min when truly at tip is
-                    // genuinely anomalous).
+                    // when we're TRULY at tip. At tip the network produces
+                    // ~6 novel blocks/min (10s target), so the 60/min novel
+                    // cap leaves 10x headroom; novel and duplicate blocks are
+                    // metered on separate budgets (see the dedup split below).
                     let actually_caught_up = {
                         let no_active_ibd = self
                             .active_ibd_peer
@@ -3923,17 +4032,6 @@ impl Node {
                     // gate above — covers the 60s-no-peers fallback-to-Live
                     // window (src/network/sync.rs:5466) before any
                     // confirmation has landed.
-                    if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
-                        block_count += 1;
-                        if block_count > MAX_BLOCKS_PER_MIN {
-                            // v1.10.0: TrafficQuotaExceeded — at-tip NewBlock chatter is not a strike signal.
-                            // Disconnect (no strike); peer can reconnect cleanly.
-                            // Soft-drop deferred — blanket soft-drop weakens
-                            // bandwidth/CPU defense against valid-block replay
-                            // floods (per expert rev9 review).
-                            return Err(PeerError::TrafficQuotaExceeded);
-                        }
-                    }
                     if self.is_ip_banned(meta.addr.ip()) {
                         continue;
                     }
@@ -3943,7 +4041,39 @@ impl Node {
                         .has_block(&block_id)
                         .map_err(|e| PeerError::Io(format!("storage read failed: {}", e)))?;
                     if already_known {
+                        // Duplicate (already-stored) block. Count it against a
+                        // SEPARATE per-min budget so the rev9 valid-block replay
+                        // -flood defense stays in place (duplicates are not
+                        // free), while normal at-tip duplicate chatter (~6/min
+                        // per peer, well under the 60/min cap) never disconnects
+                        // an honest peer. Breaching the cap means a peer is
+                        // streaming already-known blocks ~10x above the honest
+                        // rate (each forcing a frame decode + has_block read) —
+                        // a replay flood: disconnect (no strike; it can
+                        // reconnect cleanly).
+                        if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
+                            duplicate_block_count += 1;
+                            if duplicate_block_count > MAX_DUPLICATE_BLOCKS_PER_MIN {
+                                return Err(PeerError::TrafficQuotaExceeded);
+                            }
+                        }
                         continue;
+                    }
+                    // Novel block — consume the novel-block budget only now,
+                    // AFTER the dedup check above, so duplicates never spend it.
+                    // The honest 6/min cadence sits far below the 60/min cap;
+                    // over-cap = soft-drop (no strike, no disconnect) rather
+                    // than TrafficQuotaExceeded, since at-tip NewBlock chatter
+                    // is not an attack signal.
+                    if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
+                        block_count += 1;
+                        if block_count > MAX_BLOCKS_PER_MIN {
+                            tracing::debug!(
+                                "Soft-dropping novel NewBlock from {} (over MAX_BLOCKS_PER_MIN)",
+                                meta.addr
+                            );
+                            continue;
+                        }
                     }
                     if block.header.height == 0 || block.header.version != VERSION {
                         warn!("Rejected trivially invalid block from {}", meta.addr);
@@ -3968,13 +4098,32 @@ impl Node {
                     // Granting it here would award credit to invalid-PoW
                     // senders and to blocks whose event was dropped by the
                     // try_send below.
-                    let _ = self.peer_events_tx.try_send(PeerEvent::NewBlock {
+                    let block_height = block.header.height;
+                    match self.peer_events_tx.try_send(PeerEvent::NewBlock {
                         from: meta.addr,
                         from_identity: meta.identity,
                         session_id,
                         block,
                         pre_validated: false,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Event bus saturated: silently dropping this block
+                            // inflates our orphan/stale rate when it is a fresh
+                            // tip. Do NOT block the read loop (no .await) — WARN
+                            // and trigger recovery by re-requesting the block from
+                            // this peer over normal_tx (the same non-blocking
+                            // writer channel used for the GetTip reply above). If
+                            // even that enqueue fails, the 60s GetTip poll is the
+                            // backstop.
+                            warn!(
+                                "peer_events_tx full: dropping NewBlock from {} (height={}, id={}); re-requesting via GetBlocks",
+                                meta.addr, block_height, block_id
+                            );
+                            let _ = normal_tx.try_send(Message::GetBlocks(vec![block_id]));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
                 Message::NewTx(tx) => {
                     // v1.10.0 rev8: stronger freshness gate.
@@ -4464,13 +4613,30 @@ impl Node {
                     }
                 }
                 Message::TipResponse(tip_msg) => {
-                    let _ = self.peer_events_tx.try_send(PeerEvent::TipResponse {
+                    let tip_height = tip_msg.height;
+                    match self.peer_events_tx.try_send(PeerEvent::TipResponse {
                         from_identity: meta.identity,
                         session_id,
                         height: tip_msg.height,
                         block_id: tip_msg.block_id,
                         cumulative_work: tip_msg.cumulative_work,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Event bus saturated: dropping a TipResponse means we
+                            // may never learn this peer advanced, stalling sync and
+                            // inflating stale-block risk. WARN and trigger recovery
+                            // by re-polling the tip over normal_tx (non-blocking;
+                            // no .await on the read path). The 60s GetTip poll is
+                            // the backstop.
+                            warn!(
+                                "peer_events_tx full: dropping TipResponse from {} (height={}); re-requesting via GetTip",
+                                meta.addr, tip_height
+                            );
+                            let _ = normal_tx.try_send(Message::GetTip);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
                 _ => {
                     // v1.10.0: post-handshake catch-all. At this point in the
@@ -5296,7 +5462,19 @@ async fn process_block_event(node: &Node, from: SocketAddr, from_identity: PeerI
 
     // Global block slot — consume only after orphan, height, and difficulty checks.
     // Cheap rejections don't burn budget; only blocks entering PoW validation count.
-    if !node.try_consume_global_block_slot() {
+    // Tip-extending blocks (prev == current tip) are the scarce, time-critical case,
+    // so they get a small bounded RESERVE on top of the aggregate cap so a genuine
+    // next-tip block is not dropped under a flood. This is NOT an unbounded bypass:
+    // prev_block_id is attacker-forgeable and this check runs before verify_pow, so
+    // forged "tip-extenders" still consume the shared counter and are capped at
+    // MAX_GLOBAL_BLOCKS_PER_MIN + reserve — they cannot queue unbounded work on the
+    // PoW semaphore. On exhaustion we log at WARN rather than silently dropping.
+    let extends_tip = node.tip.read().await.block_id == block.header.prev_block_id;
+    if !node.try_consume_global_block_slot_inner(extends_tip) {
+        warn!(
+            "Global block-rate cap reached — dropping block at height {} ({}) from {} (extends_tip={})",
+            block.header.height, block_id, from, extends_tip
+        );
         return;
     }
 

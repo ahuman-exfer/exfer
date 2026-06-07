@@ -304,8 +304,33 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 pub const MAX_INV_ITEMS: usize = 64;
 pub const MAX_GETBLOCKS_ITEMS: usize = 64;
 pub const MEMPOOL_CAPACITY: usize = 8_192;
-pub const MAX_BLOCKS_PER_MIN: u32 = 12;
-pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 24;
+/// Per-peer novel-block cap per 60s window. Derived from the 10s block target
+/// (6 blocks/min honest mean) with 10x headroom: P[Poisson(6) > 60] is
+/// negligible, so an honest at-tip peer never trips this. Only NOVEL blocks
+/// (post-dedup) consume this budget; duplicates are accounted separately under
+/// MAX_DUPLICATE_BLOCKS_PER_MIN.
+pub const MAX_BLOCKS_PER_MIN: u32 = 60;
+/// Per-peer duplicate-block cap per 60s window. Bounds valid-block replay
+/// floods (the rev9 defense) without disconnecting honest peers for normal
+/// at-tip duplicate chatter. Shares the same 60s window reset as
+/// MAX_BLOCKS_PER_MIN.
+pub const MAX_DUPLICATE_BLOCKS_PER_MIN: u32 = 60;
+/// Aggregate (all-peer) novel-block cap per 60s window. Bounds total PoW
+/// verification CPU across the whole node, independent of per-peer caps. Set
+/// well above the honest network cadence (6 blocks/min mean) so a healthy tip
+/// never trips it; CPU stays bounded by pow_semaphore and the per-peer
+/// MAX_BLOCKS_PER_MIN caps regardless. Tip-extending blocks (prev == tip) do NOT
+/// bypass this cap — they get the small bounded RESERVE below on top of it, so a
+/// genuine next-tip block survives a flood while a forged-tip-extender flood
+/// stays bounded (prev_block_id is attacker-forgeable and checked before
+/// verify_pow, so an unbounded bypass would let it queue work on the PoW
+/// semaphore; see Node::try_consume_global_block_slot_inner).
+pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 120;
+/// Extra per-minute global slots reserved for tip-extending blocks once the
+/// aggregate cap above is exhausted. Bounds the worst case (forged tip-extenders
+/// under flood) to MAX_GLOBAL_BLOCKS_PER_MIN + this, while comfortably covering
+/// the honest ~6/min tip cadence during a flood.
+pub const MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN: u32 = 60;
 pub const MAX_TXS_PER_MIN: u32 = 60;
 pub const MAX_GLOBAL_TXS_PER_MIN: u32 = 200;
 pub const MAX_PINGS_PER_MIN: u32 = 10;

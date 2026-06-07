@@ -8,36 +8,47 @@ fn f1_unsolicited_counter_constant_exists() {
 }
 
 #[test]
-fn f2_max_blocks_per_min_is_12() {
-    assert_eq!(exfer::types::MAX_BLOCKS_PER_MIN, 12);
+fn f2_max_blocks_per_min_is_60() {
+    // Per-peer NOVEL-block cap, raised 12 -> 60 (10x honest 6/min at-tip rate)
+    // so honest peers are no longer disconnected at tip.
+    assert_eq!(exfer::types::MAX_BLOCKS_PER_MIN, 60);
 }
 
 #[test]
 fn f2_global_block_limit_constant_exists() {
-    // 24 = 4× honest rate (6 blocks/min at 10s block time)
-    assert_eq!(exfer::types::MAX_GLOBAL_BLOCKS_PER_MIN, 24);
+    // 120 = 2x the per-peer novel cap. Raised 24 -> 120 because the per-peer cap
+    // rose to 60 and the global cap must stay >= per-peer. Tip-extending blocks do
+    // NOT bypass this cap; they get a small bounded reserve on top of it
+    // (MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN) so a genuine next-tip block is not
+    // dropped under a flood while a forged-tip-extender flood stays bounded. The
+    // real CPU bound on Argon2 is pow_semaphore (2 concurrent), not this per-minute
+    // count, so the rate is a coarse limiter rather than the ceiling.
+    assert_eq!(exfer::types::MAX_GLOBAL_BLOCKS_PER_MIN, 120);
 }
 
 #[test]
 fn f2_global_limit_caps_aggregate_pow() {
-    // Worst-case with global limit: 24 PoW/min regardless of peer count
-    // vs old: 64 peers × 12/min = 768 PoW/min
     let max_global = exfer::types::MAX_GLOBAL_BLOCKS_PER_MIN;
     let max_per_peer = exfer::types::MAX_BLOCKS_PER_MIN;
     let max_inbound = exfer::types::MAX_INBOUND_PEERS as u32;
 
-    // Global limit must be less than per-peer × max-peers
+    // Global limit must be far below the unbounded per-peer x max-peers product
+    // (the original motivation: cap aggregate work regardless of peer count).
     assert!(
         max_global < max_per_peer * max_inbound,
         "global limit {} must be less than per-peer*peers {}",
         max_global,
         max_per_peer * max_inbound
     );
-    // Global limit should be reasonable (< 50 PoW/min)
+    // And it must stay a small multiple of the per-peer cap (a coarse rate
+    // limiter). The hard CPU ceiling on concurrent Argon2 is pow_semaphore (2
+    // permits), independent of this per-minute count; this assertion only guards
+    // against the constant being set absurdly high.
     assert!(
-        max_global <= 50,
-        "global limit {} should be <= 50",
-        max_global
+        max_global <= 4 * max_per_peer,
+        "global limit {} should stay within 4x the per-peer cap {}",
+        max_global,
+        max_per_peer
     );
 }
 

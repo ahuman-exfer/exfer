@@ -3776,7 +3776,19 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
             continue;
         }
 
-        let tip = node.tip.read().await.clone();
+        // Consistent (tip, utxo) snapshot. The commit path mutates the tip
+        // while holding the utxo_set write lock, so we must take the utxo_set
+        // read guard FIRST (utxo-before-tip order), read+clone the tip under
+        // it, then clone the set and drop the guard. This matches the commit
+        // path's lock order (no deadlock) and yields a tip/utxo pair that
+        // cannot straddle a block-accept write. The guard is released here so
+        // it is never held across the (expensive) template build below.
+        let (tip, utxo_set) = {
+            let utxo_guard = node.utxo_set.read().await;
+            let tip = node.tip.read().await.clone();
+            let utxo_set = utxo_guard.clone();
+            (tip, utxo_set)
+        };
         let best_work = *node.best_peer_work.lock().unwrap_or_else(|e| e.into_inner());
         // All-zeros means no confirmed peers (bootstrap) — mine freely.
         // Otherwise, only mine when our work matches or exceeds the best peer's.
@@ -3861,7 +3873,7 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
         // now <= max) this reduces exactly to the previous `now.max(min)`.
         let clamped_timestamp = now.clamp(min_timestamp, max_timestamp.max(min_timestamp));
 
-        let utxo_set = node.utxo_set.read().await.clone();
+        // utxo_set was cloned above in the consistent snapshot with the tip.
         // Clone candidate list under the lock, then release immediately.
         // Template assembly (trial-apply, revalidation) runs without holding
         // the mempool lock, so tx admission is never blocked by the miner.
@@ -3907,6 +3919,18 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
                 "Purged {} stale txs from mempool during template build",
                 skipped_ids.len()
             );
+        }
+
+        // Pre-grind re-check: if the tip advanced while we were assembling the
+        // template, the template is already stale. Skip grinding this iteration
+        // and rebuild on the new tip rather than burning a grind on a block
+        // that would orphan. Shrinks the stale-grind window.
+        {
+            let current_tip = node.tip.read().await;
+            if current_tip.block_id != tip.block_id {
+                info!("Tip advanced during template build, skipping stale grind");
+                continue;
+            }
         }
 
         info!("Mining block at height {} (nonce grinding)...", height);
@@ -3971,7 +3995,15 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .map(|d| d.as_secs());
-                match node.process_block(block.clone(), wall_clock).await {
+                // Our own block has valid PoW by construction (mine() only
+                // returns once pow < target) and its template was fully
+                // validated at build, so skip the Argon2id self-verify exactly
+                // as the NewBlock pre-check path does. Difficulty, tx, and
+                // state-root checks still run locally.
+                match node
+                    .process_block_pre_validated(block.clone(), wall_clock)
+                    .await
+                {
                     Ok(ProcessBlockOutcome::Accepted) => {
                         info!("Block {} accepted", block_id);
                         node.broadcast(&network::protocol::Message::NewBlock(block), None)
@@ -3992,7 +4024,12 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
                         return;
                     }
                     Err(e) => {
-                        error!("Mined block rejected: {}", e);
+                        // With PoW self-verify skipped and the template fully
+                        // validated at build time, a local rejection of our own
+                        // block is unexpected. Log loudly and drop the block
+                        // (it is not broadcast); the next loop mines a fresh
+                        // template rather than retrying this one.
+                        error!("Mined block unexpectedly rejected locally: {}", e);
                         // Only purge mempool when the rejection is due to
                         // transaction invalidity. Header-only rejections
                         // (bad timestamp, bad difficulty, bad PoW) mean the
