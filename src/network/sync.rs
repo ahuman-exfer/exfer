@@ -4022,15 +4022,17 @@ impl Node {
                         // Duplicate (already-stored) block. Count it against a
                         // SEPARATE per-min budget so the rev9 valid-block replay
                         // -flood defense stays in place (duplicates are not
-                        // free), but normal at-tip duplicate chatter never
-                        // disconnects an honest peer. Over-cap = soft-drop.
+                        // free), while normal at-tip duplicate chatter (~6/min
+                        // per peer, well under the 60/min cap) never disconnects
+                        // an honest peer. Breaching the cap means a peer is
+                        // streaming already-known blocks ~10x above the honest
+                        // rate (each forcing a frame decode + has_block read) —
+                        // a replay flood: disconnect (no strike; it can
+                        // reconnect cleanly).
                         if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                             duplicate_block_count += 1;
                             if duplicate_block_count > MAX_DUPLICATE_BLOCKS_PER_MIN {
-                                tracing::debug!(
-                                    "Soft-dropping duplicate NewBlock from {} (over MAX_DUPLICATE_BLOCKS_PER_MIN)",
-                                    meta.addr
-                                );
+                                return Err(PeerError::TrafficQuotaExceeded);
                             }
                         }
                         continue;

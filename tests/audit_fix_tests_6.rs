@@ -114,8 +114,11 @@ mod rate_limit_tests {
     use exfer::types::{MAX_BLOCKS_PER_MIN, MAX_TXS_PER_MIN};
 
     #[test]
-    fn max_blocks_per_min_is_12() {
-        assert_eq!(MAX_BLOCKS_PER_MIN, 12);
+    fn max_blocks_per_min_is_60() {
+        // Per-peer NOVEL-block cap. Raised 12 -> 60 (10x the 6/min honest at-tip
+        // cadence) so honest peers are no longer disconnected at tip; only novel
+        // blocks (post-dedup) consume it. Duplicates have a separate budget.
+        assert_eq!(MAX_BLOCKS_PER_MIN, 60);
     }
 
     #[test]
