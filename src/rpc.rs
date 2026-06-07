@@ -449,6 +449,11 @@ async fn handle_get_block_height(id: serde_json::Value, node: &Arc<Node>) -> Rpc
         serde_json::json!({
             "height": tip.height,
             "block_id": hex::encode(tip.block_id.as_bytes()),
+            // Chain identity for signing clients (issue #32): MUST source
+            // node.genesis_id — the same id the P2P handshake gates on — so a
+            // client that binds its signature domain to this field signs in
+            // the domain this node verifies. Never tip-derived.
+            "genesis_block_id": hex::encode(node.genesis_id.as_bytes()),
         }),
     )
 }

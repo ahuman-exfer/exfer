@@ -46,6 +46,7 @@ allow-testnet-release = ["testnet"]  # Override compile_error for testnet in rel
 testing = []  # Exposes test-only helpers (e.g. dispute_script_unchecked). Never enable in production builds.
 channels = []  # Payment channel covenant templates. Off by default.
 bench-diagnostics = []  # Phase 3a diagnostic binary (bench_phase3a). Off by default to keep the production build minimal; build with `cargo build --release --features bench-diagnostics --bin bench_phase3a` to reproduce the numbers in issue #6.
+dev-harness = []  # Canonical-only manual test harnesses (htlc_test/covenant_test/covenant_test2/stress_test). Off by default so `cargo install` never puts them in a user's PATH: they sign in the unbound canonical domain against a hardcoded RPC and would be rejected by any non-canonical (e.g. devnet) node (issue #32). Build with `cargo build --features dev-harness --bin <name>`.
 
 [dev-dependencies]
 tempfile = "3"
@@ -67,18 +68,22 @@ path = "src/bin/mine_genesis.rs"
 [[bin]]
 name = "htlc_test"
 path = "src/bin/htlc_test.rs"
+required-features = ["dev-harness"]
 
 [[bin]]
 name = "covenant_test"
 path = "src/bin/covenant_test.rs"
+required-features = ["dev-harness"]
 
 [[bin]]
 name = "covenant_test2"
 path = "src/bin/covenant_test2.rs"
+required-features = ["dev-harness"]
 
 [[bin]]
 name = "stress_test"
 path = "src/bin/stress_test.rs"
+required-features = ["dev-harness"]
 
 [[bin]]
 name = "bench_phase3a"
