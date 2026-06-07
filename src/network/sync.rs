@@ -2107,7 +2107,13 @@ impl Node {
     ///
     /// Returns Ok(true) if stored, Ok(false) if dropped (lower work than
     /// all existing fork blocks).
-    fn try_store_fork_block(
+    ///
+    /// Exposed (pub) for the deep-fork re-admission regression test in
+    /// `tests/orphan_rate_fix_regression.rs`. Behavior is unchanged; only the
+    /// visibility is widened so the fork-pool admission decision can be
+    /// exercised directly (standing up a full multi-node IBD is blocked
+    /// locally by the assume-valid bootstrap anchor).
+    pub fn try_store_fork_block(
         &self,
         block: &Block,
         cumulative_work: &[u8; 32],
