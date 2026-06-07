@@ -94,32 +94,17 @@ pub fn genesis_block() -> Block {
 /// same coinbase and UTXO state as canonical genesis — only the header
 /// timestamp (and hence the id) differs.
 ///
-/// Scope note (signature domain): this isolates devnet at the chain / datadir /
-/// P2P-handshake layer ONLY — NOT at the signature layer. `sig_message`
-/// (transaction.rs) binds signatures to the canonical [`GENESIS_BLOCK_ID`], not
-/// the active genesis, so a devnet process and a same-build testnet/devnet node
-/// share one signature domain. Coinbases are deterministic, so two same-build
-/// chains can hold an identical outpoint (same height + miner pubkey + reward →
-/// byte-identical coinbase → identical tx_id), and a devnet-signed spend of it
-/// would verify on the other chain. (The genesis coinbase specifically is
-/// unspendable — all-zeros script, no key — so it has nothing to replay; the
-/// risk is non-genesis coinbases.)
-///
-/// Why this is accepted, not fixed: the signature domain is a process-global
-/// read by every SIGNER as well as the verifier — the CLI `wallet send`,
-/// `walletd`, and the MCP server all sign via `sig_message` in their own
-/// processes (README: "point any client at it"). A node cannot override the
-/// domain unilaterally without rejecting every client spend, and those clients
-/// (some in separate repos) have no devnet signal. True separation requires a
-/// coordinated change across all signing clients (e.g. derive the domain from
-/// the node's genesis id over RPC) and is deferred until a real testnet network
-/// makes it load-bearing — tracked as a follow-up.
-///
-/// Mainnet is unaffected regardless: `exfer devnet` requires a `--features
-/// testnet` build (enforced in the Devnet command), and a testnet build's
-/// `GENESIS_BLOCK_ID` already differs from mainnet's (the difficulty target is
-/// part of `block_id`), so the shared domain is confined to devnet<->testnet,
-/// both dev-only, and no testnet network is deployed.
+/// Scope note (signature domain, issue #32): devnet is also separated at the
+/// signature layer, but NOT through this constant directly. `sig_message`
+/// (transaction.rs) binds the process [`signature_domain`]: the compiled
+/// [`GENESIS_BLOCK_ID`] unless [`bind_signature_domain`] was called. An
+/// `exfer devnet` process binds the devnet genesis id at startup (via
+/// `types::enter_devnet`), and signing clients bind the id the node reports
+/// over RPC after checking it against what they already hold — see the trust
+/// rule on [`bind_signature_domain`]. Without that separation, coinbases being
+/// deterministic means two same-build chains can hold an identical outpoint
+/// (same height + miner pubkey + reward → byte-identical coinbase → identical
+/// tx_id), and a spend signed on one chain would verify on the other.
 const DEVNET_GENESIS_TIMESTAMP: u64 = GENESIS_TIMESTAMP + 1;
 
 /// Genesis block for an isolated `exfer devnet` chain.
@@ -166,13 +151,66 @@ mod devnet_genesis_tests {
 /// Lazy genesis block ID — computed once on first access.
 ///
 /// Deterministic: always the same value because `genesis_block()` is fully
-/// deterministic. Used by `sig_message()` to bind signatures to this chain,
-/// preventing cross-chain transaction replay. This is the canonical genesis id
-/// on every build (build-dependent: testnet vs production differ by difficulty
-/// target) and is used even inside an `exfer devnet` process — see the scope
-/// note on [`DEVNET_GENESIS_TIMESTAMP`].
+/// deterministic. This is the canonical genesis id on every build
+/// (build-dependent: testnet vs production differ by difficulty target) and is
+/// the default [`signature_domain`] when no override is bound. It is never
+/// mutated — devnet and foreign-chain signing bind a separate override instead
+/// (issue #32).
 pub static GENESIS_BLOCK_ID: std::sync::LazyLock<Hash256> =
     std::sync::LazyLock::new(|| genesis_block().header.block_id());
+
+/// Process-global signature-domain override (issue #32).
+///
+/// Never bound → [`signature_domain`] falls back to the compiled
+/// [`GENESIS_BLOCK_ID`], byte-for-byte what every release signed and verified
+/// before this override existed. `node`/`mine` never bind it; only the
+/// `exfer devnet` path (`types::enter_devnet`) and signing clients that
+/// verified a node-reported genesis id do.
+static SIGNATURE_DOMAIN: std::sync::OnceLock<Hash256> = std::sync::OnceLock::new();
+
+/// Bind the process signature domain to `genesis_id` (issue #32).
+///
+/// Set-once: a process that could re-bind mid-run would sign transactions in
+/// two different domains, so re-binding to a DIFFERENT id returns
+/// `Err(already_bound_id)` and the caller must abort. Re-binding the SAME id
+/// is an idempotent `Ok` — every pre-sign helper routes through the bind, so
+/// a multi-lookup flow hits it more than once.
+///
+/// Trust rule for callers that bind a node-reported id: anchor on what this
+/// process already holds — the compiled [`GENESIS_BLOCK_ID`], or an id the
+/// operator named explicitly — and bind the exact id that was checked, never
+/// an unchecked or re-fetched one. Binding whatever an RPC answers would let
+/// a malicious node move the signer into a foreign domain, where a colliding
+/// deterministic-coinbase outpoint makes the signature replayable.
+pub fn bind_signature_domain(genesis_id: Hash256) -> Result<(), Hash256> {
+    match SIGNATURE_DOMAIN.set(genesis_id) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let bound = *SIGNATURE_DOMAIN
+                .get()
+                .expect("OnceLock::set failed, so it is initialized");
+            if bound == genesis_id {
+                Ok(())
+            } else {
+                Err(bound)
+            }
+        }
+    }
+}
+
+/// The signature domain for this process: the bound override when set, else
+/// the compiled canonical [`GENESIS_BLOCK_ID`]. Read by `sig_message()` on
+/// every sign AND every verify in this process.
+pub fn signature_domain() -> Hash256 {
+    *SIGNATURE_DOMAIN.get().unwrap_or(&*GENESIS_BLOCK_ID)
+}
+
+/// Whether [`bind_signature_domain`] has been called in this process.
+/// (Used by integration tests via the lib target; the bin never reads it.)
+#[allow(dead_code)]
+pub fn signature_domain_is_bound() -> bool {
+    SIGNATURE_DOMAIN.get().is_some()
+}
 
 /// Returns the genesis block ID.
 ///

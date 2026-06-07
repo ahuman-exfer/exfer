@@ -23,6 +23,15 @@
 //! Those are availability / UX issues, not theft. Closing them fully requires
 //! SPV-style inclusion proofs and a locally-maintained header chain, which is
 //! out of scope for this release.
+//!
+//! ## Signature domain (issue #32)
+//! The same choke point also establishes the process signature domain:
+//! [`ensure_signature_domain`] fetches the node's reported genesis id once,
+//! checks it against what the signer already holds (the compiled canonical id
+//! or an explicit `--expect-genesis`), and binds the checked id before any
+//! signing. Default-deny on mismatch — a malicious RPC cannot move the signer
+//! into a foreign chain's domain, in which deterministic coinbases can hold a
+//! colliding outpoint that would make the signature replayable.
 
 use crate::types::transaction::Transaction;
 use crate::types::Hash256;
@@ -59,6 +68,22 @@ pub enum AuthError {
     /// Output script did not byte-equal the locally-reconstructed
     /// `expected_script`.
     ScriptMismatch { expected: Vec<u8>, actual: Vec<u8> },
+    /// The node reported a genesis id that differs from the one this signer
+    /// expects (issue #32). Signing would bind the signature to a foreign
+    /// chain's domain, where a colliding deterministic-coinbase outpoint
+    /// makes it replayable. Never retry against the same endpoint; if the
+    /// foreign chain is intentional (a devnet), name its id explicitly with
+    /// `--expect-genesis`.
+    GenesisDomainMismatch { expected: Hash256, reported: Hash256 },
+    /// An explicit `--expect-genesis` id was given but the node does not
+    /// report a genesis id (pre-v1.13 `get_block_height`), so the expectation
+    /// cannot be verified.
+    GenesisUnreported { expected: Hash256 },
+    /// The node's reported `genesis_block_id` field was not a 32-byte hex id.
+    GenesisMalformed(String),
+    /// The process signature domain is already bound to a different id than
+    /// the one this node reports — one process must not sign in two domains.
+    GenesisRebind { bound: Hash256, checked: Hash256 },
 }
 
 impl std::fmt::Display for AuthError {
@@ -111,11 +136,140 @@ impl std::fmt::Display for AuthError {
                 actual.len(),
                 hex::encode(actual),
             ),
+            AuthError::GenesisDomainMismatch { expected, reported } => write!(
+                f,
+                "node reports a different chain than this signer expects — \
+                 refusing to sign in a foreign signature domain\n  \
+                 expected genesis: {}\n  node reports:     {}\n\
+                 If the node's chain is intentional (e.g. a devnet), pass \
+                 --expect-genesis with its genesis id (or `devnet`).",
+                expected, reported
+            ),
+            AuthError::GenesisUnreported { expected } => write!(
+                f,
+                "--expect-genesis {} was given but the node does not report a \
+                 genesis id (get_block_height has no genesis_block_id field; \
+                 older node?) — cannot verify the signing domain",
+                expected
+            ),
+            AuthError::GenesisMalformed(s) => write!(
+                f,
+                "node reported a malformed genesis_block_id ({}) — endpoint \
+                 may be malicious or compromised",
+                s
+            ),
+            AuthError::GenesisRebind { bound, checked } => write!(
+                f,
+                "signature domain already bound to {} in this process but the \
+                 node reports {} — one process must not sign in two domains",
+                bound, checked
+            ),
         }
     }
 }
 
 impl std::error::Error for AuthError {}
+
+// ── Signature-domain establishment (issue #32) ─────────────────────────────
+
+/// The genesis id this signer expects the node to report. Defaults to the
+/// compiled canonical [`crate::genesis::GENESIS_BLOCK_ID`]; the operator can
+/// name a different chain explicitly with `--expect-genesis` (set once at CLI
+/// startup via [`set_expected_genesis`]). The expectation is always something
+/// this process already holds — never something a node reported.
+static EXPECTED_GENESIS: std::sync::OnceLock<Hash256> = std::sync::OnceLock::new();
+
+/// Fast path: the fetch→check→bind handshake already ran in this process.
+static DOMAIN_ESTABLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Name the genesis id the signer expects (from `--expect-genesis`). Call at
+/// most once, before any signing flow. Returns `Err` if already set.
+pub fn set_expected_genesis(genesis_id: Hash256) -> Result<(), Hash256> {
+    EXPECTED_GENESIS.set(genesis_id)
+}
+
+/// Establish the process signature domain against the node at `rpc_url`
+/// (issue #32). Idempotent and cheap after the first success.
+///
+/// Sequence — one read, check, then bind the exact id that was checked
+/// (re-fetching between check and bind would open a TOCTOU where the check
+/// sees one chain and the bind another):
+/// 1. `expected` = the `--expect-genesis` id if named, else the compiled
+///    canonical [`crate::genesis::GENESIS_BLOCK_ID`]. Always locally held.
+/// 2. Fetch `get_block_height` once and read `genesis_block_id`.
+/// 3. Reported id != expected → [`AuthError::GenesisDomainMismatch`], before
+///    any bind or sign. Default-deny: a node cannot move this signer into a
+///    foreign domain; the operator must name the foreign chain explicitly.
+/// 4. Reported id == expected → bind it as the process signature domain.
+///
+/// A node that reports no genesis id (older `get_block_height`) is accepted
+/// only when the expectation is the compiled canonical id — `sig_message`'s
+/// fallback domain, which is what such a node verifies — and rejected when an
+/// explicit `--expect-genesis` cannot be verified.
+///
+/// Every spend path routes through this: [`authenticated_output_lookup`]
+/// calls it first, and `fetch_utxos_select` (main.rs) calls it before coin
+/// selection, so a signing flow cannot reach `sig_message` without the
+/// domain having been established against the node it is about to submit to.
+pub fn ensure_signature_domain(rpc_url: &str) -> Result<(), AuthError> {
+    use std::sync::atomic::Ordering;
+    if DOMAIN_ESTABLISHED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let expected = *EXPECTED_GENESIS
+        .get()
+        .unwrap_or(&*crate::genesis::GENESIS_BLOCK_ID);
+
+    let response = crate::rpc::rpc_call(rpc_url, "get_block_height", serde_json::json!({}))
+        .map_err(AuthError::Rpc)?;
+
+    let reported = match response.get("genesis_block_id").and_then(|v| v.as_str()) {
+        None => {
+            if expected == *crate::genesis::GENESIS_BLOCK_ID {
+                // Older node, canonical expectation: the unbound fallback
+                // domain is exactly what this node verifies. Nothing to bind.
+                DOMAIN_ESTABLISHED.store(true, Ordering::Release);
+                return Ok(());
+            }
+            return Err(AuthError::GenesisUnreported { expected });
+        }
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str)
+                .map_err(|_| AuthError::GenesisMalformed(hex_str.to_string()))?;
+            if bytes.len() != 32 {
+                return Err(AuthError::GenesisMalformed(hex_str.to_string()));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Hash256(arr)
+        }
+    };
+
+    if reported != expected {
+        return Err(AuthError::GenesisDomainMismatch { expected, reported });
+    }
+
+    if reported == crate::genesis::devnet_genesis_block().header.block_id() {
+        // The verified chain IS the devnet chain: enter devnet consensus mode
+        // wholesale — signature domain AND coinbase maturity 1, composed in
+        // one call (`types::enter_devnet`), never one without the other.
+        // Without the maturity half, the wallet's own maturity filter
+        // (wallet.rs list_utxos, canonical 360) would discard every young
+        // devnet coinbase the node reports as spendable.
+        crate::types::enter_devnet();
+    } else {
+        crate::genesis::bind_signature_domain(reported).map_err(|bound| {
+            AuthError::GenesisRebind {
+                bound,
+                checked: reported,
+            }
+        })?;
+    }
+    DOMAIN_ESTABLISHED.store(true, Ordering::Release);
+    Ok(())
+}
 
 /// Authenticate a transaction-hex payload against a requested txid, an output
 /// index, and (optionally) an expected output script. Pure — no I/O.
@@ -182,12 +336,20 @@ pub fn authenticate_tx_hex(
 ///
 /// Uses the `get_transaction` JSON-RPC method. See [`authenticate_tx_hex`]
 /// for authentication semantics.
+///
+/// Also establishes the process signature domain against this node first
+/// (issue #32) — every spend path authenticates its inputs through here, so
+/// this is the structural choke point that guarantees fetch→check→bind runs
+/// before any `sig_message` is signed, including the HtlcClaim/HtlcReclaim
+/// arms that sign inline without the shared sign helpers.
 pub fn authenticated_output_lookup(
     rpc_url: &str,
     requested_txid: Hash256,
     output_index: u32,
     expected_script: Option<&[u8]>,
 ) -> Result<(u64, Vec<u8>), AuthError> {
+    ensure_signature_domain(rpc_url)?;
+
     let response = crate::rpc::rpc_call(
         rpc_url,
         "get_transaction",

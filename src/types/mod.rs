@@ -45,11 +45,40 @@ pub fn coinbase_maturity() -> u64 {
     COINBASE_MATURITY_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Lower coinbase maturity to the devnet value. Call ONCE at devnet startup,
-/// before any block is processed. Never called on the `node`/`mine` paths, so a
-/// devnet-capable binary still runs networked nodes at the canonical maturity.
+/// Lower coinbase maturity to the devnet value. Not called directly by the
+/// devnet boot path — [`enter_devnet`] composes it with the signature-domain
+/// bind so the two can't be activated separately.
 pub fn set_devnet_coinbase_maturity() {
     COINBASE_MATURITY_BLOCKS.store(DEVNET_COINBASE_MATURITY, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Enter devnet consensus mode for this process: coinbase maturity 1 AND the
+/// devnet signature domain, in one call (issues #29/#32).
+///
+/// This is deliberately the ONLY sanctioned activation site — composing both
+/// switches means a process cannot lower maturity without also separating its
+/// signature domain, and cannot join the devnet domain while filtering UTXOs
+/// at the canonical maturity (the partial-activation footgun, both ways).
+/// Exactly two callers, both gated: `run_node`'s `if devnet` arm (the devnet
+/// node itself), and `wallet::auth::ensure_signature_domain` after verifying
+/// that the node a signer is about to spend through reports the devnet
+/// genesis id the operator named. `node`/`mine` never call it, so a
+/// devnet-capable binary still runs networked nodes at canonical maturity in
+/// the canonical domain.
+///
+/// Panics if the signature domain is already bound to a different id — a
+/// devnet process whose domain was pre-bound elsewhere is a programming
+/// error, and continuing would verify blocks in one domain while reporting
+/// another over RPC.
+pub fn enter_devnet() {
+    set_devnet_coinbase_maturity();
+    let devnet_id = crate::genesis::devnet_genesis_block().header.block_id();
+    if let Err(bound) = crate::genesis::bind_signature_domain(devnet_id) {
+        panic!(
+            "enter_devnet: signature domain already bound to {} (devnet expects {})",
+            bound, devnet_id
+        );
+    }
 }
 pub const MAX_BLOCK_SIZE: usize = 4_194_304; // 4 MiB
 pub const MAX_TX_SIZE: usize = 1_048_576; // 1 MiB

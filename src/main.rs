@@ -114,6 +114,12 @@ pub const RELEASE_TAG: &str = "1.12.0";
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Genesis id the signer expects the node to report (64 hex chars, or
+    /// `devnet` for this build's devnet genesis). Signing commands refuse a
+    /// node whose reported genesis differs from the expectation; without this
+    /// flag the expectation is the canonical genesis of this build (issue #32).
+    #[arg(long, global = true, value_name = "GENESIS_ID|devnet")]
+    expect_genesis: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -861,6 +867,33 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Name the expected signing domain before any subcommand runs (issue #32).
+    // The value is always locally derived — a compiled constant or an
+    // operator-typed id — never something a node reported. The check itself
+    // happens in wallet::auth::ensure_signature_domain on every signing path.
+    if let Some(ref spec) = cli.expect_genesis {
+        let expected = match spec.as_str() {
+            "devnet" => genesis::devnet_genesis_block().header.block_id(),
+            hex_str => {
+                let bytes = hex::decode(hex_str).unwrap_or_else(|e| {
+                    eprintln!("ERROR: invalid --expect-genesis hex: {}", e);
+                    std::process::exit(1);
+                });
+                if bytes.len() != 32 {
+                    eprintln!("ERROR: --expect-genesis must be 32 bytes (64 hex chars) or `devnet`");
+                    std::process::exit(1);
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Hash256(arr)
+            }
+        };
+        if wallet::auth::set_expected_genesis(expected).is_err() {
+            eprintln!("ERROR: --expect-genesis set twice");
+            std::process::exit(1);
+        }
+    }
+
     match cli.command {
         Commands::Node {
             bind,
@@ -983,6 +1016,10 @@ async fn main() {
             println!("exfer devnet — isolated local chain");
             println!("  datadir:  {}", datadir.display());
             println!("  RPC+SSE:  http://{rpc_bind}");
+            println!(
+                "  genesis:  {} (signing clients: pass --expect-genesis devnet)",
+                genesis::devnet_genesis_block().header.block_id()
+            );
             match &wallet_addr {
                 Some(addr) => println!("  mining to (coins land here):  {addr}"),
                 None => println!("  mining to pubkey:  {}", hex::encode(pubkey)),
@@ -1144,6 +1181,13 @@ async fn main() {
                 let recipient = Hash256(hash);
 
                 let (utxo_set, tip_height) = if let Some(ref url) = rpc_url {
+                    // Establish the signing domain against this node before
+                    // any other RPC (issue #32) — fail fast on a foreign
+                    // chain, even when the wallet turns out to be empty.
+                    if let Err(e) = wallet::auth::ensure_signature_domain(url) {
+                        eprintln!("ERROR: {}", e);
+                        std::process::exit(1);
+                    }
                     // v1.4.2 Fix 1: treat `get_address_utxos` as returning a
                     // list of outpoints only. The JSON `value` and `script`
                     // fields are deliberately NOT read in the spend path —
@@ -1237,6 +1281,13 @@ async fn main() {
 
                     (utxo_set, tip_h)
                 } else {
+                    // --datadir mode signs in the unbound fallback domain (the
+                    // compiled canonical genesis), which is provably correct
+                    // here: rebuild_utxo_set refuses any datadir whose height-0
+                    // block is not the canonical genesis, so the chain being
+                    // spent IS the canonical chain. Devnet spends are
+                    // --rpc-only by design (issue #32) — the devnet datadir is
+                    // rejected below, with a pointer to --rpc.
                     rebuild_utxo_set(&datadir)
                 };
 
@@ -2503,11 +2554,15 @@ fn rebuild_utxo_set_inner(datadir: &Path) -> Result<(UtxoSet, u64), String> {
                 )
             })?;
 
-        // Genesis check
+        // Genesis check. Also the reason `wallet send --datadir` may sign in
+        // the unbound fallback domain: any datadir that passes here IS the
+        // canonical chain. Devnet datadirs fail here by construction — devnet
+        // spends go through --rpc against the running devnet node (issue #32).
         if height == 0 && block_id != expected_genesis_id {
             return Err(format!(
                 "height 0 block {} does not match expected genesis {}; \
-                 database belongs to a different chain",
+                 database belongs to a different chain (a devnet datadir? \
+                 spend devnet coins via --rpc against the devnet node)",
                 block_id, expected_genesis_id
             ));
         }
@@ -2764,6 +2819,13 @@ fn fetch_utxos_select(
     amount: u64,
     fee: u64,
 ) -> (Vec<(types::transaction::OutPoint, u64)>, u64) {
+    // Establish the signing domain against this node before any other RPC
+    // (issue #32). authenticated_output_lookup re-checks per call (no-op after
+    // the first), but failing here keeps the trust-rule error first and exact.
+    if let Err(e) = wallet::auth::ensure_signature_domain(rpc) {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    }
     // v1.4.2 Fix 1: outpoints only from `get_address_utxos`. `value` and
     // `script` are NOT read here — each outpoint is authenticated below.
     let address_hex = w.address().to_string();
@@ -3015,18 +3077,19 @@ async fn run_node(
     rpc_sse_enabled: bool,
     devnet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Devnet lowers coinbase maturity to 1 block at runtime so local coins are
-    // spendable within seconds. This is a runtime store (not a cargo feature),
-    // so it only ever fires on this isolated-node path — the networked
-    // `node`/`mine` commands never call it and keep the canonical 360, even on
-    // the same binary. Set before any block is processed.
+    // Devnet consensus mode: coinbase maturity 1 AND the devnet signature
+    // domain, composed in one call so they can't be activated separately
+    // (issues #29/#32). Runtime switches, not a cargo feature, and only ever
+    // fired on this isolated-node path — the networked `node`/`mine` commands
+    // never call it and keep the canonical maturity in the canonical domain,
+    // even on the same binary. Set before any block is processed.
     //
-    // Note: the signature domain is deliberately NOT overridden here. It is a
-    // process-global read by every signing client (the CLI wallet, walletd, the
-    // MCP server) as well as the node; a node cannot change it unilaterally
-    // without breaking client spends. See genesis::DEVNET_GENESIS_TIMESTAMP.
+    // Signing clients join the devnet domain by binding the genesis id this
+    // node reports over RPC (`get_block_height.genesis_block_id`), checked
+    // against an operator-named expectation — see
+    // wallet::auth::ensure_signature_domain.
     if devnet {
-        crate::types::set_devnet_coinbase_maturity();
+        crate::types::enter_devnet();
     }
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving

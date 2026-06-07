@@ -29,6 +29,23 @@ fn sig_message_includes_genesis_block_id() {
     let sig_msg = tx.sig_message().unwrap();
     // Must start with DS_SIG
     assert!(sig_msg.starts_with(DS_SIG));
+    // Fork-safety pin (issue #32): on the no-bind path the signature domain
+    // IS the live compiled genesis id — compared against `GENESIS_BLOCK_ID`,
+    // never a hardcoded literal, because `block_id` hashes the difficulty
+    // target and so testnet and production genesis ids differ. This binary
+    // must never call `bind_signature_domain`, so the assertion pins that an
+    // unupgraded signer and an upgraded one produce byte-identical signed
+    // bytes on mainnet/testnet. Runs under BOTH default and
+    // `--features testnet` (no cfg gate).
+    assert!(
+        !exfer::genesis::signature_domain_is_bound(),
+        "this test binary must never bind the signature domain"
+    );
+    assert_eq!(
+        exfer::genesis::signature_domain(),
+        *GENESIS_BLOCK_ID,
+        "unbound signature domain must fall back to the compiled genesis id"
+    );
     // Genesis block ID must follow immediately after DS_SIG
     let genesis_id = &*GENESIS_BLOCK_ID;
     assert_eq!(

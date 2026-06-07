@@ -328,16 +328,18 @@ impl Transaction {
     /// `"EXFER-SIG" || genesis_block_id(32) || signing_bytes`.
     ///
     /// The genesis block ID binds signatures to this chain, preventing
-    /// cross-chain transaction replay. It is the canonical `GENESIS_BLOCK_ID`
-    /// on every build — including inside an `exfer devnet` process. Devnet is
-    /// therefore NOT signature-domain-separated from a same-build testnet chain;
-    /// see the scope note on `genesis::DEVNET_GENESIS_TIMESTAMP` for why this is
-    /// accepted dev-only (separating it would require every signing client to
-    /// agree on the domain, which a node cannot change unilaterally).
+    /// cross-chain transaction replay. The id is the process
+    /// [`crate::genesis::signature_domain`]: the compiled canonical
+    /// `GENESIS_BLOCK_ID` unless `bind_signature_domain` was called (issue
+    /// #32) — `node`/`mine` never bind, so networked signing and verification
+    /// are byte-identical to every prior release; an `exfer devnet` process
+    /// binds the devnet genesis id at startup, and signing clients bind the
+    /// node-reported id after checking it (see the trust rule on
+    /// `bind_signature_domain`).
     /// Returns Err if field sizes exceed u16::MAX.
     pub fn sig_message(&self) -> Result<Vec<u8>, SerError> {
         let signing = self.signing_bytes()?;
-        let genesis_id = &*crate::genesis::GENESIS_BLOCK_ID;
+        let genesis_id = crate::genesis::signature_domain();
         let mut msg = Vec::with_capacity(DS_SIG.len() + 32 + signing.len());
         msg.extend_from_slice(DS_SIG);
         msg.extend_from_slice(genesis_id.as_bytes());
