@@ -293,9 +293,18 @@ pub const MAX_DUPLICATE_BLOCKS_PER_MIN: u32 = 60;
 /// verification CPU across the whole node, independent of per-peer caps. Set
 /// well above the honest network cadence (6 blocks/min mean) so a healthy tip
 /// never trips it; CPU stays bounded by pow_semaphore and the per-peer
-/// MAX_BLOCKS_PER_MIN caps regardless. Tip-extending blocks bypass this cap
-/// (see process_block_event) since they are the scarce, time-critical case.
+/// MAX_BLOCKS_PER_MIN caps regardless. Tip-extending blocks (prev == tip) do NOT
+/// bypass this cap — they get the small bounded RESERVE below on top of it, so a
+/// genuine next-tip block survives a flood while a forged-tip-extender flood
+/// stays bounded (prev_block_id is attacker-forgeable and checked before
+/// verify_pow, so an unbounded bypass would let it queue work on the PoW
+/// semaphore; see Node::try_consume_global_block_slot_inner).
 pub const MAX_GLOBAL_BLOCKS_PER_MIN: u32 = 120;
+/// Extra per-minute global slots reserved for tip-extending blocks once the
+/// aggregate cap above is exhausted. Bounds the worst case (forged tip-extenders
+/// under flood) to MAX_GLOBAL_BLOCKS_PER_MIN + this, while comfortably covering
+/// the honest ~6/min tip cadence during a flood.
+pub const MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN: u32 = 60;
 pub const MAX_TXS_PER_MIN: u32 = 60;
 pub const MAX_GLOBAL_TXS_PER_MIN: u32 = 200;
 pub const MAX_PINGS_PER_MIN: u32 = 10;

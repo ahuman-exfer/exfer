@@ -17,10 +17,12 @@ fn f2_max_blocks_per_min_is_60() {
 #[test]
 fn f2_global_block_limit_constant_exists() {
     // 120 = 2x the per-peer novel cap. Raised 24 -> 120 because the per-peer cap
-    // rose to 60 and the global cap must stay >= per-peer; tip-extending blocks
-    // bypass this cap entirely (they must never be dropped). The real CPU bound
-    // on Argon2 verification is pow_semaphore (2 concurrent), not this per-minute
-    // count, so the rate is a coarse limiter rather than the DoS ceiling.
+    // rose to 60 and the global cap must stay >= per-peer. Tip-extending blocks do
+    // NOT bypass this cap; they get a small bounded reserve on top of it
+    // (MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN) so a genuine next-tip block is not
+    // dropped under a flood while a forged-tip-extender flood stays bounded. The
+    // real CPU bound on Argon2 is pow_semaphore (2 concurrent), not this per-minute
+    // count, so the rate is a coarse limiter rather than the ceiling.
     assert_eq!(exfer::types::MAX_GLOBAL_BLOCKS_PER_MIN, 120);
 }
 

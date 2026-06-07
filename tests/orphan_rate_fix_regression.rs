@@ -68,9 +68,10 @@ fn reorg_trigger_take_purges_order_so_live_triggers_survive_cap_pressure() {
 
 // ── bug6: deep-fork re-admission live-lock ──
 //
-// Gated on testnet to reuse the established integration Node builder.
+// NOT gated on a cargo feature: try_store_fork_block does no PoW, and the Node
+// builder + genesis_block() work on the default build, so these fix-8 pins run
+// under a plain `cargo test` (not only `--features testnet`).
 
-#[cfg(feature = "testnet")]
 mod deep_fork_readmission {
     use exfer::chain::fork_choice::ChainTip;
     use exfer::chain::state::UtxoSet;

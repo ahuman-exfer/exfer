@@ -930,6 +930,10 @@ impl ReorgTriggerState {
             }
         }
         let triggers = self.triggers.entry(ancestor_id).or_default();
+        // Defensive only: the early per-ancestor cap check above already
+        // guarantees room (this ancestor had < MAX before the eviction loop,
+        // which can only shrink it), so this is always true and the else arm is
+        // unreachable. Kept as a belt-and-suspenders invariant guard.
         if triggers.len() < MAX_TRIGGERS_PER_ANCESTOR {
             triggers.push(trigger_block);
             self.order.push_back(ancestor_id);
@@ -1157,6 +1161,19 @@ impl Node {
     /// the per-minute budget is exhausted. Check and increment happen under a
     /// single mutex acquisition so concurrent peers cannot overshoot the limit.
     fn try_consume_global_block_slot(&self) -> bool {
+        self.try_consume_global_block_slot_inner(false)
+    }
+
+    /// Consume one global block-validation slot from the shared per-minute
+    /// limiter. `tip_extender` raises the ceiling by a small bounded reserve so
+    /// a genuine next-tip block is not dropped when the chain is under a flood,
+    /// WITHOUT granting an unbounded pre-PoW bypass: `prev_block_id == tip` is an
+    /// attacker-forgeable field checked before `verify_pow`, so the exemption
+    /// must stay bounded or a rotating-IP flood of forged "tip-extenders" could
+    /// queue unbounded work on the PoW semaphore and starve honest verification.
+    /// Both classes still consume the shared counter; tip-extenders cap at
+    /// MAX_GLOBAL_BLOCKS_PER_MIN + MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN.
+    fn try_consume_global_block_slot_inner(&self, tip_extender: bool) -> bool {
         let mut limiter = self
             .global_block_limiter
             .lock()
@@ -1166,7 +1183,12 @@ impl Node {
             limiter.0 = now;
             limiter.1 = 0;
         }
-        if limiter.1 < MAX_GLOBAL_BLOCKS_PER_MIN {
+        let cap = if tip_extender {
+            MAX_GLOBAL_BLOCKS_PER_MIN + MAX_GLOBAL_TIP_EXTENDER_RESERVE_PER_MIN
+        } else {
+            MAX_GLOBAL_BLOCKS_PER_MIN
+        };
+        if limiter.1 < cap {
             limiter.1 += 1;
             true
         } else {
@@ -5440,15 +5462,18 @@ async fn process_block_event(node: &Node, from: SocketAddr, from_identity: PeerI
 
     // Global block slot — consume only after orphan, height, and difficulty checks.
     // Cheap rejections don't burn budget; only blocks entering PoW validation count.
-    // Tip-extending blocks (prev == current tip) are the scarce, time-critical case
-    // and must never be dropped by the aggregate cap, so they bypass the slot. Only
-    // non-tip-extending blocks are subject to the global slot; on exhaustion we log
-    // at WARN (height/hash) rather than silently dropping a valid block.
+    // Tip-extending blocks (prev == current tip) are the scarce, time-critical case,
+    // so they get a small bounded RESERVE on top of the aggregate cap so a genuine
+    // next-tip block is not dropped under a flood. This is NOT an unbounded bypass:
+    // prev_block_id is attacker-forgeable and this check runs before verify_pow, so
+    // forged "tip-extenders" still consume the shared counter and are capped at
+    // MAX_GLOBAL_BLOCKS_PER_MIN + reserve — they cannot queue unbounded work on the
+    // PoW semaphore. On exhaustion we log at WARN rather than silently dropping.
     let extends_tip = node.tip.read().await.block_id == block.header.prev_block_id;
-    if !extends_tip && !node.try_consume_global_block_slot() {
+    if !node.try_consume_global_block_slot_inner(extends_tip) {
         warn!(
-            "Global block-rate cap reached — dropping non-tip-extending block at height {} ({}) from {}",
-            block.header.height, block_id, from
+            "Global block-rate cap reached — dropping block at height {} ({}) from {} (extends_tip={})",
+            block.header.height, block_id, from, extends_tip
         );
         return;
     }
