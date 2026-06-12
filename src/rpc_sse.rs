@@ -14,9 +14,11 @@
 //! via the normal JSON-RPC endpoint.
 //!
 //! Subscription model: addresses are passed as a comma-separated `addresses`
-//! query parameter on `GET /sse`. Each address is a 64-char hex script
-//! (same encoding the JSON-RPC takes). Re-subscribe = reconnect with a
-//! different set; no in-band protocol for add/remove.
+//! query parameter on `GET /sse`. Each address is a 64-char hex script or a
+//! bech32m address for this node's network (same encodings the JSON-RPC
+//! takes; issue #36). Events emitted on the stream stay hex regardless of
+//! how the filter was spelled. Re-subscribe = reconnect with a different
+//! set; no in-band protocol for add/remove.
 //!
 //! Operational safeguards:
 //!
@@ -80,8 +82,9 @@ pub fn new_conn_semaphore() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(MAX_RPC_SSE_CONNECTIONS))
 }
 
-/// Decode the `addresses=<hex>,<hex>,...` query parameter into a vec of
-/// raw script bytes. Caller has already enforced the per-conn cap.
+/// Decode the `addresses=<addr>,<addr>,...` query parameter into a vec of
+/// raw script bytes. Each token is legacy 64-hex or bech32m for this node's
+/// network (issue #36). Caller has already enforced the per-conn cap.
 fn parse_addresses(query: &str) -> Result<Vec<Vec<u8>>, String> {
     // query is everything after `?`. We only care about the `addresses=`
     // pair; ignore any others (forward-compat for future params).
@@ -97,17 +100,11 @@ fn parse_addresses(query: &str) -> Result<Vec<Vec<u8>>, String> {
         return Err("empty addresses list".into());
     }
     let mut out = Vec::new();
+    let network = crate::types::address::current_network();
     for token in raw.split(',') {
-        let bytes = hex::decode(token)
-            .map_err(|e| format!("address `{}` is not hex: {}", token, e))?;
-        if bytes.len() != 32 {
-            return Err(format!(
-                "address must decode to 32 bytes, `{}` gave {}",
-                token,
-                bytes.len()
-            ));
-        }
-        out.push(bytes);
+        let bytes = crate::types::address::parse_any(token, network)
+            .map_err(|e| format!("invalid address `{}`: {}", token, e))?;
+        out.push(bytes.to_vec());
     }
     Ok(out)
 }
@@ -355,6 +352,48 @@ mod tests {
     #[test]
     fn parse_addresses_rejects_non_hex() {
         assert!(parse_addresses("addresses=notarealhex").is_err());
+    }
+
+    #[test]
+    fn parse_addresses_accepts_bech32m_alongside_hex() {
+        use crate::types::address;
+        let s1 = vec![0xaa; 32];
+        let s2 = [0xbb; 32];
+        let net = address::current_network();
+        // Mixed list: one legacy hex, one bech32m — both filter on the same
+        // raw script bytes the (hex-only) emit side will publish.
+        let q = format!(
+            "addresses={},{}",
+            hex::encode(&s1),
+            address::encode(&s2, net)
+        );
+        let parsed = parse_addresses(&q).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], s1);
+        assert_eq!(parsed[1], s2.to_vec());
+    }
+
+    #[test]
+    fn parse_addresses_rejects_wrong_network_with_specific_error() {
+        use crate::types::address;
+        let net = address::current_network();
+        // Lib unit tests never bind the devnet domain, so Devnet is foreign
+        // here; keep the fallback so the test can't silently invert.
+        let other = if net == address::Network::Devnet {
+            address::Network::Mainnet
+        } else {
+            address::Network::Devnet
+        };
+        let q = format!("addresses={}", address::encode(&[0xcc; 32], other));
+        let err = parse_addresses(&q).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "{} address not valid on this {} node",
+                other, net
+            )),
+            "wrong-network error must be specific, got: {}",
+            err
+        );
     }
 
     #[test]

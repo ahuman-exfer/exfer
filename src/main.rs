@@ -361,7 +361,7 @@ enum WalletCommands {
         /// Wallet key file
         #[arg(long, default_value = "wallet.key")]
         wallet: PathBuf,
-        /// Recipient pubkey hash (hex)
+        /// Recipient address (64-char hex or bech32m)
         #[arg(long)]
         to: String,
         /// Amount: integer in exfers, or "10 EXFER" / "10EXFER" for whole units
@@ -501,7 +501,7 @@ enum ScriptCommands {
         tx_id: String,
         #[arg(long, default_value = "0")]
         output_index: u32,
-        /// Destination address (hex, 64 chars)
+        /// Destination address (64-char hex or bech32m)
         #[arg(long)]
         to: String,
         #[arg(long, default_value = "100000", value_parser = parse_amount)]
@@ -576,7 +576,7 @@ enum ScriptCommands {
         tx_id: String,
         #[arg(long, default_value = "0")]
         output_index: u32,
-        /// Destination address (hex, 64 chars)
+        /// Destination address (64-char hex or bech32m)
         #[arg(long)]
         to: String,
         /// All three pubkeys for script reconstruction
@@ -693,7 +693,7 @@ enum ScriptCommands {
         tx_id: String,
         #[arg(long, default_value = "0")]
         output_index: u32,
-        /// Destination address (hex, 64 chars)
+        /// Destination address (64-char hex or bech32m)
         #[arg(long)]
         to: String,
         #[arg(long)]
@@ -719,7 +719,7 @@ enum ScriptCommands {
         tx_id: String,
         #[arg(long, default_value = "0")]
         output_index: u32,
-        /// Destination address (hex, 64 chars)
+        /// Destination address (64-char hex or bech32m)
         #[arg(long)]
         to: String,
         #[arg(long)]
@@ -1165,20 +1165,14 @@ async fn main() {
                 rpc: rpc_url,
             } => {
                 let w = load_wallet_interactive(&path);
-                let recipient_bytes = match hex::decode(&to) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("ERROR: invalid hex for recipient: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                if recipient_bytes.len() != 32 {
-                    eprintln!("recipient must be 32 bytes (64 hex chars)");
-                    std::process::exit(1);
+                // Establish the signing domain BEFORE parsing the recipient:
+                // against a devnet node this is what enters devnet mode
+                // (issue #32), so `current_network()` accepts xfd1... below.
+                // The later call inside the RPC branch is a no-op re-check.
+                if let Some(ref url) = rpc_url {
+                    ensure_domain_or_exit(url);
                 }
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&recipient_bytes);
-                let recipient = Hash256(hash);
+                let recipient = Hash256(parse_address_arg(&to, "recipient"));
 
                 let (utxo_set, tip_height) = if let Some(ref url) = rpc_url {
                     // Establish the signing domain against this node before
@@ -1784,7 +1778,8 @@ async fn main() {
                 let w_b = load_wallet_interactive(&path2);
                 let pk_a = w_a.pubkey();
                 let pk_b = w_b.pubkey();
-                let dest = parse_pubkey_hex(&to, "to");
+                ensure_domain_or_exit(&rpc);
+                let dest = parse_address_arg(&to, "to");
                 let expected_script = script::serialize_program(&covenants::multisig::multisig_2of2(&pk_a, &pk_b));
                 let (lock_tx_id, value, _locked_script) = fetch_lock_tx_output(&rpc, &tx_id_hex, output_index, &expected_script);
                 let mut tx = build_spend_tx(lock_tx_id, output_index, value, fee, dest.to_vec());
@@ -1879,7 +1874,8 @@ async fn main() {
             } => {
                 let w1 = load_wallet_interactive(&path);
                 let w2 = load_wallet_interactive(&path2);
-                let dest = parse_pubkey_hex(&to, "to");
+                ensure_domain_or_exit(&rpc);
+                let dest = parse_address_arg(&to, "to");
                 let pk_a = parse_pubkey_hex(&pubkey_a, "pubkey_a");
                 let pk_b = parse_pubkey_hex(&pubkey_b, "pubkey_b");
                 let pk_c = parse_pubkey_hex(&pubkey_c, "pubkey_c");
@@ -2003,7 +1999,8 @@ async fn main() {
             } => {
                 let w_a = load_wallet_interactive(&path);
                 let w_b = load_wallet_interactive(&path2);
-                let dest = parse_pubkey_hex(&to, "to");
+                ensure_domain_or_exit(&rpc);
+                let dest = parse_address_arg(&to, "to");
                 let pk_a = parse_pubkey_hex(&party_a, "party_a");
                 let pk_b = parse_pubkey_hex(&party_b, "party_b");
                 let pk_arb = parse_pubkey_hex(&arbiter, "arbiter");
@@ -2029,7 +2026,8 @@ async fn main() {
                 party_a, party_b, timeout, fee, rpc, json,
             } => {
                 let w = load_wallet_interactive(&path);
-                let dest = parse_pubkey_hex(&to, "to");
+                ensure_domain_or_exit(&rpc);
+                let dest = parse_address_arg(&to, "to");
                 let pk_a = parse_pubkey_hex(&party_a, "party_a");
                 let pk_b = parse_pubkey_hex(&party_b, "party_b");
                 let pk_arb = w.pubkey();
@@ -2768,6 +2766,28 @@ fn parse_pubkey_hex(hex_str: &str, name: &str) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     arr
+}
+
+/// Parse a destination ADDRESS argument: legacy 64-hex (bit-for-bit the old
+/// `hex::decode` behavior) or bech32m for this node's network (issue #36).
+/// Pubkeys, tx ids, hash locks and preimages stay hex-only — bech32m carries
+/// an address hash, nothing else.
+fn parse_address_arg(s: &str, name: &str) -> [u8; 32] {
+    types::address::parse_any(s, types::address::current_network()).unwrap_or_else(|e| {
+        eprintln!("ERROR: invalid {}: {}", name, e);
+        std::process::exit(1);
+    })
+}
+
+/// Establish the node's signature domain before any address parsing, so a
+/// devnet node has entered devnet mode (issue #32 — the CLI's only runtime
+/// devnet marker) by the time `current_network()` selects the accepted
+/// bech32m HRP. Idempotent: later re-checks on the same flow are no-ops.
+fn ensure_domain_or_exit(rpc: &str) {
+    if let Err(e) = wallet::auth::ensure_signature_domain(rpc) {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    }
 }
 
 /// Fetch and authenticate a covenant lock-tx output via RPC.

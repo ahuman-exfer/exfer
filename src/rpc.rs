@@ -8,6 +8,7 @@
 use crate::mempool::MempoolAddressTx;
 use crate::network::sync::Node;
 use crate::rpc_sse;
+use crate::types::address;
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
@@ -462,6 +463,17 @@ async fn handle_get_block_height(id: serde_json::Value, node: &Arc<Node>) -> Rpc
 // get_balance
 // ---------------------------------------------------------------------------
 
+/// Decode a single `address` param: legacy 64-hex or bech32m for this node's
+/// network (issue #36). Legacy hex keeps `hex::decode` semantics bit-for-bit
+/// (mixed-case hex stays accepted); bech32m failures surface the codec's
+/// specific message (bad checksum, wrong network, mixed case) to the caller.
+/// Addresses in responses stay 64-hex — this is parse-side only.
+fn decode_address_param(s: &str) -> Result<Vec<u8>, String> {
+    address::parse_any(s, address::current_network())
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Deserialize)]
 struct GetBalanceParams {
     address: String,
@@ -477,20 +489,10 @@ async fn handle_get_balance(
         Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
     };
 
-    let addr_bytes = match hex::decode(&parsed.address) {
+    let addr_bytes = match decode_address_param(&parsed.address) {
         Ok(b) => b,
-        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, e),
     };
-    if addr_bytes.len() != 32 {
-        return RpcResponse::err(
-            id,
-            INVALID_PARAMS,
-            format!(
-                "Address must be 32 bytes (64 hex chars), got {}",
-                addr_bytes.len()
-            ),
-        );
-    }
 
     // Use dedicated method to minimize read-lock hold time.
     let current_height = node.tip.read().await.height.saturating_add(1);
@@ -668,20 +670,10 @@ async fn handle_get_address_utxos(
         Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
     };
 
-    let addr_bytes = match hex::decode(&parsed.address) {
+    let addr_bytes = match decode_address_param(&parsed.address) {
         Ok(b) => b,
-        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, e),
     };
-    if addr_bytes.len() != 32 {
-        return RpcResponse::err(
-            id,
-            INVALID_PARAMS,
-            format!(
-                "Address must be 32 bytes (64 hex chars), got {}",
-                addr_bytes.len()
-            ),
-        );
-    }
 
     // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
     let paged =
@@ -813,20 +805,10 @@ async fn handle_get_address_mempool(
         Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid params: {}", e)),
     };
 
-    let addr_bytes = match hex::decode(&parsed.address) {
+    let addr_bytes = match decode_address_param(&parsed.address) {
         Ok(b) => b,
-        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+        Err(e) => return RpcResponse::err(id, INVALID_PARAMS, e),
     };
-    if addr_bytes.len() != 32 {
-        return RpcResponse::err(
-            id,
-            INVALID_PARAMS,
-            format!(
-                "Address must be 32 bytes (64 hex chars), got {}",
-                addr_bytes.len()
-            ),
-        );
-    }
 
     let tip_height = node.tip.read().await.height;
     // Brief mempool lock: collect the address-scoped view, format JSON after.
@@ -968,9 +950,11 @@ struct BatchAddressParams {
     addresses: Vec<String>,
 }
 
-/// Validate + hex-decode a batch address list into 32-byte scripts, paired with
-/// the original hex string for echoing back. Returns an error response on the
-/// first malformed or out-of-bounds input.
+/// Validate + decode a batch address list into 32-byte scripts, paired with
+/// the original input string for echoing back. Each entry is legacy 64-hex or
+/// bech32m for this node's network (issue #36) — same rules as the single-
+/// address params. Returns an error response on the first malformed or
+/// out-of-bounds input.
 fn decode_batch_addresses(
     id: &serde_json::Value,
     addresses: &[String],
@@ -995,35 +979,27 @@ fn decode_batch_addresses(
     }
     let mut decoded = Vec::with_capacity(addresses.len());
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let network = address::current_network();
     for addr in addresses {
-        let bytes = match hex::decode(addr) {
-            Ok(b) => b,
+        let bytes = match address::parse_any(addr, network) {
+            Ok(b) => b.to_vec(),
             Err(e) => {
                 return Err(RpcResponse::err(
                     id.clone(),
                     INVALID_PARAMS,
-                    format!("Invalid hex in '{}': {}", addr, e),
+                    format!("Invalid address '{}': {}", addr, e),
                 ))
             }
         };
-        if bytes.len() != 32 {
-            return Err(RpcResponse::err(
-                id.clone(),
-                INVALID_PARAMS,
-                format!(
-                    "Address '{}' must be 32 bytes (64 hex chars), got {}",
-                    addr,
-                    bytes.len()
-                ),
-            ));
-        }
         // Dedup by decoded script. A repeated address (e.g. `addresses=[S; 100]`)
         // must not multiply the downstream per-address work — for the mempool
         // batch that means N scans of the same `by_script[S]` under one lock
         // hold and N copies of the same view in the response. Legit clients
         // pass distinct addresses, so this is a no-op for them and preserves
         // Nth-in / Nth-out pairing. Validation still runs for every entry, so
-        // a malformed duplicate is still rejected.
+        // a malformed duplicate is still rejected. Decoded-byte dedup also
+        // collapses one address given in both encodings (hex + bech32m); the
+        // echoed string is the first-seen spelling.
         if seen.insert(bytes.clone()) {
             decoded.push((addr.clone(), bytes));
         }
@@ -1790,6 +1766,81 @@ mod rpc_client_tests {
             vec![a, b, c],
             "distinct kept in order, trailing dup dropped"
         );
+    }
+
+    #[test]
+    fn decode_address_param_accepts_both_encodings() {
+        let bytes = [0xABu8; 32];
+        let net = address::current_network();
+        let hex_form = hex::encode(bytes);
+        let b32_form = address::encode(&bytes, net);
+
+        // bech32m param decodes to the exact same script bytes as hex.
+        assert_eq!(decode_address_param(&hex_form).unwrap(), bytes.to_vec());
+        assert_eq!(decode_address_param(&b32_form).unwrap(), bytes.to_vec());
+        // Legacy hex keeps hex::decode semantics: mixed-case hex accepted.
+        assert_eq!(
+            decode_address_param(&hex_form.to_uppercase()).unwrap(),
+            bytes.to_vec()
+        );
+        // All-uppercase bech32m accepted (QR form); mixed case rejected.
+        assert_eq!(
+            decode_address_param(&b32_form.to_uppercase()).unwrap(),
+            bytes.to_vec()
+        );
+        let mut mixed = b32_form.clone();
+        mixed.replace_range(0..1, "X");
+        assert!(decode_address_param(&mixed)
+            .unwrap_err()
+            .contains("Mixed-case"));
+    }
+
+    #[test]
+    fn decode_address_param_wrong_network_is_specific() {
+        let bytes = [0xABu8; 32];
+        let net = address::current_network();
+        // Lib unit tests never bind the devnet domain (asserted in
+        // types::address::tests), so Devnet is always foreign here; keep the
+        // fallback anyway so the test can't silently invert.
+        let other = if net == address::Network::Devnet {
+            address::Network::Mainnet
+        } else {
+            address::Network::Devnet
+        };
+        let err = decode_address_param(&address::encode(&bytes, other)).unwrap_err();
+        assert_eq!(
+            err,
+            format!("{} address not valid on this {} node", other, net)
+        );
+    }
+
+    #[test]
+    fn decode_batch_addresses_dedups_across_encodings() {
+        let id = serde_json::Value::from(1);
+        let bytes = [0x5Eu8; 32];
+        let hex_form = hex::encode(bytes);
+        let b32_form = address::encode(&bytes, address::current_network());
+
+        // One address pasted in both encodings is ONE decoded script — the
+        // downstream per-address work must not double. First-seen spelling
+        // is the one echoed back.
+        let decoded = match decode_batch_addresses(&id, &[hex_form.clone(), b32_form.clone()]) {
+            Ok(d) => d,
+            Err(_) => panic!("both encodings of a valid address should decode"),
+        };
+        assert_eq!(decoded.len(), 1, "cross-encoding dup must dedup to one");
+        assert_eq!(decoded[0].0, hex_form);
+        assert_eq!(decoded[0].1, bytes.to_vec());
+
+        // A malformed entry still names the offending input string.
+        let bad = "xf1qqqqqq".to_string();
+        match decode_batch_addresses(&id, &[hex_form, bad.clone()]) {
+            Ok(_) => panic!("malformed bech32m must be rejected"),
+            Err(resp) => {
+                let msg = resp.error.expect("error response").message;
+                assert!(msg.contains(&bad), "error must name the input: {}", msg);
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,540 @@
+{
+  "description": "Canonical exfer address-codec test vectors (issue #36). Encoding is bech32m (BIP-350) over the raw 32-byte address hash, no witness version byte. HRPs are provisional pending founder sign-off. Entries with network=any are BIP-350 official vectors asserted against the raw bech32m decoder; all others run through parse_any(input, network). Generated deterministically by gen_address_vectors; do not edit by hand.",
+  "hrp": {
+    "devnet": "xfd",
+    "mainnet": "xf",
+    "testnet": "xft"
+  },
+  "vectors": [
+    {
+      "canonical": "xf1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2znvdy",
+      "desc": "mainnet round-trip: all-zero payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_mainnet_zero",
+      "input": "xf1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2znvdy",
+      "network": "mainnet",
+      "payload_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "canonical": "xf1lllllllllllllllllllllllllllllllllllllllllllllllllllsgusayn",
+      "desc": "mainnet round-trip: all-0xff payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_mainnet_ones",
+      "input": "xf1lllllllllllllllllllllllllllllllllllllllllllllllllllsgusayn",
+      "network": "mainnet",
+      "payload_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "canonical": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "desc": "mainnet round-trip: asymmetric payload 0x00..0x1f",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_mainnet_asym",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xf10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzs6w0pf6",
+      "desc": "mainnet round-trip: domain_hash(EXFER-ADDR, pubkey 0x01..0x20), a real Phase 1 address",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_mainnet_derived",
+      "input": "xf10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzs6w0pf6",
+      "network": "mainnet",
+      "payload_hex": "79ae16de8424208bd4862ee457a4e1e984ccc0f9042a7b870ad19f500c659b45"
+    },
+    {
+      "canonical": "xft1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6sf7y9",
+      "desc": "testnet round-trip: all-zero payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_testnet_zero",
+      "input": "xft1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6sf7y9",
+      "network": "testnet",
+      "payload_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "canonical": "xft1lllllllllllllllllllllllllllllllllllllllllllllllllllscw20dj",
+      "desc": "testnet round-trip: all-0xff payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_testnet_ones",
+      "input": "xft1lllllllllllllllllllllllllllllllllllllllllllllllllllscw20dj",
+      "network": "testnet",
+      "payload_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "canonical": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snyzuyu",
+      "desc": "testnet round-trip: asymmetric payload 0x00..0x1f",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_testnet_asym",
+      "input": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snyzuyu",
+      "network": "testnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xft10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzs2u4nqm",
+      "desc": "testnet round-trip: domain_hash(EXFER-ADDR, pubkey 0x01..0x20), a real Phase 1 address",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_testnet_derived",
+      "input": "xft10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzs2u4nqm",
+      "network": "testnet",
+      "payload_hex": "79ae16de8424208bd4862ee457a4e1e984ccc0f9042a7b870ad19f500c659b45"
+    },
+    {
+      "canonical": "xfd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqxynu3f",
+      "desc": "devnet round-trip: all-zero payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_devnet_zero",
+      "input": "xfd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqxynu3f",
+      "network": "devnet",
+      "payload_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "canonical": "xfd1lllllllllllllllllllllllllllllllllllllllllllllllllllsy6sdc7",
+      "desc": "devnet round-trip: all-0xff payload",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_devnet_ones",
+      "input": "xfd1lllllllllllllllllllllllllllllllllllllllllllllllllllsy6sdc7",
+      "network": "devnet",
+      "payload_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "canonical": "xfd1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s0sc73s",
+      "desc": "devnet round-trip: asymmetric payload 0x00..0x1f",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_devnet_asym",
+      "input": "xfd1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s0sc73s",
+      "network": "devnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xfd10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzskg034h",
+      "desc": "devnet round-trip: domain_hash(EXFER-ADDR, pubkey 0x01..0x20), a real Phase 1 address",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_devnet_derived",
+      "input": "xfd10xhpdh5yyssgh4yx9mj90f8paxzves8eqs48hpc26x04qrr9ndzskg034h",
+      "network": "devnet",
+      "payload_hex": "79ae16de8424208bd4862ee457a4e1e984ccc0f9042a7b870ad19f500c659b45"
+    },
+    {
+      "canonical": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "desc": "all-uppercase form is accepted; canonical stays lowercase",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_upper_mainnet",
+      "input": "XF1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SRKCWDA",
+      "network": "mainnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snyzuyu",
+      "desc": "all-uppercase form is accepted; canonical stays lowercase",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_upper_testnet",
+      "input": "XFT1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SNYZUYU",
+      "network": "testnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": null,
+      "desc": "single uppercased character in an otherwise lowercase address",
+      "error_class": "mixed_case",
+      "expect": "err",
+      "id": "err_mixed_case_last_char",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwdA",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "uppercased HRP character with lowercase remainder",
+      "error_class": "mixed_case",
+      "expect": "err",
+      "id": "err_mixed_case_hrp_char",
+      "input": "Xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "single-character substitution at the first_data position",
+      "error_class": "bad_checksum",
+      "expect": "err",
+      "id": "err_substitution_first_data",
+      "input": "xf1pqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "single-character substitution at the middle position",
+      "error_class": "bad_checksum",
+      "expect": "err",
+      "id": "err_substitution_middle",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpuqpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "single-character substitution at the last_checksum position",
+      "error_class": "bad_checksum",
+      "expect": "err",
+      "id": "err_substitution_last_checksum",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwdq",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "first distinct adjacent character pair in the data part swapped",
+      "error_class": "bad_checksum",
+      "expect": "err",
+      "id": "err_transposition",
+      "input": "xf1qqsqyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "same payload and HRP but bech32 (BIP-173) checksum instead of bech32m",
+      "error_class": "wrong_checksum_variant",
+      "expect": "err",
+      "id": "err_bech32_not_m_mainnet",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sk2gzgl",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "same payload and HRP but bech32 (BIP-173) checksum instead of bech32m",
+      "error_class": "wrong_checksum_variant",
+      "expect": "err",
+      "id": "err_bech32_not_m_testnet",
+      "input": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sxcjsp7",
+      "network": "testnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "testnet address parsed on a mainnet node",
+      "error_class": "wrong_network",
+      "expect": "err",
+      "id": "err_wrong_network_testnet_on_mainnet",
+      "input": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snyzuyu",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "devnet address parsed on a mainnet node",
+      "error_class": "wrong_network",
+      "expect": "err",
+      "id": "err_wrong_network_devnet_on_mainnet",
+      "input": "xfd1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s0sc73s",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "mainnet address parsed on a testnet node",
+      "error_class": "wrong_network",
+      "expect": "err",
+      "id": "err_wrong_network_mainnet_on_testnet",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "testnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "mainnet address parsed on a devnet node",
+      "error_class": "wrong_network",
+      "expect": "err",
+      "id": "err_wrong_network_mainnet_on_devnet",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "devnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum-valid bech32m under foreign HRP bc",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_unknown_hrp_bc",
+      "input": "bc1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sp695jg",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum-valid bech32m under foreign HRP cosmos",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_unknown_hrp_cosmos",
+      "input": "cosmos1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snpcy4v",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum-valid bech32m carrying a 31-byte payload",
+      "error_class": "bad_payload_length",
+      "expect": "err",
+      "id": "err_payload_31_bytes",
+      "input": "xf14w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4vry798l",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum-valid bech32m carrying a 33-byte payload",
+      "error_class": "bad_payload_length",
+      "expect": "err",
+      "id": "err_payload_33_bytes",
+      "input": "xf14w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46kyxqgv6",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum recomputed over a final data character with non-zero padding bits",
+      "error_class": "bad_padding",
+      "expect": "err",
+      "id": "err_nonzero_padding",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc037qvms0",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "empty string",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_empty",
+      "input": "",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "bech32 charset characters but no separator",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_no_separator",
+      "input": "xfqqqqqqqq",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "character outside the bech32 charset in the data part",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_bad_charset_char",
+      "input": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugbzysnzs23v9ccrydpk8qarc0srkcwda",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "desc": "legacy 64-hex, lowercase",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_hex_lower",
+      "input": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "network": "mainnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xf1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srkcwda",
+      "desc": "legacy 64-hex, uppercase (hex::decode semantics)",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_hex_upper",
+      "input": "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+      "network": "mainnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xft1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0snyzuyu",
+      "desc": "legacy 64-hex, mixed case stays accepted bit-for-bit (hex::decode semantics)",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_hex_mixed_case",
+      "input": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "network": "testnet",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "canonical": "xf1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs3hlp82",
+      "desc": "64-hex consisting of '1' characters must route to hex, not bech32",
+      "error_class": null,
+      "expect": "ok",
+      "id": "ok_hex_contains_separator_char",
+      "input": "1111111111111111111111111111111111111111111111111111111111111111",
+      "network": "mainnet",
+      "payload_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "canonical": null,
+      "desc": "63 hex chars (must be exactly 64)",
+      "error_class": "bad_hex_length",
+      "expect": "err",
+      "id": "err_hex_63_chars",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "65 hex chars (must be exactly 64)",
+      "error_class": "bad_hex_length",
+      "expect": "err",
+      "id": "err_hex_65_chars",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "64 chars but one is 'g', not a hex digit",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_hex_invalid_digit",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "0x-prefixed hex is not accepted",
+      "error_class": "unknown_format",
+      "expect": "err",
+      "id": "err_hex_0x_prefix",
+      "input": "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "network": "mainnet",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "BIP-350 official valid bech32m string",
+      "error_class": null,
+      "expect": "ok",
+      "id": "bip350_valid_upper_empty_data",
+      "input": "A1LQFN3A",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "BIP-350 official valid bech32m string",
+      "error_class": null,
+      "expect": "ok",
+      "id": "bip350_valid_lower_empty_data",
+      "input": "a1lqfn3a",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "BIP-350 official valid bech32m string",
+      "error_class": null,
+      "expect": "ok",
+      "id": "bip350_valid_abcdef",
+      "input": "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "BIP-350 official valid bech32m string",
+      "error_class": null,
+      "expect": "ok",
+      "id": "bip350_valid_split",
+      "input": "split1checkupstagehandshakeupstreamerranterredcaperredlc445v",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "BIP-350 official valid bech32m string",
+      "error_class": null,
+      "expect": "ok",
+      "id": "bip350_valid_punct_hrp",
+      "input": "?1v759aa",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "no separator character",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_no_separator",
+      "input": "qyrz8wqd2c9m",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "empty HRP",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_empty_hrp",
+      "input": "1qyrz8wqd2c9m",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "invalid data character",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_data_char",
+      "input": "y1b0jsk6g",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "checksum calculated with uppercase HRP",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_upper_hrp_checksum",
+      "input": "M1VUXWEZ",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "too-short checksum",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_short_checksum",
+      "input": "in1muywd",
+      "network": "any",
+      "payload_hex": null
+    },
+    {
+      "canonical": null,
+      "desc": "invalid character in checksum",
+      "error_class": null,
+      "expect": "err",
+      "id": "bip350_invalid_checksum_char",
+      "input": "mm1crxm3i",
+      "network": "any",
+      "payload_hex": null
+    }
+  ]
+}
