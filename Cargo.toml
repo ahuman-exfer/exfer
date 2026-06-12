@@ -35,6 +35,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Hex encoding for display
 hex = "0.4"
 
+# Checksummed address encoding (bech32m, issue #36). Always-on (not gated
+# behind a node-only dep set): the address codec must stay in the
+# wasm-buildable subset (see feat/wasm-core).
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -89,3 +94,8 @@ required-features = ["dev-harness"]
 name = "bench_phase3a"
 path = "src/bin/bench_phase3a.rs"
 required-features = ["bench-diagnostics"]
+
+[[bin]]
+name = "gen_address_vectors"
+path = "src/bin/gen_address_vectors.rs"
+required-features = ["dev-harness"]
