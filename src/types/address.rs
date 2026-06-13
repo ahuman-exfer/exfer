@@ -24,8 +24,9 @@ use super::hash::Hash256;
 
 // ── Human-readable parts ──
 //
-// PROVISIONAL pending founder sign-off in issue #36. Defined once here so a
-// different choice later is a one-line change.
+// FINAL per the PR #38 format sign-off: bech32m IS the exfer address
+// format, and xf / xft / xfd are FINAL. Defined once here so a different
+// choice later is a one-line change.
 
 pub const HRP_MAINNET: &str = "xf";
 pub const HRP_TESTNET: &str = "xft";

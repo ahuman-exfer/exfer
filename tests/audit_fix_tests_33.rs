@@ -54,6 +54,7 @@ fn p2a_wallet_rejects_sub_dust_amount() {
         1000,
         &utxo_set,
         1000,
+        None,
     );
     assert!(
         matches!(result, Err(WalletError::DustOutput(_))),
@@ -94,6 +95,7 @@ fn p2a_wallet_folds_sub_dust_change_into_fee() {
             1000,
             &utxo_set,
             1000,
+            None,
         )
         .expect("should succeed with sub-dust change folded into fee");
     // Should have only 1 output (recipient), no change output

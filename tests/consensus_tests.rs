@@ -934,6 +934,61 @@ fn test_tx_rule10_size_limit() {
     ));
 }
 
+#[test]
+fn test_tx_level_datum_size_boundary_via_wallet_build() {
+    // Issue #37: a wallet-built tx with (Some(datum), None) — inline datum,
+    // no datum_hash — traverses the tx-level datum size check. Exactly
+    // MAX_DATUM_SIZE passes; one byte over fails DatumOversized.
+    use exfer::wallet::Wallet;
+
+    let w = Wallet::generate();
+    let mut utxo_set = UtxoSet::new();
+    let _ = utxo_set.insert(
+        OutPoint::new(Hash256::sha256(b"datum_fund"), 0),
+        UtxoEntry {
+            output: TxOutput::new_p2pkh(1_000_000_000, &w.pubkey()),
+            height: 0,
+            is_coinbase: false,
+        },
+    );
+    let recipient = Hash256::sha256(b"datum_recipient");
+
+    // Exactly MAX_DATUM_SIZE: passes tx-level validation.
+    let tx = w
+        .build_transaction(
+            recipient,
+            500_000_000,
+            100_000,
+            &utxo_set,
+            1000,
+            Some(vec![0xAA; MAX_DATUM_SIZE]),
+        )
+        .unwrap();
+    assert_eq!(tx.outputs[0].datum.as_ref().unwrap().len(), MAX_DATUM_SIZE);
+    assert!(tx.outputs[0].datum_hash.is_none());
+    validate_transaction(&tx, &utxo_set, 1000)
+        .expect("datum of exactly MAX_DATUM_SIZE must validate");
+
+    // One byte over: rejected as DatumOversized on the recipient output.
+    let tx_over = w
+        .build_transaction(
+            recipient,
+            500_000_000,
+            100_000,
+            &utxo_set,
+            1000,
+            Some(vec![0xAA; MAX_DATUM_SIZE + 1]),
+        )
+        .unwrap();
+    match validate_transaction(&tx_over, &utxo_set, 1000) {
+        Err(ValidationError::DatumOversized { output_index, size }) => {
+            assert_eq!(output_index, 0);
+            assert_eq!(size, MAX_DATUM_SIZE + 1);
+        }
+        other => panic!("expected DatumOversized, got {:?}", other),
+    }
+}
+
 // ======================================================================
 // 8.2 Coinbase Validation Tests (Section 8.2)
 // ======================================================================

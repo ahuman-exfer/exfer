@@ -370,6 +370,9 @@ enum WalletCommands {
         /// Fee: integer in exfers, or "0.001 EXFER" for whole units
         #[arg(long, default_value = "100000", value_parser = parse_amount)]
         fee: u64,
+        /// Optional datum (hex), attached to the recipient output (max 4096 bytes)
+        #[arg(long)]
+        datum: Option<String>,
         /// Data directory
         #[arg(long, default_value = "data")]
         datadir: PathBuf,
@@ -1160,10 +1163,43 @@ async fn main() {
                 to,
                 amount,
                 fee,
+                datum,
                 datadir,
                 json,
                 rpc: rpc_url,
             } => {
+                // Decode and bound the datum FIRST — before the passphrase
+                // prompt, any RPC, and any UTXO work — so a bad argument
+                // fails cleanly instead of handing consensus a transaction
+                // it will reject (issue #37).
+                let datum_bytes: Option<Vec<u8>> = match datum {
+                    Some(ref s) => match hex::decode(s) {
+                        Ok(b) => {
+                            if b.is_empty() {
+                                eprintln!(
+                                    "ERROR: datum is empty (omit --datum to send without one)"
+                                );
+                                std::process::exit(1);
+                            }
+                            if b.len() > types::MAX_DATUM_SIZE {
+                                eprintln!(
+                                    "ERROR: datum is {} bytes, exceeds MAX_DATUM_SIZE {}",
+                                    b.len(),
+                                    types::MAX_DATUM_SIZE
+                                );
+                                std::process::exit(1);
+                            }
+                            Some(b)
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: invalid datum hex: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    None => None,
+                };
+                // Canonical lowercase echo for the output paths below.
+                let datum_hex = datum_bytes.as_ref().map(hex::encode);
                 let w = load_wallet_interactive(&path);
                 // Establish the signing domain BEFORE parsing the recipient:
                 // against a devnet node this is what enters devnet mode
@@ -1285,14 +1321,20 @@ async fn main() {
                     rebuild_utxo_set(&datadir)
                 };
 
-                let tx =
-                    match w.build_transaction(recipient, amount, fee, &utxo_set, tip_height + 1) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("ERROR: failed to build transaction: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
+                let tx = match w.build_transaction(
+                    recipient,
+                    amount,
+                    fee,
+                    &utxo_set,
+                    tip_height + 1,
+                    datum_bytes,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("ERROR: failed to build transaction: {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 let tx_id = match tx.tx_id() {
                     Ok(id) => id,
                     Err(e) => {
@@ -1318,7 +1360,7 @@ async fn main() {
                     ) {
                         Ok(result) => {
                             if json {
-                                let j = serde_json::json!({
+                                let mut j = serde_json::json!({
                                     "tx_id": tx_id.to_string(),
                                     "size": serialized.len(),
                                     "tip_height": tip_height,
@@ -1326,11 +1368,19 @@ async fn main() {
                                     "rpc_url": url,
                                     "rpc_result": result,
                                 });
+                                // Echo the attached datum so an agent can
+                                // confirm what landed on the recipient output.
+                                if let Some(ref d) = datum_hex {
+                                    j["datum"] = serde_json::json!(d);
+                                }
                                 println!("{}", serde_json::to_string_pretty(&j).unwrap());
                             } else {
                                 println!("TxId:      {}", tx_id);
                                 println!("Size:      {} bytes", serialized.len());
                                 println!("Tip:       height {}", tip_height);
+                                if let Some(ref d) = datum_hex {
+                                    println!("Datum:     {}", d);
+                                }
                                 println!("Submitted: via RPC {}", url);
                             }
                         }
@@ -1341,17 +1391,25 @@ async fn main() {
                         }
                     }
                 } else if json {
-                    let j = serde_json::json!({
+                    let mut j = serde_json::json!({
                         "tx_id": tx_id.to_string(),
                         "size": serialized.len(),
                         "tip_height": tip_height,
                         "raw": hex::encode(&serialized),
                     });
+                    // Echo the attached datum so an agent can confirm what
+                    // landed on the recipient output.
+                    if let Some(ref d) = datum_hex {
+                        j["datum"] = serde_json::json!(d);
+                    }
                     println!("{}", serde_json::to_string_pretty(&j).unwrap());
                 } else {
                     println!("TxId:    {}", tx_id);
                     println!("Size:    {} bytes", serialized.len());
                     println!("Tip:     height {}", tip_height);
+                    if let Some(ref d) = datum_hex {
+                        println!("Datum:   {}", d);
+                    }
                     println!("Raw:     {}", hex::encode(&serialized));
                 }
             }
