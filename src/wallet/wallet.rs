@@ -228,6 +228,10 @@ impl Wallet {
     /// Returns the signed transaction, or an error if insufficient funds.
     /// Rejects recipient amounts below DUST_THRESHOLD; folds sub-dust change into fee.
     /// Excludes immature coinbase outputs from coin selection.
+    /// An optional `datum` attaches to the recipient output ONLY (the change
+    /// output stays datum-free); `datum_hash` is left None — size is the only
+    /// consensus rule on a hash-free inline datum, and the caller (CLI) is
+    /// responsible for enforcing MAX_DATUM_SIZE before building.
     pub fn build_transaction(
         &self,
         recipient: Hash256,
@@ -235,6 +239,7 @@ impl Wallet {
         fee: u64,
         utxo_set: &UtxoSet,
         current_height: u64,
+        datum: Option<Vec<u8>>,
     ) -> Result<Transaction, WalletError> {
         use crate::types::DUST_THRESHOLD;
 
@@ -273,11 +278,12 @@ impl Wallet {
             })
             .collect();
 
-        // Build outputs
+        // Build outputs — the datum (if any) rides on the recipient output
+        // only; datum_hash stays None (size-only consensus path).
         let mut outputs = vec![TxOutput {
             value: amount,
             script: recipient.0.to_vec(),
-            datum: None,
+            datum,
             datum_hash: None,
         }];
 
@@ -560,7 +566,7 @@ mod tests {
 
         let recipient = Hash256::sha256(b"recipient_addr");
         let tx = w
-            .build_transaction(recipient, 500_000_000, 10_000, &utxo_set, 1000)
+            .build_transaction(recipient, 500_000_000, 10_000, &utxo_set, 1000, None)
             .unwrap();
 
         assert_eq!(tx.inputs.len(), 1);
@@ -580,12 +586,61 @@ mod tests {
     }
 
     #[test]
+    fn test_build_transaction_datum_on_recipient_output_only() {
+        let w = Wallet::generate();
+        let mut utxo_set = UtxoSet::new();
+
+        let outpoint = OutPoint::new(Hash256::sha256(b"tx_datum"), 0);
+        utxo_set
+            .insert(
+                outpoint,
+                UtxoEntry {
+                    output: TxOutput::new_p2pkh(1_000_000_000, &w.pubkey()),
+                    height: 0,
+                    is_coinbase: false,
+                },
+            )
+            .expect("insert test UTXO");
+
+        let recipient = Hash256::sha256(b"recipient_addr");
+        let datum = b"arbitrary-test-payload".to_vec();
+        let tx = w
+            .build_transaction(
+                recipient,
+                500_000_000,
+                100_000,
+                &utxo_set,
+                1000,
+                Some(datum.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(tx.outputs.len(), 2); // payment + change
+        // Recipient output carries the datum, with datum_hash left None
+        // (size-only consensus path).
+        assert_eq!(tx.outputs[0].datum.as_deref(), Some(&datum[..]));
+        assert!(tx.outputs[0].datum_hash.is_none());
+        // Change output stays datum-free.
+        assert!(tx.outputs[1].datum.is_none());
+        assert!(tx.outputs[1].datum_hash.is_none());
+
+        // Signature still verifies over the datum-bearing outputs.
+        let sig_msg = tx.sig_message().unwrap();
+        let pubkey_bytes: [u8; 32] = tx.witnesses[0].witness[0..32].try_into().unwrap();
+        let sig_bytes: [u8; 64] = tx.witnesses[0].witness[32..96].try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        assert!(verifying_key.verify(&sig_msg, &sig).is_ok());
+    }
+
+    #[test]
     fn test_insufficient_funds() {
         let w = Wallet::generate();
         let utxo_set = UtxoSet::new();
 
         let recipient = Hash256::ZERO;
-        match w.build_transaction(recipient, 1000, 10, &utxo_set, 1000) {
+        match w.build_transaction(recipient, 1000, 10, &utxo_set, 1000, None) {
             Err(WalletError::InsufficientFunds) => {}
             other => panic!("expected InsufficientFunds, got {:?}", other),
         }
