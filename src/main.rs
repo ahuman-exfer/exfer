@@ -6,8 +6,10 @@
 ))]
 compile_error!(
     "testnet feature must not be used in release builds. \
-     This produces a binary with trivial difficulty and no genesis PoW check. \
-     Use debug builds for testnet, or add --features allow-testnet-release to override."
+     This enables testnet consensus parameters (low-difficulty 2^252 PoW, a \
+     separate genesis, and a min-difficulty floor) unsuitable for a mainnet \
+     release. Use debug builds for testnet, or add --features \
+     allow-testnet-release to override."
 );
 
 mod chain;
@@ -266,8 +268,8 @@ enum Commands {
     },
     /// Run an isolated single-node local chain for development & testing.
     /// Instant blocks, no networking, coinbase spendable after 1 block,
-    /// JSON-RPC + SSE on by default. Requires a testnet build
-    /// (`--features testnet`) for trivial difficulty.
+    /// JSON-RPC + SSE on by default. Requires a testnet-feature build
+    /// (`--features testnet`), which carries the devnet genesis + code path.
     Devnet {
         /// Data directory (safe to delete between runs).
         #[arg(long, default_value = "devnet-data")]
@@ -1003,15 +1005,17 @@ async fn main() {
             bind,
             miner_pubkey,
         } => {
-            // Devnet requires a trivial-difficulty build: its distinct genesis
-            // uses nonce=0, which only satisfies PoW under the testnet target,
-            // and at real difficulty devnet couldn't mine anyway. Fail clearly
-            // here rather than later on an opaque genesis PoW rejection.
-            // (Runtime `if cfg!` rather than `#[cfg]` so the rest of the arm
-            // stays reachable for the compiler — no unreachable-code warning.)
+            // Devnet requires a testnet-feature build: its distinct nonce=0
+            // genesis is produced by the devnet code path and is exempt from the
+            // startup genesis-PoW check; a mainnet build neither contains that
+            // genesis nor the exemption (and at mainnet difficulty devnet
+            // couldn't mine anyway). Fail clearly here rather than later on an
+            // opaque genesis PoW rejection. (Runtime `if cfg!` rather than
+            // `#[cfg]` so the rest of the arm stays reachable for the compiler —
+            // no unreachable-code warning.)
             if !cfg!(feature = "testnet") {
                 eprintln!(
-                    "ERROR: `exfer devnet` requires a trivial-difficulty build. \
+                    "ERROR: `exfer devnet` requires a testnet-feature build. \
                      Rebuild with `--features testnet` (release: `--features \
                      allow-testnet-release`)."
                 );
@@ -3155,7 +3159,7 @@ async fn run_node(
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
     // assume-valid on would wedge it at that height. A devnet always verifies
-    // its own (trivial-PoW) chain in full, regardless of the other flags.
+    // its own chain in full, regardless of the other flags.
     //
     // A `--features testnet` build is in the same boat: the public testnet has
     // its own low genesis and its tip lives far below the mainnet checkpoint
@@ -3320,17 +3324,27 @@ async fn run_node(
     };
     let expected_genesis_id = genesis.header.block_id();
 
-    // Validate genesis PoW — refuse to start with a placeholder nonce
-    if !crate::consensus::pow::verify_pow(&genesis.header).unwrap_or(false) {
-        #[cfg(not(feature = "testnet"))]
-        {
-            return Err(format!(
-                "Genesis block PoW is INVALID (nonce={}). \
-                 Run `cargo run --release --bin mine_genesis` to find a valid nonce before production launch.",
-                genesis.header.nonce
-            )
-            .into());
-        }
+    // Validate genesis PoW — refuse to start with a placeholder/stale nonce.
+    // Enforced for mainnet (2^248) AND the persistent testnet (2^252): both are
+    // real-PoW chains, so a stale TESTNET_GENESIS_NONCE (e.g. after a change to
+    // the testnet timestamp/witness without re-mining) must fail closed rather
+    // than seed a public datadir with an unmined genesis. Before this, the whole
+    // check was `#[cfg(not(feature="testnet"))]` — a holdover from the old
+    // trivial-0xFF testnet, so a testnet-feature build skipped it entirely.
+    // Exempt ONLY devnet: its genesis is intentionally not real-PoW-mined
+    // (nonce=0). Today `devnet_genesis_block()` pins the all-0xFF target so it
+    // would pass anyway, but gating on `!devnet` rather than relying on that
+    // pinning is the robust, intent-matching guard (and survives any future
+    // change to the devnet target). `devnet` is unreachable-true on a mainnet
+    // build (rejected earlier), so this is a no-op for mainnet runtime behavior.
+    if !devnet && !crate::consensus::pow::verify_pow(&genesis.header).unwrap_or(false) {
+        return Err(format!(
+            "Genesis block PoW is INVALID (nonce={}). Run the genesis miner \
+             (`mine_genesis` for mainnet, `mine_testnet_genesis` for testnet) \
+             to find a valid nonce before launch.",
+            genesis.header.nonce
+        )
+        .into());
     }
 
     // Foreign chain detection: if the database already has a tip, verify its

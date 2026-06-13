@@ -7,8 +7,10 @@
 ))]
 compile_error!(
     "testnet feature must not be used in release builds. \
-     This produces a binary with trivial difficulty and no genesis PoW check. \
-     Use debug builds for testnet, or add --features allow-testnet-release to override."
+     This enables testnet consensus parameters (low-difficulty 2^252 PoW, a \
+     separate genesis, and a min-difficulty floor) unsuitable for a mainnet \
+     release. Use debug builds for testnet, or add --features \
+     allow-testnet-release to override."
 );
 
 // Second guard: even with allow-testnet-release, release builds require

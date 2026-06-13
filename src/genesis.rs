@@ -25,8 +25,9 @@ use crate::types::VERSION;
 /// Fixed genesis timestamp: 2026-03-15T01:00:00Z
 const GENESIS_TIMESTAMP: u64 = 1773536400;
 
-/// Mined genesis nonce (satisfies Argon2id PoW at 2^248 target).
-/// Testnet uses a trivial difficulty target, so any nonce works there.
+/// Mined genesis nonce (satisfies Argon2id PoW at the mainnet 2^248 target).
+/// The persistent testnet has its own genuinely-mined nonce at 2^252
+/// ([`TESTNET_GENESIS_NONCE`]); devnet pins the all-0xFF target with nonce=0.
 const GENESIS_NONCE: u64 = 259;
 
 /// Build the genesis block template (everything except nonce).
