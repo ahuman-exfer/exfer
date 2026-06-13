@@ -2034,6 +2034,33 @@ impl Node {
         processed_ids
     }
 
+    /// Telemetry only: classify a reorg-apply rollback error and bump the
+    /// matching counter. Called at every undo/apply/commit rollback exit of the
+    /// reorg branch in `process_block_inner`, so the count is independent of the
+    /// caller (NewBlock, future-block retry, IBD, or `retry_reorg_triggers`) —
+    /// every caller routes through `process_block_inner`'s reorg branch.
+    /// Scope: the counter tracks failures of the reorg *application* — i.e. after
+    /// state mutation begins (the undo loop, the new-chain apply, the atomic
+    /// commit). The pre-undo ancestry walk's setup failures (a missing/storage-
+    /// unreadable ancestor before any UTXO change) are intentionally NOT counted
+    /// here; nothing has been mutated or rolled back at that point.
+    /// Classification mirrors the old retry-path logic (`is_fatal` -> fatal,
+    /// else recoverable). A `MissingReorgAncestor` is NOT an apply failure (the
+    /// trigger is re-queued and retried once the ancestor arrives) so it is not
+    /// counted. No behavioral effect.
+    #[inline]
+    fn record_reorg_apply_error(&self, e: &ProcessBlockError) {
+        match e {
+            ProcessBlockError::MissingReorgAncestor(_) => {}
+            e if e.is_fatal() => {
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorg_fatal_errors);
+            }
+            _ => {
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorg_recoverable_errors);
+            }
+        }
+    }
+
     /// Retry all saved trigger blocks for a given ancestor that just arrived.
     /// Takes trigger blocks from the shared node-level reorg trigger state
     /// (not per-peer), so triggers saved by peer A can be retried when peer B
@@ -2110,8 +2137,10 @@ impl Node {
                         }
                     }
                     Err(e) if e.is_fatal() => {
-                        // Metrics (telemetry only): fatal reorg error count.
-                        crate::metrics::NodeMetrics::incr(&self.metrics.reorg_fatal_errors);
+                        // Reorg error counters are bumped at the failure sites in
+                        // process_block_inner's reorg branch (which this retry
+                        // routes through via process_block) — counting here too
+                        // would double-count a retry-triggered failure.
                         tracing::error!(
                             fatal = true,
                             error = %e,
@@ -2121,8 +2150,7 @@ impl Node {
                         return;
                     }
                     Err(e) => {
-                        // Metrics (telemetry only): recoverable reorg error count.
-                        crate::metrics::NodeMetrics::incr(&self.metrics.reorg_recoverable_errors);
+                        // Counted at the reorg-branch failure site (see above).
                         warn!(
                             "Reorg trigger block {} failed after ancestor recovery: {}",
                             trigger_id, e
@@ -2718,13 +2746,12 @@ impl Node {
                     old_chain.len(),
                     new_chain.len()
                 );
-                // Metrics (telemetry only): a reorg is being applied; record it
-                // and the depth (old-chain blocks undone). No behavioral effect.
-                crate::metrics::NodeMetrics::incr(&self.metrics.reorgs_applied);
-                crate::metrics::NodeMetrics::add(
-                    &self.metrics.total_blocks_undone,
-                    old_chain.len() as u64,
-                );
+                // Metrics: capture the undo depth now (old-chain blocks this
+                // reorg would disconnect), but do NOT record the reorg as applied
+                // yet — the undo/apply/commit below can still roll back with the
+                // tip unchanged, and counting here would over-report reorgs that
+                // start then fail. Recorded only after the atomic commit succeeds.
+                let reorg_undo_depth = old_chain.len() as u64;
 
                 // 2. Undo old chain in-place (most recent first — already in order)
                 //    Track how many blocks we've undone so we can redo them on failure.
@@ -2774,10 +2801,12 @@ impl Node {
                             // Fail closed: undo failed mid-reorg, state is inconsistent.
                             // Attempt to redo what was undone, but propagate either way.
                             let _ = redo_old_chain_blocks(&mut utxo_set, &old_chain[..old_undone]);
-                            return Err(ProcessBlockError::Fatal(format!(
+                            let err = ProcessBlockError::Fatal(format!(
                                 "reorg undo_transaction failed: {}",
                                 e
-                            )));
+                            ));
+                            self.record_reorg_apply_error(&err);
+                            return Err(err);
                         }
                     }
                     old_undone += 1;
@@ -2787,14 +2816,18 @@ impl Node {
                     if let Err(redo_err) =
                         redo_old_chain_blocks(&mut utxo_set, &old_chain[..old_undone])
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: redo also failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     // Missing spent-UTXO metadata means the node cannot
                     // execute this or future reorgs — fatal, not recoverable.
-                    return Err(ProcessBlockError::Fatal(e));
+                    let err = ProcessBlockError::Fatal(e);
+                    self.record_reorg_apply_error(&err);
+                    return Err(err);
                 }
 
                 // 3. Apply new chain with full tx validation (oldest first)
@@ -2942,17 +2975,24 @@ impl Node {
                     if let Err(undo_err) =
                         undo_applied_new_chain(&mut utxo_set, &new_chain[..new_applied], &all_spent)
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: new-chain undo failed: {}",
                             e, undo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     if let Err(redo_err) = redo_old_chain_blocks(&mut utxo_set, &old_chain) {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: old-chain redo failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
+                    // The reorg rolled back cleanly with the tip unchanged; count
+                    // the apply error by its severity (Recoverable vs Fatal).
+                    self.record_reorg_apply_error(&e);
                     return Err(e);
                 }
 
@@ -3017,19 +3057,35 @@ impl Node {
                     if let Err(undo_err) =
                         undo_applied_new_chain(&mut utxo_set, &new_chain[..new_applied], &all_spent)
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "storage failed: {}: new-chain undo failed: {}",
                             e, undo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     if let Err(redo_err) = redo_old_chain_blocks(&mut utxo_set, &old_chain) {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "storage failed: {}: old-chain redo failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
-                    return Err(e.to_string().into());
+                    let err: ProcessBlockError = e.to_string().into();
+                    self.record_reorg_apply_error(&err);
+                    return Err(err);
                 }
+
+                // Metrics (telemetry only): the reorg has now committed
+                // atomically (commit_reorg_atomic succeeded above; no rollback
+                // path remains below). Only now is it truly applied — count it
+                // here, not at the pre-undo attempt site. No behavioral effect.
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorgs_applied);
+                crate::metrics::NodeMetrics::add(
+                    &self.metrics.total_blocks_undone,
+                    reorg_undo_depth,
+                );
 
                 // utxo_set already reflects the new chain — no swap needed
 
