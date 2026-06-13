@@ -489,8 +489,16 @@ fn header_only_validation_no_utxo_needed() {
     }
     utxo.apply_transaction(&cb, 1).unwrap();
 
-    // Timestamp must be above MTP of the genesis chain
-    let block = make_block(1, gid, 1774000000, 42, vec![cb], utxo.state_root());
+    // Timestamp must be above MTP of the genesis chain. The persistent-testnet
+    // genesis timestamp is 1781308800 (2026-06-13T00:00:00Z), so the child block
+    // must be after that (the old 1774000000 predated the new genesis). Testnet
+    // also now uses a REAL low target (2^252), so the block needs a genuinely
+    // mined nonce — the old fixed nonce=42 only passed under the trivial 0xFF
+    // target. Mine a valid nonce here (a handful of Argon2id hashes at 2^252).
+    let mut block = make_block(1, gid, 1781481700, 0, vec![cb], utxo.state_root());
+    while !exfer::consensus::pow::verify_pow(&block.header).unwrap() {
+        block.header.nonce += 1;
+    }
     let parent_header = genesis.header.clone();
 
     let ancestor_timestamps = storage.get_ancestor_timestamps(&gid, 11).unwrap();

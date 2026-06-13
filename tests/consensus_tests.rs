@@ -879,7 +879,12 @@ fn test_tx_rule8_fee_at_minimum() {
 
 #[test]
 fn test_tx_rule9_coinbase_maturity() {
-    // Spec 8.1 Rule 9: coinbase outputs locked for 360 blocks
+    // Spec 8.1 Rule 9: coinbase outputs locked for `coinbase_maturity()` blocks.
+    // Mainnet = 360; a `--features testnet` build = 10 (persistent-testnet
+    // profile). The coinbase here is created at height 100; the spend matures at
+    // height 100 + maturity. This stays correct on both builds by reading the
+    // live maturity instead of hard-coding 360.
+    let maturity = exfer::types::coinbase_maturity();
     let (sk, pk) = make_keypair();
     let prev_tx_id = Hash256::sha256(b"cb");
     let utxo_set = make_utxo_set_with_coins(&pk, &[(prev_tx_id, 0, 1_000_000_000)], true, 100);
@@ -894,14 +899,14 @@ fn test_tx_rule9_coinbase_maturity() {
     };
     sign_tx(&mut tx, &sk);
 
-    // At height 459 (age = 359 blocks), should fail
+    // One block before maturity (age = maturity - 1): should fail.
     assert!(matches!(
-        validate_transaction(&tx, &utxo_set, 459),
+        validate_transaction(&tx, &utxo_set, 100 + maturity - 1),
         Err(ValidationError::CoinbaseImmature { .. })
     ));
 
-    // At height 460 (age = 360 blocks), should succeed
-    let (fee, _, _) = validate_transaction(&tx, &utxo_set, 460).unwrap();
+    // At maturity (age = maturity): should succeed.
+    let (fee, _, _) = validate_transaction(&tx, &utxo_set, 100 + maturity).unwrap();
     assert_eq!(fee, 1_000_000_000 - DUST_THRESHOLD);
 }
 
@@ -1280,11 +1285,17 @@ fn test_consensus_constants() {
     assert_eq!(TARGET_BLOCK_TIME_SECS, 10);
     assert_eq!(RETARGET_WINDOW, 4_320);
     assert_eq!(MAX_RETARGET_FACTOR, 4);
-    // Coinbase maturity is a runtime value (lowered to 1 only by `exfer
-    // devnet`), not a cargo feature: the canonical constant stays 360 and the
-    // live default equals it in every test lane, including `--all-features`.
+    // The canonical coinbase-maturity CONSTANT stays 360 on every build.
     assert_eq!(COINBASE_MATURITY, 360);
+    // The runtime default is 360 on mainnet, but a `--features testnet` build
+    // defaults to the low TESTNET_COINBASE_MATURITY (10) for fast faucet/agent
+    // iteration (persistent-testnet profile; parallel to devnet's runtime 1).
+    // It is still lowered further to 1 only by `exfer devnet`. This is a
+    // testnet-specific expectation; the mainnet branch is unchanged at 360.
+    #[cfg(not(feature = "testnet"))]
     assert_eq!(exfer::types::coinbase_maturity(), 360);
+    #[cfg(feature = "testnet")]
+    assert_eq!(exfer::types::coinbase_maturity(), 10);
     assert_eq!(MAX_BLOCK_SIZE, 4_194_304);
     assert_eq!(MAX_TX_SIZE, 1_048_576);
     assert_eq!(MTP_WINDOW, 11);

@@ -31,9 +31,23 @@ fn genesis_fields_are_constants() {
     assert_eq!(g.header.version, 1);
     assert_eq!(g.header.height, 0);
     assert_eq!(g.header.prev_block_id, Hash256::ZERO);
-    assert_eq!(g.header.timestamp, 1773536400); // 2025-02-28T00:00:00Z
-    assert_eq!(g.header.nonce, 259);
-    // Coinbase: 100 EXFER to unspendable output
+    // Timestamp + nonce are network-specific: mainnet is the NIST-beacon genesis
+    // (ts 1773536400, mined nonce 259); a `--features testnet` build is the
+    // dedicated persistent-testnet genesis (ts 1781308800 = 2026-06-13T00:00:00Z,
+    // mined nonce 20 at the real 2^252 target). Updated for the persistent-testnet
+    // profile — this is a testnet-specific expectation; the mainnet branch is
+    // unchanged.
+    #[cfg(not(feature = "testnet"))]
+    {
+        assert_eq!(g.header.timestamp, 1773536400);
+        assert_eq!(g.header.nonce, 259);
+    }
+    #[cfg(feature = "testnet")]
+    {
+        assert_eq!(g.header.timestamp, 1_781_308_800);
+        assert_eq!(g.header.nonce, 20);
+    }
+    // Coinbase: 100 EXFER to unspendable output (same on both networks)
     assert_eq!(g.transactions.len(), 1);
     assert_eq!(g.transactions[0].outputs[0].value, 10_000_000_000);
     assert_eq!(g.transactions[0].outputs[0].script, vec![0u8; 32]);
