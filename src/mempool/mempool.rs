@@ -121,6 +121,13 @@ impl Mempool {
         self.entries.is_empty()
     }
 
+    /// Total serialized bytes of all transactions currently in the mempool.
+    /// Read-only accessor for operational metrics (`get_node_info`).
+    #[allow(dead_code)]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
     /// Resolve a tx's inputs against a UTXO snapshot into `SpentInput`s.
     ///
     /// Callers already hold a snapshot covering exactly these outpoints (the

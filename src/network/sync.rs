@@ -1103,6 +1103,12 @@ pub struct Node {
     /// is struck with a `DeliveredWrongBlockForRequestedId` outcome.
     pub stage_a_authenticated_headers:
         tokio::sync::RwLock<Option<Arc<Vec<BlockHeader>>>>,
+    /// Operational metrics: monotonic atomic counters incremented at existing
+    /// event sites (telemetry only — never gates a consensus/relay decision).
+    /// Surfaced read-only via the `get_node_info` JSON-RPC method.
+    pub metrics: Arc<crate::metrics::NodeMetrics>,
+    /// Process start instant, for the `uptime_seconds` field of `get_node_info`.
+    pub started_at: std::time::Instant,
 }
 
 impl Node {
@@ -2054,6 +2060,9 @@ impl Node {
                     "Retrying reorg trigger block {} after ancestor {} arrived",
                     trigger_id, ancestor_id
                 );
+                // Metrics (telemetry only): live-lock canary — a persistently
+                // climbing value flags the deep-fork re-admission live-lock.
+                crate::metrics::NodeMetrics::incr(&self.metrics.retrying_reorg_trigger);
                 match self.process_block(trigger_block.clone(), wall_clock).await {
                     Ok(ProcessBlockOutcome::Accepted) => {
                         info!("Reorg trigger block {} accepted", trigger_id);
@@ -2101,6 +2110,8 @@ impl Node {
                         }
                     }
                     Err(e) if e.is_fatal() => {
+                        // Metrics (telemetry only): fatal reorg error count.
+                        crate::metrics::NodeMetrics::incr(&self.metrics.reorg_fatal_errors);
                         tracing::error!(
                             fatal = true,
                             error = %e,
@@ -2110,6 +2121,8 @@ impl Node {
                         return;
                     }
                     Err(e) => {
+                        // Metrics (telemetry only): recoverable reorg error count.
+                        crate::metrics::NodeMetrics::incr(&self.metrics.reorg_recoverable_errors);
                         warn!(
                             "Reorg trigger block {} failed after ancestor recovery: {}",
                             trigger_id, e
@@ -2705,6 +2718,13 @@ impl Node {
                     old_chain.len(),
                     new_chain.len()
                 );
+                // Metrics (telemetry only): a reorg is being applied; record it
+                // and the depth (old-chain blocks undone). No behavioral effect.
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorgs_applied);
+                crate::metrics::NodeMetrics::add(
+                    &self.metrics.total_blocks_undone,
+                    old_chain.len() as u64,
+                );
 
                 // 2. Undo old chain in-place (most recent first — already in order)
                 //    Track how many blocks we've undone so we can redo them on failure.
@@ -3070,6 +3090,9 @@ impl Node {
                             continue;
                         }
                         stored.push((blk_id, work));
+                        // Metrics (telemetry only): this old-chain block left the
+                        // canonical chain for fork storage — the orphan/stale proxy.
+                        crate::metrics::NodeMetrics::incr(&self.metrics.blocks_orphaned);
                     }
 
                     // --- Commit phase: acquire lock, update in-memory state only.
@@ -3243,6 +3266,9 @@ impl Node {
             }
 
             info!("New tip: height={}, id={}", block.header.height, block_id);
+            // Metrics (telemetry only): a block advanced the canonical chain
+            // (covers both the tip-extend and reorg-winner paths). No effect.
+            crate::metrics::NodeMetrics::incr(&self.metrics.blocks_accepted);
         }
 
         Ok(ProcessBlockOutcome::Accepted)
@@ -4054,6 +4080,10 @@ impl Node {
                         if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                             duplicate_block_count += 1;
                             if duplicate_block_count > MAX_DUPLICATE_BLOCKS_PER_MIN {
+                                // Metrics (telemetry only): rate-cap disconnect.
+                                crate::metrics::NodeMetrics::incr(
+                                    &self.metrics.rate_cap_disconnects,
+                                );
                                 return Err(PeerError::TrafficQuotaExceeded);
                             }
                         }
@@ -4068,6 +4098,8 @@ impl Node {
                     if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                         block_count += 1;
                         if block_count > MAX_BLOCKS_PER_MIN {
+                            // Metrics (telemetry only): per-peer soft-drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.rate_cap_softdrops);
                             tracing::debug!(
                                 "Soft-dropping novel NewBlock from {} (over MAX_BLOCKS_PER_MIN)",
                                 meta.addr
@@ -4108,6 +4140,8 @@ impl Node {
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Metrics (telemetry only): peer-event channel drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.channel_send_drops);
                             // Event bus saturated: silently dropping this block
                             // inflates our orphan/stale rate when it is a fresh
                             // tip. Do NOT block the read loop (no .await) — WARN
@@ -4623,6 +4657,8 @@ impl Node {
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Metrics (telemetry only): peer-event channel drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.channel_send_drops);
                             // Event bus saturated: dropping a TipResponse means we
                             // may never learn this peer advanced, stalling sync and
                             // inflating stale-block risk. WARN and trigger recovery
@@ -5471,6 +5507,8 @@ async fn process_block_event(node: &Node, from: SocketAddr, from_identity: PeerI
     // PoW semaphore. On exhaustion we log at WARN rather than silently dropping.
     let extends_tip = node.tip.read().await.block_id == block.header.prev_block_id;
     if !node.try_consume_global_block_slot_inner(extends_tip) {
+        // Metrics (telemetry only): global block-rate cap drop.
+        crate::metrics::NodeMetrics::incr(&node.metrics.global_block_drops);
         warn!(
             "Global block-rate cap reached — dropping block at height {} ({}) from {} (extends_tip={})",
             block.header.height, block_id, from, extends_tip

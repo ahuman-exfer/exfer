@@ -85,6 +85,8 @@ fn make_node(
         tip_validation_coord: Arc::new(exfer::network::tip_validation::TipValidationCoordinator::new()),
         assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
         stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
+        metrics: std::sync::Arc::new(exfer::metrics::NodeMetrics::new()),
+        started_at: std::time::Instant::now(),
     })
 }
 

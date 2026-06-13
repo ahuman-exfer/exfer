@@ -373,6 +373,7 @@ async fn dispatch(
     let id = req.id.clone();
     match req.method.as_str() {
         "get_block_height" => handle_get_block_height(id, node).await,
+        "get_node_info" => handle_get_node_info(id, node).await,
         "get_balance"
         | "get_address_utxos"
         | "get_script_utxos"
@@ -457,6 +458,79 @@ async fn handle_get_block_height(id: serde_json::Value, node: &Arc<Node>) -> Rpc
             "genesis_block_id": hex::encode(node.genesis_id.as_bytes()),
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// get_node_info — read-only operational health snapshot (purely additive)
+// ---------------------------------------------------------------------------
+
+/// Read-only node status + operational metrics. Surfaces version, network,
+/// chain identity, tip, peer/mempool sizes, uptime, and the monotonic
+/// counters from `crate::metrics`. No state is mutated and no existing RPC
+/// method is altered. Each lock is taken briefly and never held across another
+/// to keep this off the block-acceptance writer's critical path.
+async fn handle_get_node_info(id: serde_json::Value, node: &Arc<Node>) -> RpcResponse {
+    RpcResponse::ok(id, node_info_json(node).await)
+}
+
+/// Build the `get_node_info` result object for `node`. Public so the RPC-shape
+/// integration test can assert the schema + metric surfacing against a real
+/// `Node` without standing up an HTTP listener. Read-only; mutates nothing.
+pub async fn node_info_json(node: &Arc<Node>) -> serde_json::Value {
+    // Tip snapshot (cheap read lock).
+    let (tip_height, tip_block_id) = {
+        let tip = node.tip.read().await;
+        (tip.height, tip.block_id)
+    };
+
+    // Tip age: wall clock minus the tip block's header timestamp. Best-effort —
+    // a missing header (e.g. genesis-only fresh node racing a prune) yields null.
+    let tip_age_seconds: Option<i64> = match node.storage.get_header(&tip_block_id) {
+        Ok(Some(h)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            Some(now - h.timestamp as i64)
+        }
+        _ => None,
+    };
+
+    // Connected peer count: logical peers with a live session.
+    let peer_count = {
+        let peers = node.peers.lock().await;
+        peers
+            .by_identity
+            .iter()
+            .filter(|(_, lp)| lp.session.is_some())
+            .count()
+    };
+
+    // Mempool size (tx count + serialized bytes) under a brief lock.
+    let (mempool_txs, mempool_bytes) = {
+        let mp = node.mempool.lock().await;
+        (mp.len(), mp.total_bytes())
+    };
+
+    let network = crate::types::address::current_network().name();
+    let uptime_seconds = node.started_at.elapsed().as_secs();
+    let metrics = node.metrics.snapshot();
+
+    serde_json::json!({
+        "version": crate::types::RELEASE_TAG,
+        "network": network,
+        // Chain identity — same source as get_block_height (node.genesis_id),
+        // the id the P2P handshake gates on. Never tip-derived.
+        "genesis_block_id": hex::encode(node.genesis_id.as_bytes()),
+        "tip_height": tip_height,
+        "tip_block_id": hex::encode(tip_block_id.as_bytes()),
+        "tip_age_seconds": tip_age_seconds,
+        "peer_count": peer_count,
+        "mempool_size": mempool_txs,
+        "mempool_bytes": mempool_bytes,
+        "uptime_seconds": uptime_seconds,
+        "metrics": metrics,
+    })
 }
 
 // ---------------------------------------------------------------------------

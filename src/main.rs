@@ -16,6 +16,7 @@ mod covenants;
 mod events;
 mod genesis;
 mod mempool;
+mod metrics;
 mod miner;
 mod network;
 mod rpc;
@@ -103,11 +104,11 @@ fn parse_amount(s: &str) -> Result<u64, String> {
     ))
 }
 
-/// Public release tag. Separate from `Cargo.toml`'s `version` field: the
-/// Cargo version is reserved for eventual crates.io publication and
-/// follows its own semver, while the release tag is what the network and
-/// binary releases track.
-pub const RELEASE_TAG: &str = "1.12.0";
+/// Public release tag. Single source of truth lives in the library crate
+/// ([`crate::types::RELEASE_TAG`]) so the binary `--version` and the
+/// `get_node_info` RPC report the same tag; re-exported here for the
+/// `#[command(version = ...)]` attribute below.
+use crate::types::RELEASE_TAG;
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -3650,6 +3651,8 @@ async fn run_node(
         tip_validation_coord: Arc::new(network::tip_validation::TipValidationCoordinator::new()),
         assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
         stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
+        metrics: Arc::new(metrics::NodeMetrics::new()),
+        started_at: std::time::Instant::now(),
     });
 
     // Networking is skipped entirely in devnet: it is an isolated single

@@ -144,6 +144,8 @@ mod deep_fork_readmission {
             assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
             stage_a_authenticated_headers: tokio::sync::RwLock::new(None),
             devnet: false,
+            metrics: std::sync::Arc::new(exfer::metrics::NodeMetrics::new()),
+            started_at: std::time::Instant::now(),
         }
     }
 
