@@ -16,6 +16,14 @@ pub use transaction::{Transaction, TxInput, TxOutput, TxWitness};
 
 // ── Consensus constants ──
 
+/// Public release tag — the version the network and binary releases track.
+/// Separate from `Cargo.toml`'s `version` field, which is reserved for
+/// eventual crates.io publication and follows its own semver. This lives in
+/// the library crate so both the binary (`--version`, see `main.rs`) and the
+/// `get_node_info` RPC (`rpc.rs`) surface the same tag rather than the
+/// `0.1.0` `CARGO_PKG_VERSION` placeholder.
+pub const RELEASE_TAG: &str = "1.12.0";
+
 pub const VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 5;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 10;
@@ -50,7 +58,10 @@ pub fn coinbase_maturity() -> u64 {
 /// devnet boot path — [`enter_devnet`] composes it with the signature-domain
 /// bind so the two can't be activated separately.
 pub fn set_devnet_coinbase_maturity() {
-    COINBASE_MATURITY_BLOCKS.store(DEVNET_COINBASE_MATURITY, std::sync::atomic::Ordering::Relaxed);
+    COINBASE_MATURITY_BLOCKS.store(
+        DEVNET_COINBASE_MATURITY,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Enter devnet consensus mode for this process: coinbase maturity 1 AND the
@@ -98,10 +109,8 @@ pub const BLOCK_HEADER_SIZE: usize = 156;
 pub const ASSUME_VALID_HEIGHT: u64 = 500_000;
 /// Block hash at ASSUME_VALID_HEIGHT. Verified exactly once during sync.
 pub const ASSUME_VALID_HASH: [u8; 32] = [
-    0xdb, 0x1f, 0x9c, 0xa3, 0x6c, 0x3e, 0x12, 0xbf,
-    0x03, 0x01, 0xfb, 0x65, 0xea, 0x9c, 0xf2, 0x18,
-    0xa7, 0x53, 0xf3, 0xd8, 0x0f, 0x1a, 0x07, 0xb5,
-    0x9d, 0x6e, 0xa1, 0x32, 0x37, 0x32, 0x19, 0x40,
+    0xdb, 0x1f, 0x9c, 0xa3, 0x6c, 0x3e, 0x12, 0xbf, 0x03, 0x01, 0xfb, 0x65, 0xea, 0x9c, 0xf2, 0x18,
+    0xa7, 0x53, 0xf3, 0xd8, 0x0f, 0x1a, 0x07, 0xb5, 0x9d, 0x6e, 0xa1, 0x32, 0x37, 0x32, 0x19, 0x40,
 ];
 /// Cumulative work at ASSUME_VALID_HEIGHT on the canonical chain. Used by v1.5.0
 /// Fix 2 cold-bootstrap subpath 2b to derive `verified_cumulative_work` without
@@ -138,10 +147,8 @@ pub const ASSUME_VALID_HASH: [u8; 32] = [
 /// to `false` on mismatch so cold-bootstrap tip validation falls through to
 /// `--verify-all`-equivalent.
 pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x01, 0xdc, 0x5d, 0x56, 0x4b, 0xd4,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xdc, 0x5d, 0x56, 0x4b, 0xd4,
 ];
 
 // ── v1.5.0 Fix 2 — tip-validation constants ──

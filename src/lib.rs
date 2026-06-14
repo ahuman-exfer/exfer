@@ -26,6 +26,7 @@ pub mod covenants;
 pub mod events;
 pub mod genesis;
 pub mod mempool;
+pub mod metrics;
 pub mod miner;
 pub mod network;
 pub mod rpc;

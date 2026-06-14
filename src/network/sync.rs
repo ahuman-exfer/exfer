@@ -1103,6 +1103,12 @@ pub struct Node {
     /// is struck with a `DeliveredWrongBlockForRequestedId` outcome.
     pub stage_a_authenticated_headers:
         tokio::sync::RwLock<Option<Arc<Vec<BlockHeader>>>>,
+    /// Operational metrics: monotonic atomic counters incremented at existing
+    /// event sites (telemetry only — never gates a consensus/relay decision).
+    /// Surfaced read-only via the `get_node_info` JSON-RPC method.
+    pub metrics: Arc<crate::metrics::NodeMetrics>,
+    /// Process start instant, for the `uptime_seconds` field of `get_node_info`.
+    pub started_at: std::time::Instant,
 }
 
 impl Node {
@@ -2028,6 +2034,33 @@ impl Node {
         processed_ids
     }
 
+    /// Telemetry only: classify a reorg-apply rollback error and bump the
+    /// matching counter. Called at every undo/apply/commit rollback exit of the
+    /// reorg branch in `process_block_inner`, so the count is independent of the
+    /// caller (NewBlock, future-block retry, IBD, or `retry_reorg_triggers`) —
+    /// every caller routes through `process_block_inner`'s reorg branch.
+    /// Scope: the counter tracks failures of the reorg *application* — i.e. after
+    /// state mutation begins (the undo loop, the new-chain apply, the atomic
+    /// commit). The pre-undo ancestry walk's setup failures (a missing/storage-
+    /// unreadable ancestor before any UTXO change) are intentionally NOT counted
+    /// here; nothing has been mutated or rolled back at that point.
+    /// Classification mirrors the old retry-path logic (`is_fatal` -> fatal,
+    /// else recoverable). A `MissingReorgAncestor` is NOT an apply failure (the
+    /// trigger is re-queued and retried once the ancestor arrives) so it is not
+    /// counted. No behavioral effect.
+    #[inline]
+    fn record_reorg_apply_error(&self, e: &ProcessBlockError) {
+        match e {
+            ProcessBlockError::MissingReorgAncestor(_) => {}
+            e if e.is_fatal() => {
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorg_fatal_errors);
+            }
+            _ => {
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorg_recoverable_errors);
+            }
+        }
+    }
+
     /// Retry all saved trigger blocks for a given ancestor that just arrived.
     /// Takes trigger blocks from the shared node-level reorg trigger state
     /// (not per-peer), so triggers saved by peer A can be retried when peer B
@@ -2054,6 +2087,9 @@ impl Node {
                     "Retrying reorg trigger block {} after ancestor {} arrived",
                     trigger_id, ancestor_id
                 );
+                // Metrics (telemetry only): live-lock canary — a persistently
+                // climbing value flags the deep-fork re-admission live-lock.
+                crate::metrics::NodeMetrics::incr(&self.metrics.retrying_reorg_trigger);
                 match self.process_block(trigger_block.clone(), wall_clock).await {
                     Ok(ProcessBlockOutcome::Accepted) => {
                         info!("Reorg trigger block {} accepted", trigger_id);
@@ -2101,6 +2137,10 @@ impl Node {
                         }
                     }
                     Err(e) if e.is_fatal() => {
+                        // Reorg error counters are bumped at the failure sites in
+                        // process_block_inner's reorg branch (which this retry
+                        // routes through via process_block) — counting here too
+                        // would double-count a retry-triggered failure.
                         tracing::error!(
                             fatal = true,
                             error = %e,
@@ -2110,6 +2150,7 @@ impl Node {
                         return;
                     }
                     Err(e) => {
+                        // Counted at the reorg-branch failure site (see above).
                         warn!(
                             "Reorg trigger block {} failed after ancestor recovery: {}",
                             trigger_id, e
@@ -2705,6 +2746,12 @@ impl Node {
                     old_chain.len(),
                     new_chain.len()
                 );
+                // Metrics: capture the undo depth now (old-chain blocks this
+                // reorg would disconnect), but do NOT record the reorg as applied
+                // yet — the undo/apply/commit below can still roll back with the
+                // tip unchanged, and counting here would over-report reorgs that
+                // start then fail. Recorded only after the atomic commit succeeds.
+                let reorg_undo_depth = old_chain.len() as u64;
 
                 // 2. Undo old chain in-place (most recent first — already in order)
                 //    Track how many blocks we've undone so we can redo them on failure.
@@ -2754,10 +2801,12 @@ impl Node {
                             // Fail closed: undo failed mid-reorg, state is inconsistent.
                             // Attempt to redo what was undone, but propagate either way.
                             let _ = redo_old_chain_blocks(&mut utxo_set, &old_chain[..old_undone]);
-                            return Err(ProcessBlockError::Fatal(format!(
+                            let err = ProcessBlockError::Fatal(format!(
                                 "reorg undo_transaction failed: {}",
                                 e
-                            )));
+                            ));
+                            self.record_reorg_apply_error(&err);
+                            return Err(err);
                         }
                     }
                     old_undone += 1;
@@ -2767,14 +2816,18 @@ impl Node {
                     if let Err(redo_err) =
                         redo_old_chain_blocks(&mut utxo_set, &old_chain[..old_undone])
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: redo also failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     // Missing spent-UTXO metadata means the node cannot
                     // execute this or future reorgs — fatal, not recoverable.
-                    return Err(ProcessBlockError::Fatal(e));
+                    let err = ProcessBlockError::Fatal(e);
+                    self.record_reorg_apply_error(&err);
+                    return Err(err);
                 }
 
                 // 3. Apply new chain with full tx validation (oldest first)
@@ -2922,17 +2975,24 @@ impl Node {
                     if let Err(undo_err) =
                         undo_applied_new_chain(&mut utxo_set, &new_chain[..new_applied], &all_spent)
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: new-chain undo failed: {}",
                             e, undo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     if let Err(redo_err) = redo_old_chain_blocks(&mut utxo_set, &old_chain) {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "{}: old-chain redo failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
+                    // The reorg rolled back cleanly with the tip unchanged; count
+                    // the apply error by its severity (Recoverable vs Fatal).
+                    self.record_reorg_apply_error(&e);
                     return Err(e);
                 }
 
@@ -2997,19 +3057,35 @@ impl Node {
                     if let Err(undo_err) =
                         undo_applied_new_chain(&mut utxo_set, &new_chain[..new_applied], &all_spent)
                     {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "storage failed: {}: new-chain undo failed: {}",
                             e, undo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
                     if let Err(redo_err) = redo_old_chain_blocks(&mut utxo_set, &old_chain) {
-                        return Err(ProcessBlockError::Fatal(format!(
+                        let err = ProcessBlockError::Fatal(format!(
                             "storage failed: {}: old-chain redo failed: {}",
                             e, redo_err
-                        )));
+                        ));
+                        self.record_reorg_apply_error(&err);
+                        return Err(err);
                     }
-                    return Err(e.to_string().into());
+                    let err: ProcessBlockError = e.to_string().into();
+                    self.record_reorg_apply_error(&err);
+                    return Err(err);
                 }
+
+                // Metrics (telemetry only): the reorg has now committed
+                // atomically (commit_reorg_atomic succeeded above; no rollback
+                // path remains below). Only now is it truly applied — count it
+                // here, not at the pre-undo attempt site. No behavioral effect.
+                crate::metrics::NodeMetrics::incr(&self.metrics.reorgs_applied);
+                crate::metrics::NodeMetrics::add(
+                    &self.metrics.total_blocks_undone,
+                    reorg_undo_depth,
+                );
 
                 // utxo_set already reflects the new chain — no swap needed
 
@@ -3070,6 +3146,9 @@ impl Node {
                             continue;
                         }
                         stored.push((blk_id, work));
+                        // Metrics (telemetry only): this old-chain block left the
+                        // canonical chain for fork storage — the orphan/stale proxy.
+                        crate::metrics::NodeMetrics::incr(&self.metrics.blocks_orphaned);
                     }
 
                     // --- Commit phase: acquire lock, update in-memory state only.
@@ -3243,6 +3322,9 @@ impl Node {
             }
 
             info!("New tip: height={}, id={}", block.header.height, block_id);
+            // Metrics (telemetry only): a block advanced the canonical chain
+            // (covers both the tip-extend and reorg-winner paths). No effect.
+            crate::metrics::NodeMetrics::incr(&self.metrics.blocks_accepted);
         }
 
         Ok(ProcessBlockOutcome::Accepted)
@@ -4054,6 +4136,10 @@ impl Node {
                         if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                             duplicate_block_count += 1;
                             if duplicate_block_count > MAX_DUPLICATE_BLOCKS_PER_MIN {
+                                // Metrics (telemetry only): rate-cap disconnect.
+                                crate::metrics::NodeMetrics::incr(
+                                    &self.metrics.rate_cap_disconnects,
+                                );
                                 return Err(PeerError::TrafficQuotaExceeded);
                             }
                         }
@@ -4068,6 +4154,8 @@ impl Node {
                     if actually_caught_up && self.ever_confirmed_peer.load(Ordering::Relaxed) {
                         block_count += 1;
                         if block_count > MAX_BLOCKS_PER_MIN {
+                            // Metrics (telemetry only): per-peer soft-drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.rate_cap_softdrops);
                             tracing::debug!(
                                 "Soft-dropping novel NewBlock from {} (over MAX_BLOCKS_PER_MIN)",
                                 meta.addr
@@ -4108,6 +4196,8 @@ impl Node {
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Metrics (telemetry only): peer-event channel drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.channel_send_drops);
                             // Event bus saturated: silently dropping this block
                             // inflates our orphan/stale rate when it is a fresh
                             // tip. Do NOT block the read loop (no .await) — WARN
@@ -4623,6 +4713,8 @@ impl Node {
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Metrics (telemetry only): peer-event channel drop.
+                            crate::metrics::NodeMetrics::incr(&self.metrics.channel_send_drops);
                             // Event bus saturated: dropping a TipResponse means we
                             // may never learn this peer advanced, stalling sync and
                             // inflating stale-block risk. WARN and trigger recovery
@@ -5471,6 +5563,8 @@ async fn process_block_event(node: &Node, from: SocketAddr, from_identity: PeerI
     // PoW semaphore. On exhaustion we log at WARN rather than silently dropping.
     let extends_tip = node.tip.read().await.block_id == block.header.prev_block_id;
     if !node.try_consume_global_block_slot_inner(extends_tip) {
+        // Metrics (telemetry only): global block-rate cap drop.
+        crate::metrics::NodeMetrics::incr(&node.metrics.global_block_drops);
         warn!(
             "Global block-rate cap reached — dropping block at height {} ({}) from {} (extends_tip={})",
             block.header.height, block_id, from, extends_tip
