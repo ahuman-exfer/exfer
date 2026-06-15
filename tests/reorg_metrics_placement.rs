@@ -109,20 +109,47 @@ fn coinbase(height: u64, value: u64, pubkey: &[u8; 32]) -> Transaction {
     }
 }
 
-/// Grind `header.nonce` until it satisfies the real testnet PoW target. With
-/// the persistent-testnet difficulty (2^252) this is ~16 Argon2id attempts —
-/// fast, but no longer free as it was under the old trivial 0xFF target where
-/// nonce 0 always passed. Must be called AFTER every header field that feeds the
-/// PoW hash is final (e.g. a deliberately-corrupted state_root).
-fn mine(header: &mut BlockHeader) {
+// Precomputed PoW nonces for the fixed synthetic headers below. Under #42's real
+// 2^252 testnet target, grinding a nonce per block costs ~16 Argon2id attempts
+// (~85s for this file) — the wrong cost for a test about reorg-metric placement
+// (issue #46). The headers here are fully deterministic, so the first valid nonce
+// is a constant: precompute it once and verify-only at test time (one Argon2id
+// hash per block instead of ~16). PoW fidelity is preserved — every block still
+// passes the real `process_block` path with a genuinely valid nonce, exactly as
+// in production. If a fixture changes, `pow()` regrinds and prints the new value
+// to update here (so it self-heals rather than silently breaking).
+const NONCE_A1: u64 = 6; // chain A height-1 block (identical in both tests)
+const NONCE_B1_CORRUPT: u64 = 3; // failed_reorg: B1 with the corrupted state_root
+const NONCE_B2_AFTER_CORRUPT: u64 = 11; // failed_reorg: B2 extending the corrupted B1
+const NONCE_B1_VALID: u64 = 5; // successful_reorg: valid B1
+const NONCE_B2_AFTER_VALID: u64 = 18; // successful_reorg: B2 extending the valid B1
+
+/// Finalize `header`'s PoW. Sets the precomputed `nonce` and confirms it satisfies
+/// the real testnet target with a single `verify_pow` (full fidelity — the block
+/// still carries a genuinely valid nonce). If the precomputed value is stale
+/// (a header fixture changed), regrind from 0 and print the value to hard-code,
+/// so the test self-heals instead of failing opaquely with `PowFailed`. Must be
+/// called AFTER every field feeding the PoW hash is final (e.g. a corrupted
+/// state_root).
+fn pow(header: &mut BlockHeader, nonce: u64, label: &str) {
+    header.nonce = nonce;
+    if exfer::consensus::pow::verify_pow(header).unwrap_or(false) {
+        return;
+    }
+    header.nonce = 0;
     while !exfer::consensus::pow::verify_pow(header).unwrap_or(false) {
         header.nonce = header.nonce.wrapping_add(1);
     }
+    eprintln!(
+        "reorg_metrics_placement: precomputed nonce {nonce} stale for {label} \
+         (height {}) — update the const to {}",
+        header.height, header.nonce
+    );
 }
 
-/// Assemble a block, computing tx_root and the post-apply state_root by
-/// replaying the txs (coinbase first) onto a clone of `base_utxo`, then mining a
-/// valid nonce at the testnet genesis target.
+/// Assemble a block, computing tx_root and the post-apply state_root by replaying
+/// the txs (coinbase first) onto a clone of `base_utxo`. Leaves `nonce` at 0; the
+/// caller finalizes PoW via `pow()` once the header is final.
 fn build_block(
     prev: &BlockHeader,
     height: u64,
@@ -134,7 +161,7 @@ fn build_block(
         post.apply_transaction(tx, height)
             .expect("apply for state_root");
     }
-    let mut header = BlockHeader {
+    let header = BlockHeader {
         version: 1,
         height,
         prev_block_id: prev.block_id(),
@@ -144,7 +171,6 @@ fn build_block(
         tx_root: compute_tx_root(&txs).expect("tx_root"),
         state_root: post.state_root(),
     };
-    mine(&mut header);
     Block {
         header,
         transactions: txs,
@@ -171,12 +197,13 @@ async fn failed_reorg_does_not_count_as_applied_and_counts_the_error() {
     let node = make_node(storage, utxo_set.clone(), tip, gid);
 
     // Chain A: a single valid block — this is our canonical tip (height 1).
-    let a1 = build_block(
+    let mut a1 = build_block(
         &genesis.header,
         1,
         vec![coinbase(1, block_reward(1), &[0xA1u8; 32])],
         &utxo_set,
     );
+    pow(&mut a1.header, NONCE_A1, "a1");
     let a1_id = a1.header.block_id();
     assert!(matches!(
         node.process_block(a1, None).await.expect("a1 accepted"),
@@ -193,11 +220,10 @@ async fn failed_reorg_does_not_count_as_applied_and_counts_the_error() {
         &utxo_set,
     );
     b1.header.state_root = Hash256::sha256(b"deliberately-wrong-state-root");
-    // Re-mine: the corrupted state_root changed the PoW preimage, so the nonce
-    // build_block found is stale. B1 must still pass header/PoW validation (it is
-    // stored as a fork candidate); the state_root mismatch is only caught later,
-    // at reorg-apply.
-    mine(&mut b1.header);
+    // Finalize PoW AFTER corrupting state_root (it feeds the PoW preimage). B1
+    // must still pass header/PoW validation (it is stored as a fork candidate);
+    // the state_root mismatch is only caught later, at reorg-apply.
+    pow(&mut b1.header, NONCE_B1_CORRUPT, "b1_corrupt");
     let b1_header = b1.header.clone();
     // After B1's coinbase (used only to shape B2's header; B2 is never reached
     // because the reorg fails on B1's state_root first).
@@ -212,12 +238,13 @@ async fn failed_reorg_does_not_count_as_applied_and_counts_the_error() {
     // B2 extends B1, so chain B (2 blocks) outweighs chain A (1 block) and a
     // reorg is triggered on this NewBlock path. The reorg undoes A1, then fails
     // applying B1 (state_root mismatch) and rolls back — the tip stays at A1.
-    let b2 = build_block(
+    let mut b2 = build_block(
         &b1_header,
         2,
         vec![coinbase(2, block_reward(2), &[0xB2u8; 32])],
         &after_b1,
     );
+    pow(&mut b2.header, NONCE_B2_AFTER_CORRUPT, "b2_after_corrupt");
     let res = node.process_block(b2, None).await;
     assert!(
         res.is_err(),
@@ -286,12 +313,13 @@ async fn successful_reorg_counts_applied_and_undone_depth() {
     let node = make_node(storage, utxo_set.clone(), tip, gid);
 
     // Chain A: a single valid block — canonical tip at height 1.
-    let a1 = build_block(
+    let mut a1 = build_block(
         &genesis.header,
         1,
         vec![coinbase(1, block_reward(1), &[0xA1u8; 32])],
         &utxo_set,
     );
+    pow(&mut a1.header, NONCE_A1, "a1");
     assert!(matches!(
         node.process_block(a1, None).await.expect("a1 accepted"),
         ProcessBlockOutcome::Accepted
@@ -299,12 +327,13 @@ async fn successful_reorg_counts_applied_and_undone_depth() {
 
     // Chain B: B1 forks genesis (valid), B2 extends B1 so B (2 blocks) outweighs
     // A (1 block) and triggers a reorg that commits, disconnecting A1.
-    let b1 = build_block(
+    let mut b1 = build_block(
         &genesis.header,
         1,
         vec![coinbase(1, block_reward(1), &[0xB1u8; 32])],
         &utxo_set,
     );
+    pow(&mut b1.header, NONCE_B1_VALID, "b1_valid");
     let b1_header = b1.header.clone();
     let mut after_b1 = utxo_set.clone();
     after_b1.apply_transaction(&b1.transactions[0], 1).unwrap();
@@ -313,12 +342,13 @@ async fn successful_reorg_counts_applied_and_undone_depth() {
         ProcessBlockOutcome::Stored
     ));
 
-    let b2 = build_block(
+    let mut b2 = build_block(
         &b1_header,
         2,
         vec![coinbase(2, block_reward(2), &[0xB2u8; 32])],
         &after_b1,
     );
+    pow(&mut b2.header, NONCE_B2_AFTER_VALID, "b2_after_valid");
     assert!(matches!(
         node.process_block(b2, None)
             .await
