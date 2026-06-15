@@ -109,9 +109,20 @@ fn coinbase(height: u64, value: u64, pubkey: &[u8; 32]) -> Transaction {
     }
 }
 
+/// Grind `header.nonce` until it satisfies the real testnet PoW target. With
+/// the persistent-testnet difficulty (2^252) this is ~16 Argon2id attempts —
+/// fast, but no longer free as it was under the old trivial 0xFF target where
+/// nonce 0 always passed. Must be called AFTER every header field that feeds the
+/// PoW hash is final (e.g. a deliberately-corrupted state_root).
+fn mine(header: &mut BlockHeader) {
+    while !exfer::consensus::pow::verify_pow(header).unwrap_or(false) {
+        header.nonce = header.nonce.wrapping_add(1);
+    }
+}
+
 /// Assemble a block, computing tx_root and the post-apply state_root by
-/// replaying the txs (coinbase first) onto a clone of `base_utxo`. Difficulty
-/// is the trivial testnet genesis target, so nonce 0 satisfies PoW.
+/// replaying the txs (coinbase first) onto a clone of `base_utxo`, then mining a
+/// valid nonce at the testnet genesis target.
 fn build_block(
     prev: &BlockHeader,
     height: u64,
@@ -123,17 +134,19 @@ fn build_block(
         post.apply_transaction(tx, height)
             .expect("apply for state_root");
     }
+    let mut header = BlockHeader {
+        version: 1,
+        height,
+        prev_block_id: prev.block_id(),
+        timestamp: prev.timestamp + TARGET_BLOCK_TIME_SECS,
+        difficulty_target: genesis_target(),
+        nonce: 0,
+        tx_root: compute_tx_root(&txs).expect("tx_root"),
+        state_root: post.state_root(),
+    };
+    mine(&mut header);
     Block {
-        header: BlockHeader {
-            version: 1,
-            height,
-            prev_block_id: prev.block_id(),
-            timestamp: prev.timestamp + TARGET_BLOCK_TIME_SECS,
-            difficulty_target: genesis_target(),
-            nonce: 0,
-            tx_root: compute_tx_root(&txs).expect("tx_root"),
-            state_root: post.state_root(),
-        },
+        header,
         transactions: txs,
     }
 }
@@ -180,6 +193,11 @@ async fn failed_reorg_does_not_count_as_applied_and_counts_the_error() {
         &utxo_set,
     );
     b1.header.state_root = Hash256::sha256(b"deliberately-wrong-state-root");
+    // Re-mine: the corrupted state_root changed the PoW preimage, so the nonce
+    // build_block found is stale. B1 must still pass header/PoW validation (it is
+    // stored as a fork candidate); the state_root mismatch is only caught later,
+    // at reorg-apply.
+    mine(&mut b1.header);
     let b1_header = b1.header.clone();
     // After B1's coinbase (used only to shape B2's header; B2 is never reached
     // because the reorg fails on B1's state_root first).
