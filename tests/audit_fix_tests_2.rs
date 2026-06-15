@@ -471,19 +471,22 @@ fn genesis_difficulty_is_2_248() {
 #[cfg(feature = "testnet")]
 #[test]
 fn testnet_genesis_block_valid() {
-    // Under testnet, genesis difficulty is [0xFF;32] — any hash valid
+    // Updated for the persistent-testnet profile: testnet genesis is no longer
+    // the trivial all-0xFF target. It is the dedicated testnet-1 genesis at the
+    // REAL low target 2^252 (byte[0]=0x10) with a genuinely mined nonce (20).
     let genesis = genesis_block();
     assert_eq!(
         genesis.header.difficulty_target,
-        Hash256([0xFF; 32]),
-        "testnet genesis should have trivial difficulty"
+        exfer::consensus::difficulty::testnet_genesis_target(),
+        "testnet genesis should carry the real low target 2^252"
     );
+    assert_eq!(genesis.header.difficulty_target.0[0], 0x10);
     assert_eq!(
-        genesis.header.nonce, 259,
-        "genesis nonce should be the mined value"
+        genesis.header.nonce, 20,
+        "genesis nonce should be the mined testnet value"
     );
 
-    // Verify PoW passes trivially
+    // Verify the mined nonce satisfies real PoW at the testnet target.
     let pow = exfer::consensus::pow::compute_pow(&genesis.header).unwrap();
     assert!(
         exfer::consensus::pow::verify_pow(&genesis.header).unwrap(),

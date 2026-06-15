@@ -6,8 +6,10 @@
 ))]
 compile_error!(
     "testnet feature must not be used in release builds. \
-     This produces a binary with trivial difficulty and no genesis PoW check. \
-     Use debug builds for testnet, or add --features allow-testnet-release to override."
+     This enables testnet consensus parameters (low-difficulty 2^252 PoW, a \
+     separate genesis, and a min-difficulty floor) unsuitable for a mainnet \
+     release. Use debug builds for testnet, or add --features \
+     allow-testnet-release to override."
 );
 
 mod chain;
@@ -267,8 +269,8 @@ enum Commands {
     },
     /// Run an isolated single-node local chain for development & testing.
     /// Instant blocks, no networking, coinbase spendable after 1 block,
-    /// JSON-RPC + SSE on by default. Requires a testnet build
-    /// (`--features testnet`) for trivial difficulty.
+    /// JSON-RPC + SSE on by default. Requires a testnet-feature build
+    /// (`--features testnet`), which carries the devnet genesis + code path.
     Devnet {
         /// Data directory (safe to delete between runs).
         #[arg(long, default_value = "devnet-data")]
@@ -824,37 +826,72 @@ enum ScriptCommands {
     },
 }
 
-/// Hardcoded fallback seed peers.
+/// Hardcoded fallback mainnet seed peers.
+#[cfg(not(feature = "testnet"))]
 const FALLBACK_SEEDS: &[&str] = &[
     "89.127.232.155:9333",
     "82.221.100.201:9333",
     "80.78.31.82:9333",
 ];
 
-/// Default mainnet seed peers. Used when --peers is not specified.
-/// Resolves seed.exfer.org first, falls back to hardcoded IPs if DNS fails.
+/// Hardcoded fallback PUBLIC TESTNET seed peers.
+///
+/// PLACEHOLDER — the real testnet seed IPs are TBD and get filled in when the
+/// testnet hosts are provisioned (design doc §4). Until then this is a loopback
+/// placeholder so a testnet build never accidentally dials the mainnet seeds
+/// (wrong network: the handshake would reject them on genesis mismatch anyway,
+/// but we must not even point at them). Operators run testnet seeds with an
+/// explicit `--peers` until DNS/IPs are live.
+#[cfg(feature = "testnet")]
+const TESTNET_FALLBACK_SEEDS: &[&str] = &[
+    // PLACEHOLDER seed IPs — replace once testnet hosts exist.
+    "127.0.0.1:9333",
+];
+
+/// DNS seed hostname for default peer discovery. Mainnet vs public testnet,
+/// selected at compile time. Mainnet resolution is unchanged.
+#[cfg(not(feature = "testnet"))]
+const DNS_SEED_HOST: &str = "seed.exfer.org";
+#[cfg(feature = "testnet")]
+const DNS_SEED_HOST: &str = "testnet-seed.exfer.org";
+
+/// Default seed peers. Used when --peers is not specified.
+/// Resolves the network's DNS seed first, falls back to hardcoded IPs if DNS
+/// fails. The network (mainnet vs public testnet) is selected at compile time;
+/// the mainnet path (`seed.exfer.org` → `FALLBACK_SEEDS`) is byte-for-byte
+/// unchanged from before — the `testnet` cfg only swaps in the testnet host and
+/// seed list and is compiled out of mainnet builds.
 fn default_peers_if_empty(peers: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
     if !peers.is_empty() {
         return peers;
     }
 
+    #[cfg(not(feature = "testnet"))]
+    let fallback_seeds: &[&str] = FALLBACK_SEEDS;
+    #[cfg(feature = "testnet")]
+    let fallback_seeds: &[&str] = TESTNET_FALLBACK_SEEDS;
+
     // Try DNS seed first
-    match std::net::ToSocketAddrs::to_socket_addrs(&("seed.exfer.org", 9333)) {
+    match std::net::ToSocketAddrs::to_socket_addrs(&(DNS_SEED_HOST, 9333u16)) {
         Ok(addrs) => {
             let resolved: Vec<std::net::SocketAddr> = addrs.collect();
             if !resolved.is_empty() {
-                tracing::info!("Resolved {} seed peers from seed.exfer.org", resolved.len());
+                tracing::info!(
+                    "Resolved {} seed peers from {}",
+                    resolved.len(),
+                    DNS_SEED_HOST
+                );
                 return resolved;
             }
         }
         Err(e) => {
-            tracing::warn!("DNS seed resolution failed (seed.exfer.org): {}", e);
+            tracing::warn!("DNS seed resolution failed ({}): {}", DNS_SEED_HOST, e);
         }
     }
 
     // Fall back to hardcoded seeds
     tracing::info!("Using hardcoded seed peers");
-    FALLBACK_SEEDS
+    fallback_seeds
         .iter()
         .map(|s| s.parse().unwrap())
         .collect()
@@ -972,15 +1009,17 @@ async fn main() {
             bind,
             miner_pubkey,
         } => {
-            // Devnet requires a trivial-difficulty build: its distinct genesis
-            // uses nonce=0, which only satisfies PoW under the testnet target,
-            // and at real difficulty devnet couldn't mine anyway. Fail clearly
-            // here rather than later on an opaque genesis PoW rejection.
-            // (Runtime `if cfg!` rather than `#[cfg]` so the rest of the arm
-            // stays reachable for the compiler — no unreachable-code warning.)
+            // Devnet requires a testnet-feature build: its distinct nonce=0
+            // genesis is produced by the devnet code path and is exempt from the
+            // startup genesis-PoW check; a mainnet build neither contains that
+            // genesis nor the exemption (and at mainnet difficulty devnet
+            // couldn't mine anyway). Fail clearly here rather than later on an
+            // opaque genesis PoW rejection. (Runtime `if cfg!` rather than
+            // `#[cfg]` so the rest of the arm stays reachable for the compiler —
+            // no unreachable-code warning.)
             if !cfg!(feature = "testnet") {
                 eprintln!(
-                    "ERROR: `exfer devnet` requires a trivial-difficulty build. \
+                    "ERROR: `exfer devnet` requires a testnet-feature build. \
                      Rebuild with `--features testnet` (release: `--features \
                      allow-testnet-release`)."
                 );
@@ -2357,10 +2396,13 @@ fn run_init_inner(
 
     // Step 4: Write config
     let config_path = datadir.join("config.toml");
+    // dns_seeds in the generated config tracks the build's network: mainnet
+    // emits seed.exfer.org (unchanged), a testnet build emits the testnet host.
     let config_content = format!(
-        "rpc_port = {}\np2p_port = 9333\ndatadir = \"{}\"\ndns_seeds = [\"seed.exfer.org\"]\n",
+        "rpc_port = {}\np2p_port = 9333\ndatadir = \"{}\"\ndns_seeds = [\"{}\"]\n",
         rpc_port,
-        datadir.display()
+        datadir.display(),
+        DNS_SEED_HOST
     );
     if let Err(e) = std::fs::write(&config_path, &config_content) {
         eprintln!("WARNING: failed to write config: {}", e);
@@ -3176,8 +3218,21 @@ async fn run_node(
     // Devnet mines its own chain from genesis, so it can never match the
     // hardcoded mainnet ASSUME_VALID_HASH at ASSUME_VALID_HEIGHT — leaving
     // assume-valid on would wedge it at that height. A devnet always verifies
-    // its own (trivial-PoW) chain in full, regardless of the other flags.
-    let assume_valid = !no_assume_valid && !verify_all && !devnet;
+    // its own chain in full, regardless of the other flags.
+    //
+    // A `--features testnet` build is in the same boat: the public testnet has
+    // its own low genesis and its tip lives far below the mainnet checkpoint
+    // height (500k), so the mainnet ASSUME_VALID_HASH never appears on it. With
+    // assume-valid ON, a fresh testnet node in the Bootstrap regime takes the
+    // cold-bootstrap "path 2b" and asks a peer for the header at
+    // ASSUME_VALID_HEIGHT=500_000 — which no testnet node has — so tip
+    // validation fails and the two seeds can never sync (the documented
+    // first-blocks blocker). Forcing assume-valid OFF on testnet routes to the
+    // common-ancestor "path 2a", which works from genesis, and makes the
+    // testnet full-verify (boot-to-Live) from height 0. cfg-gated so the
+    // MAINNET expression is byte-for-byte unchanged.
+    let testnet_full_verify = cfg!(feature = "testnet");
+    let assume_valid = !no_assume_valid && !verify_all && !devnet && !testnet_full_verify;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
     // walk by withholding trust in the WALK_VERIFIED_TIP marker for this boot.
     let trust_walk_marker = !full_verify;
@@ -3309,7 +3364,7 @@ async fn run_node(
     {
         warn!("========================================");
         warn!("  TESTNET BUILD — NOT FOR PRODUCTION");
-        warn!("  Trivial difficulty, no genesis PoW check");
+        warn!("  Public testnet: real PoW at low target (2^252), separate chain");
         warn!("========================================");
         eprintln!("WARNING: This is a TESTNET build. NOT FOR PRODUCTION.");
         eprintln!("Sleeping 5 seconds so operators can abort if unintended...");
@@ -3328,17 +3383,27 @@ async fn run_node(
     };
     let expected_genesis_id = genesis.header.block_id();
 
-    // Validate genesis PoW — refuse to start with a placeholder nonce
-    if !crate::consensus::pow::verify_pow(&genesis.header).unwrap_or(false) {
-        #[cfg(not(feature = "testnet"))]
-        {
-            return Err(format!(
-                "Genesis block PoW is INVALID (nonce={}). \
-                 Run `cargo run --release --bin mine_genesis` to find a valid nonce before production launch.",
-                genesis.header.nonce
-            )
-            .into());
-        }
+    // Validate genesis PoW — refuse to start with a placeholder/stale nonce.
+    // Enforced for mainnet (2^248) AND the persistent testnet (2^252): both are
+    // real-PoW chains, so a stale TESTNET_GENESIS_NONCE (e.g. after a change to
+    // the testnet timestamp/witness without re-mining) must fail closed rather
+    // than seed a public datadir with an unmined genesis. Before this, the whole
+    // check was `#[cfg(not(feature="testnet"))]` — a holdover from the old
+    // trivial-0xFF testnet, so a testnet-feature build skipped it entirely.
+    // Exempt ONLY devnet: its genesis is intentionally not real-PoW-mined
+    // (nonce=0). Today `devnet_genesis_block()` pins the all-0xFF target so it
+    // would pass anyway, but gating on `!devnet` rather than relying on that
+    // pinning is the robust, intent-matching guard (and survives any future
+    // change to the devnet target). `devnet` is unreachable-true on a mainnet
+    // build (rejected earlier), so this is a no-op for mainnet runtime behavior.
+    if !devnet && !crate::consensus::pow::verify_pow(&genesis.header).unwrap_or(false) {
+        return Err(format!(
+            "Genesis block PoW is INVALID (nonce={}). Run the genesis miner \
+             (`mine_genesis` for mainnet, `mine_testnet_genesis` for testnet) \
+             to find a valid nonce before launch.",
+            genesis.header.nonce
+        )
+        .into());
     }
 
     // Foreign chain detection: if the database already has a tip, verify its

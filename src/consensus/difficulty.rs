@@ -24,28 +24,60 @@ impl std::fmt::Display for DifficultyError {
 }
 
 /// Genesis difficulty target.
-/// Production: 2^248 (~256 expected Argon2id hashes).
-/// Testnet: all 0xFF (any hash valid, nonce=0 works).
+/// Production: 2^248 (~256 expected Argon2id hashes; `production_genesis_target()`).
+/// Testnet: 2^252 (~16 expected Argon2id hashes; real PoW, not trivial — see
+/// [`testnet_genesis_target`]). The old trivial all-`0xFF` target (nonce=0
+/// always valid) is gone: a persistent public testnet on a trivial target is
+/// instantly spammable, so testnet now requires genuine memory-hard PoW at a
+/// low-but-nonzero target.
 pub fn genesis_target() -> Hash256 {
     #[cfg(feature = "testnet")]
     {
-        Hash256([0xFF; 32])
+        testnet_genesis_target()
     }
     #[cfg(not(feature = "testnet"))]
     {
-        let mut target = [0u8; 32];
-        // 2^248: byte[0] = 0x01 in big-endian 256-bit representation
-        target[0] = 0x01;
-        Hash256(target)
+        production_genesis_target()
     }
 }
 
 /// The production genesis target (2^248), always available regardless of feature flags.
 /// Used for tests that need to verify the exact constant.
+///
+/// Acceptance is `pow_hash < target`, so expected hashes per block is
+/// `2^256 / target = 2^256 / 2^248 = 2^8 = 256` Argon2id hashes.
 #[allow(dead_code)]
 pub fn production_genesis_target() -> Hash256 {
     let mut target = [0u8; 32];
+    // 2^248: byte[0] = 0x01 in big-endian 256-bit representation
     target[0] = 0x01;
+    Hash256(target)
+}
+
+/// The testnet genesis target (2^252), always available regardless of feature flags.
+///
+/// Chosen so a persistent public testnet does real PoW but stays cheap enough
+/// for modest hardware / an autonomous agent to mine:
+/// expected hashes per block = `2^256 / target = 2^256 / 2^252 = 2^4 = 16`
+/// Argon2id hashes (vs 256 on mainnet — i.e. 16x cheaper per block). At the
+/// Argon2id parameters in use (64 MiB / 2 iters, ~5 H/s/core) that is ~3s of
+/// grinding on a single core, comfortably under the 10s target block time on a
+/// 2-vCPU box, yet non-trivial: an attacker must actually grind memory-hard
+/// Argon2id (GPUs/botnets help little), so the chain is not free to spam or
+/// trivially reorg the way the old all-`0xFF` target allowed.
+///
+/// 2^252 is encoded big-endian as `byte[0] = 0x10` (bit 252 = byte 0, bit 4),
+/// all other bytes zero.
+///
+/// This target also doubles as the testnet **min-difficulty floor** (see
+/// [`retarget`]): the DAA may make testnet harder as third-party hashpower
+/// joins, but can never make it easier than launch, so a hashpower drop cannot
+/// drive the target back toward triviality and strand the chain.
+#[allow(dead_code)]
+pub fn testnet_genesis_target() -> Hash256 {
+    let mut target = [0u8; 32];
+    // 2^252: bit 252 is bit 4 of the most-significant byte → 0x10.
+    target[0] = 0x10;
     Hash256(target)
 }
 
@@ -239,7 +271,24 @@ pub fn retarget(old_target: &Hash256, actual_time_secs: u64) -> Hash256 {
         return Hash256(min);
     }
 
-    Hash256(new_target_bytes)
+    let result = Hash256(new_target_bytes);
+
+    // Testnet min-difficulty floor (additive, testnet-only; mainnet math is
+    // byte-for-byte unchanged because this branch is compiled out without the
+    // `testnet` feature). A larger target = easier PoW, so the difficulty FLOOR
+    // is an upper bound on the target: never let the DAA make testnet easier
+    // than the launch target (`testnet_genesis_target`, 2^252). Without this,
+    // a sudden hashpower drop could ratchet the target up (via the +4x clamp)
+    // toward triviality and strand the public testnet at spammable difficulty.
+    #[cfg(feature = "testnet")]
+    {
+        let floor = testnet_genesis_target();
+        if ge_256(result.as_bytes(), floor.as_bytes()) {
+            return floor;
+        }
+    }
+
+    result
 }
 
 /// Multiply a 256-bit big-endian number by a u64 numerator, then divide by a u64 denominator.
@@ -438,14 +487,23 @@ mod tests {
 
     #[test]
     fn test_genesis_target() {
-        // Verify genesis_target returns an appropriate value for the build config
+        // Verify genesis_target returns an appropriate value for the build config.
         let target = genesis_target();
         #[cfg(feature = "testnet")]
-        assert_eq!(
-            target,
-            Hash256([0xFF; 32]),
-            "testnet target should be all 0xFF"
-        );
+        {
+            // NOT the old trivial all-0xFF target: testnet is now real PoW at
+            // 2^252 (byte[0]=0x10, rest zero). Updated from the pre-persistent
+            // expectation (this is a testnet-only expectation; mainnet is below).
+            assert_eq!(
+                target,
+                testnet_genesis_target(),
+                "testnet genesis target should be the real low target 2^252"
+            );
+            assert_eq!(target.0[0], 0x10);
+            for i in 1..32 {
+                assert_eq!(target.0[i], 0x00, "byte {} should be 0", i);
+            }
+        }
         #[cfg(not(feature = "testnet"))]
         {
             assert_eq!(target.0[0], 0x01);
@@ -453,6 +511,51 @@ mod tests {
                 assert_eq!(target.0[i], 0x00, "byte {} should be 0", i);
             }
         }
+    }
+
+    #[test]
+    fn test_testnet_genesis_target_value_and_hashes() {
+        // 2^252 → byte[0] = 0x10, rest zero.
+        let t = testnet_genesis_target();
+        assert_eq!(t.0[0], 0x10);
+        for i in 1..32 {
+            assert_eq!(t.0[i], 0x00, "byte {} should be 0", i);
+        }
+        // Expected hashes/block = 2^256 / target. Mainnet 2^256/2^248 = 256;
+        // testnet 2^256/2^252 = 16 → testnet is exactly 16x cheaper per block.
+        let mainnet_work = work_from_target(&production_genesis_target());
+        let testnet_work = work_from_target(&t);
+        // work = floor(2^256/target). 2^256/2^248 = 256 = 0x100 at bytes[30..32].
+        assert_eq!(mainnet_work[30], 0x01);
+        assert_eq!(mainnet_work[31], 0x00);
+        // 2^256/2^252 = 16 = 0x10 at the least-significant byte.
+        assert_eq!(testnet_work[31], 0x10);
+        for i in 0..31 {
+            assert_eq!(testnet_work[i], 0x00, "testnet work byte {} should be 0", i);
+        }
+        // testnet target is easier (larger) than mainnet target.
+        assert!(t.as_bytes() > production_genesis_target().as_bytes());
+    }
+
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn test_testnet_min_difficulty_floor() {
+        // Under the testnet feature, retarget must never produce a target EASIER
+        // (larger) than the launch floor 2^252, no matter how slow blocks are.
+        let floor = testnet_genesis_target();
+        let expected = (RETARGET_WINDOW - 1) * TARGET_BLOCK_TIME_SECS;
+        // Blocks 4x too slow → DAA wants +4x easier, but the floor caps it.
+        let new_target = retarget(&floor, expected * 4);
+        assert_eq!(
+            new_target, floor,
+            "testnet retarget must clamp to the 2^252 difficulty floor"
+        );
+        // Faster blocks make it harder (smaller target) — floor does not block that.
+        let harder = retarget(&floor, expected / 2);
+        assert!(
+            harder.as_bytes() < floor.as_bytes(),
+            "testnet retarget may make difficulty harder than the floor"
+        );
     }
 
     #[test]

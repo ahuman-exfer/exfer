@@ -36,15 +36,33 @@ pub const COINBASE_MATURITY: u64 = 360;
 /// isolated local chain has usable funds within seconds.
 pub const DEVNET_COINBASE_MATURITY: u64 = 1;
 
+/// Public testnet coinbase maturity: low (10 blocks, ~100s at the 10s target)
+/// so a freshly-mined faucet/agent wallet has spendable funds within a couple
+/// of minutes instead of ~1h (mainnet's 360). Networked (unlike devnet's 1),
+/// but valueless coins on a separate chain, so the relaxed maturity is safe.
+#[cfg(feature = "testnet")]
+pub const TESTNET_COINBASE_MATURITY: u64 = 10;
+
+/// The build's default coinbase maturity. Mainnet keeps the canonical
+/// [`COINBASE_MATURITY`] (360); a `--features testnet` build defaults to
+/// [`TESTNET_COINBASE_MATURITY`] (10). cfg-gated so the mainnet default is
+/// byte-for-byte unchanged. `exfer devnet` still lowers this further to
+/// [`DEVNET_COINBASE_MATURITY`] (1) at runtime, on either build.
+#[cfg(not(feature = "testnet"))]
+const DEFAULT_COINBASE_MATURITY: u64 = COINBASE_MATURITY;
+#[cfg(feature = "testnet")]
+const DEFAULT_COINBASE_MATURITY: u64 = TESTNET_COINBASE_MATURITY;
+
 /// Live coinbase maturity in blocks. This is a *runtime* value, not a
 /// compile-time constant: a single binary must serve both a mainnet-faithful
 /// `node`/`mine` (360) and an isolated `devnet` (1) without a cargo feature
 /// mutating a consensus constant for the whole build (which would silently
 /// give a networked node a 1-block maturity it must never have). It defaults
-/// to the canonical 360 and is only ever lowered by `exfer devnet` at startup
-/// via [`set_devnet_coinbase_maturity`]; every networked path keeps 360.
+/// to [`DEFAULT_COINBASE_MATURITY`] (360 on mainnet, 10 on a testnet build) and
+/// is only ever lowered further by `exfer devnet` at startup via
+/// [`set_devnet_coinbase_maturity`]; every networked mainnet path keeps 360.
 static COINBASE_MATURITY_BLOCKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(COINBASE_MATURITY);
+    std::sync::atomic::AtomicU64::new(DEFAULT_COINBASE_MATURITY);
 
 /// Current coinbase maturity in blocks. Defaults to the canonical
 /// [`COINBASE_MATURITY`]; equals [`DEVNET_COINBASE_MATURITY`] only inside a

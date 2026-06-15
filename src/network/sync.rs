@@ -7156,8 +7156,30 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         // `run_ibd`. The normal post-anchor branch below requires
         // `tip.confirmed == true`, which only flips at Stage B anchor-apply,
         // so we cannot go through that branch for pre-anchor work.
+        //
+        // This whole funnel is meaningful ONLY when assume-valid is in force
+        // (`node.assume_valid`). With assume-valid OFF the node trusts no
+        // checkpoint: it full-verifies every block from genesis (Argon2 +
+        // tx-validation), so there is no "pre-anchor / post-anchor" split to
+        // honour and there is no mainnet ASSUME_VALID_HEIGHT block on this
+        // chain at all. Three callers run with assume-valid OFF — a mainnet
+        // node launched with `--verify-all`/`--no-assume-valid`, a `devnet`
+        // (which short-circuits anyway by booting straight to Live without a
+        // sync manager), and a `--features testnet` node. The testnet case is
+        // the one this guard fixes: a fresh testnet tip lives near 0, forever
+        // below the mainnet anchor (500_000), and no testnet peer is ever at
+        // that height, so without this guard EVERY testnet node enters this
+        // branch, finds no Stage A/B candidate, and wedges on the documented
+        // "no peer is at or past ASSUME_VALID_HEIGHT" log. Gating on
+        // `node.assume_valid` routes assume-valid-off nodes to the normal
+        // post-anchor branch below, which bootstraps from genesis: solo nodes
+        // go Live via the no-peers-after-60s path and start mining; nodes with
+        // peers run the normal full-verify IBD / wedge-fallback. The MAINNET
+        // default keeps `assume_valid == true`, so the default mainnet node
+        // takes this branch exactly as before — behaviour is byte-for-byte
+        // unchanged for any node that has not opted out of assume-valid.
         let our_tip_height = node.tip.read().await.height;
-        if our_tip_height <= ASSUME_VALID_HEIGHT {
+        if node.assume_valid && our_tip_height <= ASSUME_VALID_HEIGHT {
             let need_stage_a = {
                 let guard = node.stage_a_authenticated_headers.read().await;
                 guard.is_none()

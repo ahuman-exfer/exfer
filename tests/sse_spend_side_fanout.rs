@@ -136,14 +136,16 @@ fn signed_spend(
 }
 
 /// Assemble a block, computing its tx_root and the post-apply state_root by
-/// replaying the txs (coinbase first) onto a clone of `base_utxo`. Difficulty
-/// is the trivial testnet genesis target, so nonce 0 satisfies PoW.
+/// replaying the txs (coinbase first) onto a clone of `base_utxo`. Difficulty is
+/// the testnet genesis target, which is now the REAL low target (2^252), so the
+/// block needs a genuinely mined nonce (a handful of Argon2id hashes) rather
+/// than the old trivial nonce 0.
 fn build_block(prev: &BlockHeader, height: u64, txs: Vec<Transaction>, base_utxo: &UtxoSet) -> Block {
     let mut post = base_utxo.clone();
     for tx in &txs {
         post.apply_transaction(tx, height).expect("apply for state_root");
     }
-    Block {
+    let mut block = Block {
         header: BlockHeader {
             version: 1,
             height,
@@ -155,7 +157,11 @@ fn build_block(prev: &BlockHeader, height: u64, txs: Vec<Transaction>, base_utxo
             state_root: post.state_root(),
         },
         transactions: txs,
+    };
+    while !exfer::consensus::pow::verify_pow(&block.header).expect("pow") {
+        block.header.nonce += 1;
     }
+    block
 }
 
 /// Drain every event currently queued for a subscriber and report whether any

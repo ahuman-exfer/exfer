@@ -8,7 +8,9 @@
 
 // ---- P0: Genesis PoW ----
 
-/// Testnet genesis always valid (target = all-FF, any nonce works).
+/// Testnet genesis PoW is valid: the persistent-testnet genesis carries a
+/// genuinely mined nonce against the real low target (2^252), not the old
+/// trivial all-0xFF target where any nonce passed.
 #[test]
 #[cfg(feature = "testnet")]
 fn p0_testnet_genesis_valid() {
@@ -16,7 +18,7 @@ fn p0_testnet_genesis_valid() {
     let block = exfer::genesis::genesis_block();
     assert!(
         verify_pow(&block.header).unwrap(),
-        "testnet genesis must be valid with any nonce"
+        "testnet genesis must satisfy PoW at the real 2^252 target with its mined nonce"
     );
 }
 

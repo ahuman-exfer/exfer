@@ -67,10 +67,20 @@ fn named_expectation_default_deny_then_devnet_bind_composes() {
     //    EXACT checked id. Joining the devnet chain enters devnet consensus
     //    mode wholesale: domain + coinbase maturity 1 (types::enter_devnet),
     //    so the wallet's maturity filter matches the chain it now spends on.
+    // Pre-bind maturity is the build's networked default: 360 on mainnet, 10 on
+    // a `--features testnet` build (persistent-testnet profile). Entering devnet
+    // (below) lowers it further to DEVNET_COINBASE_MATURITY (1) regardless.
+    #[cfg(not(feature = "testnet"))]
     assert_eq!(
         exfer::types::coinbase_maturity(),
         exfer::types::COINBASE_MATURITY,
         "pre-bind: canonical maturity"
+    );
+    #[cfg(feature = "testnet")]
+    assert_eq!(
+        exfer::types::coinbase_maturity(),
+        exfer::types::TESTNET_COINBASE_MATURITY,
+        "pre-bind: testnet build default maturity"
     );
     let mock = MockNode::serve(serde_json::json!({
         "height": 3,
