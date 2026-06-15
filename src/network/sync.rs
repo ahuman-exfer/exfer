@@ -7072,6 +7072,47 @@ fn next_is_live(
     }
 }
 
+/// Whether a node with no liveness proof may self-bootstrap to `Live`.
+///
+/// Two cases:
+/// 1. **Solo** — never saw a peer and past the boot grace (the original path:
+///    the only node on the network mines from genesis).
+/// 2. **Symmetric genesis (testnet, #43)** — we are still at genesis, peered,
+///    but every peer is also at genesis: none confirmed, none ahead, none
+///    claiming a better chain, and we've waited a longer grace. Without this,
+///    two fresh testnet seeds peered only with each other deadlock at genesis —
+///    assume-valid is off so going Live needs a proof none can give, and the
+///    solo clause is disqualified the instant they peer (`ever_had_peer`
+///    latches). After the grace each eligible node goes Live and mines block 1;
+///    fork choice converges the (at most brief) competing tips.
+///
+/// `testnet` is `cfg!(feature = "testnet")` computed at the call site, so on a
+/// mainnet build case 2 is dead and this is byte-identical to the old inline
+/// `connected_count == 0 && !ever_had_peer && >60s` — and on mainnet assume-valid
+/// is on with seeds always far ahead, so the topology never even arises.
+#[allow(clippy::too_many_arguments)]
+fn is_bootstrap_eligible(
+    connected_count: usize,
+    ever_had_peer: bool,
+    start_elapsed: Duration,
+    testnet: bool,
+    at_genesis: bool,
+    has_confirmed_peer: bool,
+    peer_ahead: bool,
+    peer_claims_ahead: bool,
+) -> bool {
+    let solo =
+        connected_count == 0 && !ever_had_peer && start_elapsed > Duration::from_secs(60);
+    let genesis_peered = testnet
+        && at_genesis
+        && connected_count > 0
+        && !has_confirmed_peer
+        && !peer_ahead
+        && !peer_claims_ahead
+        && start_elapsed > Duration::from_secs(90);
+    solo || genesis_peered
+}
+
 /// The central sync manager task. Processes all block events, drives IBD,
 /// manages sync state. Runs as a single node-wide task.
 ///
@@ -7884,9 +7925,22 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         let peer_ahead = best_confirmed_work > our_work;
 
         let has_proof = has_liveness_proof(best_confirmed_work, proven_by_delivery, our_work);
-        let bootstrap_eligible = connected_count == 0
-            && !ever_had_peer
-            && start_time.elapsed() > Duration::from_secs(60);
+        // Still at genesis? (#43: symmetric two-fresh-seeds bootstrap.)
+        let at_genesis = node
+            .tip
+            .try_read()
+            .map(|t| t.height == 0)
+            .unwrap_or(false);
+        let bootstrap_eligible = is_bootstrap_eligible(
+            connected_count,
+            ever_had_peer,
+            start_time.elapsed(),
+            cfg!(feature = "testnet"),
+            at_genesis,
+            /* has_confirmed_peer */ best_confirmed_work != [0u8; 32],
+            peer_ahead,
+            peer_claims_ahead,
+        );
         let was_live = is_live;
         is_live = next_is_live(
             is_live,
@@ -10486,7 +10540,7 @@ mod ibd_eligibility_tests {
 
     // ── P1 round-4: delivery floor must not grant permanent liveness ─────
 
-    use super::next_is_live;
+    use super::{is_bootstrap_eligible, next_is_live};
 
     #[test]
     fn delivery_floor_goes_live_then_reverts_when_tip_stalls() {
@@ -10587,5 +10641,36 @@ mod ibd_eligibility_tests {
         assert!(!next_is_live(false, false, false, false, true, true, false));
         // Bootstrap path: no peers ever, past grace → Live.
         assert!(next_is_live(false, false, false, false, false, false, true));
+    }
+
+    #[test]
+    fn symmetric_two_fresh_seeds_bootstrap_after_grace() {
+        // Reproducer for #43: two fresh same-genesis testnet seeds peered only
+        // with each other. Topology: at genesis, one peer, no confirmed peer,
+        // none ahead, no better-chain claim. The solo clause is disqualified
+        // (peered → ever_had_peer latched), so before the fix this deadlocked.
+        let short = Duration::from_secs(30);
+        let grace = Duration::from_secs(120);
+
+        // Mainnet build (testnet=false): this topology is NEVER bootstrap-
+        // eligible — byte-identical to the old behaviour, no mainnet change.
+        assert!(!is_bootstrap_eligible(1, true, grace, false, true, false, false, false));
+
+        // Testnet, before the genesis grace: not yet.
+        assert!(!is_bootstrap_eligible(1, true, short, true, true, false, false, false));
+        // Testnet, past the grace: eligible → goes Live and mines block 1.
+        assert!(is_bootstrap_eligible(1, true, grace, true, true, false, false, false));
+
+        // A confirmed peer ahead is a real IBD candidate, NOT a bootstrap case.
+        assert!(!is_bootstrap_eligible(1, true, grace, true, true, true, true, false));
+        // An unconfirmed better-chain claim also disqualifies (IBD/verify first).
+        assert!(!is_bootstrap_eligible(1, true, grace, true, true, false, false, true));
+        // Past genesis (we already mined) is not a genesis-bootstrap case.
+        assert!(!is_bootstrap_eligible(1, true, grace, true, false, false, false, false));
+
+        // The original solo path still works: no peers ever, past 60s.
+        assert!(is_bootstrap_eligible(0, false, Duration::from_secs(61), false, true, false, false, false));
+        // ...and is disqualified the instant a peer is/was seen.
+        assert!(!is_bootstrap_eligible(0, true, Duration::from_secs(61), false, true, false, false, false));
     }
 }

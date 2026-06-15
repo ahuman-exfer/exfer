@@ -3229,8 +3229,14 @@ async fn run_node(
     // validation fails and the two seeds can never sync (the documented
     // first-blocks blocker). Forcing assume-valid OFF on testnet routes to the
     // common-ancestor "path 2a", which works from genesis, and makes the
-    // testnet full-verify (boot-to-Live) from height 0. cfg-gated so the
-    // MAINNET expression is byte-for-byte unchanged.
+    // testnet full-verify (boot-to-Live) from height 0. This unblocks the SOLO
+    // and ASYMMETRIC-start cases (one node ahead → the other IBDs). It does NOT
+    // by itself fix the SYMMETRIC two-fresh-seeds-from-genesis topology (#43):
+    // two mutually-peered genesis nodes hold no liveness proof and the solo
+    // bootstrap clause is disqualified once they peer — that case is handled
+    // separately by the genesis-peered branch of `is_bootstrap_eligible`
+    // (network/sync.rs). cfg-gated so the MAINNET expression is byte-for-byte
+    // unchanged.
     let testnet_full_verify = cfg!(feature = "testnet");
     let assume_valid = !no_assume_valid && !verify_all && !devnet && !testnet_full_verify;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
