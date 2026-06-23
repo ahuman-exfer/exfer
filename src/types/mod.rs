@@ -22,7 +22,7 @@ pub use transaction::{Transaction, TxInput, TxOutput, TxWitness};
 /// the library crate so both the binary (`--version`, see `main.rs`) and the
 /// `get_node_info` RPC (`rpc.rs`) surface the same tag rather than the
 /// `0.1.0` `CARGO_PKG_VERSION` placeholder.
-pub const RELEASE_TAG: &str = "1.12.0";
+pub const RELEASE_TAG: &str = "1.13.0";
 
 pub const VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 5;
