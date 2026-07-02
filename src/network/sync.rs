@@ -4730,12 +4730,27 @@ impl Node {
                         Err(mpsc::error::TrySendError::Closed(_)) => {}
                     }
                 }
+                Message::Unknown { msg_type, .. } => {
+                    // Forward-compat (Phase 1): a well-framed message whose type id
+                    // this build doesn't know. `reader_recv` already ran the frame
+                    // counter replay-check + advance AND charged the dedicated
+                    // unknown-frame budget (disconnecting on a flood), so here we
+                    // simply skip it — do NOT strike. It may be a legitimately
+                    // newer peer speaking a superset protocol; dropping the frame
+                    // (not the peer) is the whole point of the version negotiation.
+                    tracing::trace!(
+                        "Skipping unknown message type {:#x} from {}",
+                        msg_type,
+                        meta.addr
+                    );
+                }
                 _ => {
                     // v1.10.0: post-handshake catch-all. At this point in the
-                    // match every legitimate message variant has been handled,
-                    // so this arm fires on protocol garbage (repeat Hello/
-                    // AuthAck or unknown message type). STRIKE — this is one
-                    // of the few remaining authenticated-peer abuse levers.
+                    // match every legitimate message variant has been handled, so
+                    // this arm fires on protocol garbage — a REPEAT Hello/AuthAck
+                    // (known types that are illegal post-handshake), NOT an unknown
+                    // type id (that is Message::Unknown, handled above). STRIKE —
+                    // one of the few remaining authenticated-peer abuse levers.
                     unsolicited_count += 1;
                     if unsolicited_count > MAX_UNSOLICITED_PER_MIN {
                         return Err(PeerError::ProtocolGarbage);

@@ -136,19 +136,27 @@ fn p1a_version_mismatch_error() {
 }
 
 #[test]
-fn p1a_handshake_rejects_downgrade() {
-    // Verify the handshake code enforces exact version match by inspecting
-    // the source. A peer claiming any version != PROTOCOL_VERSION must be
-    // rejected (no downgrade, no forward-compat).
+fn p1a_handshake_enforces_version_floor_and_no_nonce_skip() {
+    // Phase 1 (issue #50 enabler) replaced the old exact-match version check
+    // (`their_hello.version != PROTOCOL_VERSION`) with a version FLOOR: peers
+    // below `MIN_SUPPORTED_VERSION` are rejected, and accepted peers run at the
+    // negotiated `eff = min(theirs, ours)`. Downgrade RESISTANCE moved into the
+    // signed auth transcript (both advertised versions bound for eff >= 6; the
+    // eff scalar bound always) — see tests/p2p_forward_compat.rs. This test pins
+    // the floor check and that the insecure v2 nonce-skip path stays gone.
     let peer_rs = std::fs::read_to_string("src/network/peer.rs").expect("peer.rs should exist");
     assert!(
-        peer_rs.contains("their_hello.version != PROTOCOL_VERSION"),
-        "handshake must enforce exact protocol version match"
+        peer_rs.contains("their_hello.version < MIN_SUPPORTED_VERSION"),
+        "handshake must reject peers below the supported version floor"
     );
-    // The old v2 compat path that skipped nonce verification must be gone
+    assert!(
+        !peer_rs.contains("their_hello.version != PROTOCOL_VERSION"),
+        "the old exact-match (no-forward-compat) check must be gone"
+    );
+    // The old v2 compat path that skipped nonce verification must remain absent.
     assert!(
         !peer_rs.contains("skipping nonce verification"),
-        "v2 compat path must be removed — no downgrade allowed"
+        "v2 compat path must stay removed — no insecure downgrade"
     );
 }
 

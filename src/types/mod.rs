@@ -25,7 +25,15 @@ pub use transaction::{Transaction, TxInput, TxOutput, TxWitness};
 pub const RELEASE_TAG: &str = "1.13.0";
 
 pub const VERSION: u32 = 1;
+/// The protocol version this build ADVERTISES in its `Hello`. Phase 1
+/// (forward-compat) keeps this at 5 so deployed v5 nodes (exact-match) still
+/// accept us; Phase 2 (inv/getdata) bumps it to 6.
 pub const PROTOCOL_VERSION: u32 = 5;
+/// The lowest advertised peer version we ACCEPT at handshake. A peer advertising
+/// `>= MIN_SUPPORTED_VERSION` is accepted and the session runs at the negotiated
+/// `eff = min(their_version, PROTOCOL_VERSION)`. Replaces the old exact-match
+/// `!= PROTOCOL_VERSION` rejection, which partitioned the network on any bump.
+pub const MIN_SUPPORTED_VERSION: u32 = 5;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 10;
 pub const RETARGET_WINDOW: u64 = 4_320;
 pub const MAX_RETARGET_FACTOR: u64 = 4;
