@@ -22,6 +22,13 @@ pub enum Message {
     Headers(Vec<BlockHeader>),
     GetAddr,
     Addr(Vec<AddrEntry>),
+    /// Receive-only sentinel for a well-framed message whose type id is unknown
+    /// to this build (forward-compat, Phase 1). `deserialize` returns this instead
+    /// of erroring so the session read path can skip the frame — after the counter
+    /// replay-check/advance and the unknown-frame budget — rather than disconnect.
+    /// `len` is the payload length (retained for diagnostics/logging; the skip
+    /// budget is a count-only per-minute cap). Never sent; `serialize` rejects it.
+    Unknown { msg_type: u8, len: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +116,12 @@ impl Message {
             Message::Headers(hdrs) => (MSG_HEADERS, serialize_headers(hdrs)),
             Message::GetAddr => (MSG_GET_ADDR, vec![]),
             Message::Addr(entries) => (MSG_ADDR, serialize_addr_list(entries)),
+            Message::Unknown { msg_type, .. } => {
+                return Err(SerError::InvalidData(format!(
+                    "refusing to serialize Message::Unknown sentinel (type {:#x})",
+                    msg_type
+                )))
+            }
         };
 
         let mut buf = Vec::with_capacity(5 + payload.len());
@@ -210,12 +223,17 @@ impl Message {
                 sig.copy_from_slice(payload);
                 Message::AuthAck(AuthAckMsg { sig })
             }
-            _ => {
-                return Err(SerError::InvalidData(format!(
-                    "unknown message type: {:#x}",
-                    msg_type
-                )))
-            }
+            // Forward-compat (Phase 1): a well-framed frame with an unknown type id
+            // is NOT an error — return a sentinel so the post-handshake read path
+            // can skip it (after counter check/advance + unknown-frame budget)
+            // instead of disconnecting. The frame is fully consumed (5 +
+            // payload_len), so framing is preserved. Handshake reads match on
+            // specific types with a `_ => reject` arm, so an Unknown there is still
+            // rejected. A malformed *known* message still returns Err above.
+            _ => Message::Unknown {
+                msg_type,
+                len: payload_len,
+            },
         };
 
         Ok((msg, 5 + payload_len))
@@ -323,6 +341,22 @@ pub fn tip_commitment(
 ///
 /// Role 0x00 = responder, 0x01 = initiator. Both sides sign different messages
 /// to prevent reflection attacks.
+///
+/// `version` MUST be the negotiated `eff` (min of the two advertised versions),
+/// NOT the local compile-time `PROTOCOL_VERSION` — otherwise two peers with
+/// different constants produce different transcripts and auth fails.
+///
+/// `adv_versions` binds both advertised versions into the signed transcript, used
+/// ONLY for the versioned format (`eff >= 6`): `Some((initiator_advertised,
+/// responder_advertised))` in role-fixed order (both sides compute the identical
+/// tuple from the two Hellos + their own role). It is NOT active downgrade
+/// resistance while v5 is accepted — `eff` derives from unauthenticated Hellos, so
+/// a MITM can force both sides to `eff=5`/`None` (opportunistic version agreement;
+/// see the caller and spec §3.3). It makes an inconsistent (asymmetric) tamper
+/// fail closed, and becomes real downgrade resistance only once v5 is refused.
+/// Pass `None` for the legacy format (`eff < 6`); with `None` the output is
+/// byte-for-byte identical to the pre-forward-compat v5 transcript — the
+/// backward-compat guarantee.
 pub fn compute_auth_transcript(
     genesis_id: &Hash256,
     version: u32,
@@ -331,6 +365,7 @@ pub fn compute_auth_transcript(
     role: u8,
     tip_a: &[u8; 72],
     tip_b: &[u8; 72],
+    adv_versions: Option<(u32, u32)>,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -342,6 +377,12 @@ pub fn compute_auth_transcript(
     hasher.update([role]);
     hasher.update(tip_a.as_slice());
     hasher.update(tip_b.as_slice());
+    // Versioned (eff >= 6) downgrade binding, appended AFTER the legacy fields so
+    // the None (legacy) path stays byte-identical to deployed v5.
+    if let Some((init_adv, resp_adv)) = adv_versions {
+        hasher.update(init_adv.to_le_bytes());
+        hasher.update(resp_adv.to_le_bytes());
+    }
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);

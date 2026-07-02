@@ -99,9 +99,9 @@ mod structural {
         let nonce_a = [1u8; 32];
         let nonce_b = [2u8; 32];
         let t0 =
-            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP);
+            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP, None);
         let t1 =
-            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x01, &ZERO_TIP, &ZERO_TIP);
+            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x01, &ZERO_TIP, &ZERO_TIP, None);
         // Different roles produce different transcripts (prevents reflection)
         assert_ne!(t0, t1);
     }
@@ -112,8 +112,8 @@ mod structural {
         let g2 = Hash256([2u8; 32]);
         let nonce_a = [0xAA; 32];
         let nonce_b = [0xBB; 32];
-        let t1 = compute_auth_transcript(&g1, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP);
-        let t2 = compute_auth_transcript(&g2, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP);
+        let t1 = compute_auth_transcript(&g1, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP, None);
+        let t2 = compute_auth_transcript(&g2, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &ZERO_TIP, None);
         assert_ne!(t1, t2);
     }
 
@@ -123,8 +123,8 @@ mod structural {
         let na1 = [1u8; 32];
         let na2 = [2u8; 32];
         let nb = [3u8; 32];
-        let t1 = compute_auth_transcript(&genesis, 4, &na1, &nb, 0x00, &ZERO_TIP, &ZERO_TIP);
-        let t2 = compute_auth_transcript(&genesis, 4, &na2, &nb, 0x00, &ZERO_TIP, &ZERO_TIP);
+        let t1 = compute_auth_transcript(&genesis, 4, &na1, &nb, 0x00, &ZERO_TIP, &ZERO_TIP, None);
+        let t2 = compute_auth_transcript(&genesis, 4, &na2, &nb, 0x00, &ZERO_TIP, &ZERO_TIP, None);
         assert_ne!(t1, t2);
     }
 
@@ -137,8 +137,8 @@ mod structural {
         // Different initiator height → different transcript
         let tip_h0 = tip_commitment(0, &Hash256::ZERO, &[0u8; 32]);
         let tip_h1 = tip_commitment(1, &Hash256::ZERO, &[0u8; 32]);
-        let t1 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_h0, &ZERO_TIP);
-        let t2 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_h1, &ZERO_TIP);
+        let t1 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_h0, &ZERO_TIP, None);
+        let t2 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_h1, &ZERO_TIP, None);
         assert_ne!(
             t1, t2,
             "different initiator height must produce different transcript"
@@ -150,8 +150,8 @@ mod structural {
         work_b[31] = 1;
         let tip_wa = tip_commitment(0, &Hash256::ZERO, &work_a);
         let tip_wb = tip_commitment(0, &Hash256::ZERO, &work_b);
-        let t3 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &tip_wa);
-        let t4 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &tip_wb);
+        let t3 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &tip_wa, None);
+        let t4 = compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &ZERO_TIP, &tip_wb, None);
         assert_ne!(
             t3, t4,
             "different responder work must produce different transcript"
@@ -161,9 +161,9 @@ mod structural {
         let tip_id0 = tip_commitment(0, &Hash256::ZERO, &[0u8; 32]);
         let tip_id1 = tip_commitment(0, &Hash256([0xFF; 32]), &[0u8; 32]);
         let t5 =
-            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_id0, &ZERO_TIP);
+            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_id0, &ZERO_TIP, None);
         let t6 =
-            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_id1, &ZERO_TIP);
+            compute_auth_transcript(&genesis, 4, &nonce_a, &nonce_b, 0x00, &tip_id1, &ZERO_TIP, None);
         assert_ne!(
             t5, t6,
             "different best_block_id must produce different transcript"
@@ -477,6 +477,41 @@ mod handshake_tests {
     }
 
     #[tokio::test]
+    async fn higher_version_accepted_and_negotiated_down() {
+        // Phase 1 forward-compat: a peer advertising a HIGHER version than us
+        // (simulating a future Phase-2 node) must be ACCEPTED, not rejected, and
+        // the session negotiated to eff = min. Both sides run PROTOCOL_VERSION=5;
+        // the client advertises 6. Both must complete the handshake (eff=5 legacy
+        // format → matching transcripts + session keys).
+        let (key_a, key_b) = key_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let hello = make_hello();
+            Peer::handshake(stream, peer_addr, hello, true, &key_b, &mut None).await
+        });
+
+        let client = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut hello = make_hello();
+            hello.version = 6; // advertise a newer protocol
+            Peer::handshake(stream, addr, hello, false, &key_a, &mut None).await
+        });
+
+        let (server_result, client_result) = tokio::join!(server, client);
+        assert!(
+            server_result.unwrap().is_ok(),
+            "responder must accept a higher-version peer (forward-compat)"
+        );
+        assert!(
+            client_result.unwrap().is_ok(),
+            "initiator advertising v6 must complete against a v5 responder"
+        );
+    }
+
+    #[tokio::test]
     async fn self_connection_rejected() {
         let key = SigningKey::from_bytes(&[0x33u8; 32]);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -593,6 +628,7 @@ mod handshake_tests {
                 0x00,
                 &zero_tip, // initiator tip
                 &zero_tip, // responder tip
+                None,
             );
             let sig = key_b.sign(&transcript);
 

@@ -70,7 +70,9 @@ impl Peer {
     ///   2. Send Hello(nonce_b, pubkey_b, echo=nonce_a, sig_b)
     ///   3. Read AuthAck(sig_a) — verify sig_a
     ///
-    /// Rejects peers with version != PROTOCOL_VERSION (exact match, no downgrade).
+    /// Rejects peers advertising a version below `MIN_SUPPORTED_VERSION`;
+    /// accepted peers run at the negotiated `eff = min(theirs, ours)`, fed into
+    /// the auth transcript and session-key KDF (Phase 1 forward-compat, #50).
     /// Rejects self-connections (same public key).
     pub async fn handshake(
         mut stream: TcpStream,
@@ -100,10 +102,10 @@ impl Peer {
                 _ => return Err(PeerError::UnexpectedMessage),
             };
 
-            if their_hello.version != PROTOCOL_VERSION {
+            if their_hello.version < MIN_SUPPORTED_VERSION {
                 warn!(
-                    "Rejecting {}: protocol v{} != our v{}",
-                    addr, their_hello.version, PROTOCOL_VERSION
+                    "Rejecting {}: protocol v{} < our min v{}",
+                    addr, their_hello.version, MIN_SUPPORTED_VERSION
                 );
                 return Err(PeerError::VersionMismatch);
             }
@@ -113,6 +115,26 @@ impl Peer {
             if their_hello.pubkey == our_pubkey {
                 return Err(PeerError::SelfConnection);
             }
+
+            // Negotiated version = min(theirs, ours). Fed into BOTH the auth
+            // transcript and the session-key KDF (never the compile constant), so
+            // two peers with different PROTOCOL_VERSION agree. For eff >= 6, bind
+            // the role-ordered advertised-version tuple (init, resp); None (eff < 6)
+            // keeps the transcript byte-identical to v5. NOTE: `eff` derives from
+            // the UNAUTHENTICATED Hello versions, so this is opportunistic version
+            // agreement, NOT active downgrade resistance while v5 is accepted — a
+            // MITM can strip both Hellos to 5, giving eff=5/None on both sides
+            // (the accepted §3.3 limitation; it degrades the link to v5 relay, does
+            // not break auth). The tuple makes an ASYMMETRIC (inconsistent) tamper
+            // fail closed, and becomes real downgrade resistance only once
+            // MIN_SUPPORTED_VERSION rises to 6 and v5 is refused.
+            // Responder branch: initiator = them, responder = us.
+            let eff = their_hello.version.min(PROTOCOL_VERSION);
+            let adv_versions = if eff >= 6 {
+                Some((their_hello.version, PROTOCOL_VERSION))
+            } else {
+                None
+            };
 
             let nonce_a = their_hello.nonce;
             let nonce_b = our_nonce;
@@ -133,12 +155,13 @@ impl Peer {
             // Step 2: Send our Hello with echo + signature (role 0x00 = responder)
             let transcript_resp = compute_auth_transcript(
                 &our_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 0x00,
                 &tip_a,
                 &tip_b,
+                adv_versions,
             );
             let sig_b = signing_key.sign(&transcript_resp);
 
@@ -166,12 +189,13 @@ impl Peer {
 
             let transcript_init = compute_auth_transcript(
                 &their_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 0x01,
                 &tip_a,
                 &tip_b,
+                adv_versions,
             );
             verify_peer_sig(&their_hello.pubkey, &transcript_init, &sig_a_bytes, addr)?;
 
@@ -189,7 +213,7 @@ impl Peer {
                 .to_bytes();
             let session_key = compute_session_key(
                 &their_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 &dh_shared_secret,
@@ -254,10 +278,10 @@ impl Peer {
                 _ => return Err(PeerError::UnexpectedMessage),
             };
 
-            if their_hello.version != PROTOCOL_VERSION {
+            if their_hello.version < MIN_SUPPORTED_VERSION {
                 warn!(
-                    "Rejecting {}: protocol v{} != our v{}",
-                    addr, their_hello.version, PROTOCOL_VERSION
+                    "Rejecting {}: protocol v{} < our min v{}",
+                    addr, their_hello.version, MIN_SUPPORTED_VERSION
                 );
                 return Err(PeerError::VersionMismatch);
             }
@@ -271,6 +295,15 @@ impl Peer {
             if their_hello.pubkey == our_pubkey {
                 return Err(PeerError::SelfConnection);
             }
+
+            // Negotiated version (see responder branch). Initiator branch:
+            // initiator = us, responder = them.
+            let eff = their_hello.version.min(PROTOCOL_VERSION);
+            let adv_versions = if eff >= 6 {
+                Some((PROTOCOL_VERSION, their_hello.version))
+            } else {
+                None
+            };
 
             let nonce_a = our_nonce;
             let nonce_b = their_hello.nonce;
@@ -290,12 +323,13 @@ impl Peer {
             // Verify responder's signature (role 0x00 = responder)
             let transcript_resp = compute_auth_transcript(
                 &our_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 0x00,
                 &tip_a,
                 &tip_b,
+                adv_versions,
             );
             verify_peer_sig(
                 &their_hello.pubkey,
@@ -310,12 +344,13 @@ impl Peer {
             // Step 3: Send AuthAck with our signature (role 0x01 = initiator)
             let transcript_init = compute_auth_transcript(
                 &our_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 0x01,
                 &tip_a,
                 &tip_b,
+                adv_versions,
             );
             let sig_a = signing_key.sign(&transcript_init);
             let ack_bytes = Message::AuthAck(AuthAckMsg {
@@ -337,7 +372,7 @@ impl Peer {
                 .to_bytes();
             let session_key = compute_session_key(
                 &their_hello.genesis_block_id,
-                PROTOCOL_VERSION,
+                eff,
                 &nonce_a,
                 &nonce_b,
                 &dh_shared_secret,
@@ -398,6 +433,7 @@ impl Peer {
             counter_buf: self.counter_buf,
             counter_buf_len: self.counter_buf_len,
             counter_started: self.counter_started,
+            unknown_budget: UnknownFrameBudget::default(),
         };
         let writer = WriterState {
             stream: write_half,
@@ -508,6 +544,45 @@ pub enum WriterControl {
     SendPing,
 }
 
+/// Forward-compat (Phase 1): per-peer sliding-window rate budget for skipped
+/// unknown-type frames. Skipped frames bypass the dispatch-level `MAX_*_PER_MIN`
+/// counters (those only count known messages that reach dispatch), and
+/// `frame_budget` bounds only in-flight memory — not rate. So unknown frames get
+/// their own per-minute count cap, charged in `reader_recv` right after the frame
+/// counter advance. Extracted from `ReaderState` so it is unit-testable without a
+/// live socket.
+///
+/// A count cap suffices: each unknown payload is already bounded to
+/// `UNKNOWN_MSG_MAX_PAYLOAD` (8 KiB) by the read-path gate, so the count cap
+/// deterministically bounds total unknown-frame egress to
+/// `MAX_UNKNOWN_FRAMES_PER_MIN * (FRAME_HEADER_SIZE + UNKNOWN_MSG_MAX_PAYLOAD)`
+/// ≈ 960 KiB/min. A separate byte cap would be unreachable via the wire (the
+/// count cap always trips first), so there isn't one.
+#[derive(Default)]
+pub struct UnknownFrameBudget {
+    window_start: Option<std::time::Instant>,
+    count: u32,
+}
+
+impl UnknownFrameBudget {
+    /// Charge one skipped unknown frame. Returns `true` if still within the
+    /// per-minute count budget, `false` if exceeded (caller disconnects). The 60s
+    /// window resets lazily on the first charge after it elapses.
+    pub fn charge(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let reset = match self.window_start {
+            Some(start) => now.duration_since(start) >= Duration::from_secs(60),
+            None => true,
+        };
+        if reset {
+            self.window_start = Some(now);
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count <= MAX_UNKNOWN_FRAMES_PER_MIN
+    }
+}
+
 /// Reader task state: owns the read half of the TCP stream and crypto state.
 pub struct ReaderState {
     pub stream: OwnedReadHalf,
@@ -516,6 +591,7 @@ pub struct ReaderState {
     pub counter_buf: [u8; 8],
     pub counter_buf_len: usize,
     pub counter_started: Option<std::time::Instant>,
+    pub unknown_budget: UnknownFrameBudget,
 }
 
 /// Writer task state: owns the write half of the TCP stream and crypto state.
@@ -681,6 +757,18 @@ pub async fn reader_recv(
     state.recv_counter = counter
         .checked_add(1)
         .ok_or_else(|| PeerError::Io("recv counter overflow".into()))?;
+
+    // Forward-compat (Phase 1): a well-framed but unknown-type message is skipped
+    // rather than fatal. The counter replay-check + advance above have ALREADY run
+    // for this frame (so a replayed unknown frame is rejected and the sequence
+    // stays monotonic). Charge the dedicated unknown-frame budget here — skipped
+    // frames never reach the dispatch-level MAX_*_PER_MIN counters — then return
+    // the sentinel; the dispatch loop ignores it and re-enters for the next frame.
+    if let Message::Unknown { .. } = &msg {
+        if !state.unknown_budget.charge() {
+            return Err(PeerError::AbuseThresholdExceeded);
+        }
+    }
     Ok(Some(msg))
 }
 
@@ -912,6 +1000,19 @@ async fn read_message<S: AsyncRead + Unpin>(
 /// Payloads above this threshold are read in chunks with throughput enforcement.
 const EAGER_ALLOC_LIMIT: usize = 32_768; // 32 KiB
 
+/// Forward-compat (Phase 1): max payload accepted for an UNKNOWN post-handshake
+/// message type before it is skipped. Bounded (8 KiB) so an unknown-type flood
+/// cannot force large allocations, while leaving room for plausible future small
+/// control messages. Larger unknown frames are rejected as "payload too large".
+const UNKNOWN_MSG_MAX_PAYLOAD: usize = 8_192; // 8 KiB
+
+/// Forward-compat (Phase 1): per-peer per-minute cap on skipped unknown-type
+/// frames (they bypass the dispatch-level MAX_*_PER_MIN counters). A
+/// legitimately-newer peer sends few unknowns; a flood exceeding this disconnects.
+/// Combined with the 8 KiB `UNKNOWN_MSG_MAX_PAYLOAD` read-path bound, this caps
+/// unknown-frame egress deterministically without a separate byte budget.
+const MAX_UNKNOWN_FRAMES_PER_MIN: u32 = 120;
+
 /// Chunk size for incremental reads of large payloads.
 const READ_CHUNK_SIZE: usize = 32_768; // 32 KiB
 
@@ -1039,7 +1140,11 @@ async fn read_message_after_type<S: AsyncRead + Unpin>(
                 0
             }
         }
-        _ => 0,
+        // Forward-compat (Phase 1): an unknown type id gets a bounded allowance so
+        // its frame can be read + HMAC-verified + skipped (via Message::Unknown),
+        // rather than rejected here. Bounded so an unknown-type flood cannot force
+        // large allocations; larger unknown frames are still rejected below.
+        _ => UNKNOWN_MSG_MAX_PAYLOAD,
     };
     if payload_len > max_payload {
         return Err(std::io::Error::new(
@@ -1326,6 +1431,21 @@ impl std::fmt::Display for PeerError {
 }
 
 impl std::error::Error for PeerError {}
+
+#[cfg(test)]
+mod unknown_frame_budget_tests {
+    use super::*;
+
+    #[test]
+    fn allows_up_to_count_cap_then_trips() {
+        let mut b = UnknownFrameBudget::default();
+        // All calls happen within milliseconds, so they share one 60s window.
+        for i in 1..=MAX_UNKNOWN_FRAMES_PER_MIN {
+            assert!(b.charge(), "frame {i} should be within the count budget");
+        }
+        assert!(!b.charge(), "one frame over the per-minute count cap must trip");
+    }
+}
 
 #[cfg(test)]
 mod frame_budget_drift_tests {
